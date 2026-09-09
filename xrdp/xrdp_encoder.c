@@ -333,6 +333,12 @@ xrdp_encoder_create(struct xrdp_mm *mm)
                     env_var);
             }
         }
+        env_var = g_getenv("XRDP_GFX_FRAME_LOG");
+        self->frame_log = (env_var != NULL && g_atoi(env_var) != 0);
+        if (self->frame_log)
+        {
+            LOG(LOG_LEVEL_INFO, "xrdp_encoder_create: per-frame logging on");
+        }
         env_var = g_getenv("XRDP_GFX_MAX_COMPRESSED_BYTES");
         self->max_compressed_bytes = DEFAULT_XRDP_GFX_MAX_COMPRESSED_BYTES;
         if (env_var != NULL)
@@ -715,6 +721,20 @@ out_RFX_AVC420_METABLOCK(struct xrdp_egfx_rect *dst_rect,
                          rects[index].x2 - dst_rect->x1 + 1);
         rect.bottom = MIN(dst_rect->y2 - dst_rect->y1,
                           rects[index].y2 - dst_rect->y1 + 1);
+        /* Force even dimensions on each rect. H.264 chroma is half-resolution
+           (4:2:0 / 4:4:4 alike) -- each chroma sample covers a 2x2 luma block.
+           An odd-width or odd-height rect leaves no clean way to map chroma at
+           the boundary: FreeRDP's YUV444 SSE primitive asserts
+           (((nWidth % 2) == 0)) and crashes; mstsc tolerates it but mis-renders
+           the chroma plane (visible as horizontal stripes during P-frame
+           updates). The expansion above already adds an asymmetric +/-1
+           margin, which is what produces the odd dimensions in the first
+           place. Round the top-left edges down to even and the bottom-right
+           edges up to even (re-clamped to the destination area). */
+        rect.left &= ~1;
+        rect.top  &= ~1;
+        rect.right  = MIN(dst_rect->x2 - dst_rect->x1, (rect.right  + 1) & ~1);
+        rect.bottom = MIN(dst_rect->y2 - dst_rect->y1, (rect.bottom + 1) & ~1);
         xrdp_region_add_rect(reg, &rect);
     }
     index = 0;
@@ -817,8 +837,13 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
     struct xrdp_enc_gfx_cmd *enc_gfx_cmd = &(enc->u.gfx);
     int mon_index;
     int connection_type;
+    unsigned int t_pack = 0;
 
     connection_type = self->mm->wm->client_info->mcs_connection_type;
+    if (self->frame_log)
+    {
+        t_pack = g_get_elapsed_ms();
+    }
 
     s = &ls;
     g_memset(s, 0, sizeof(struct stream));
@@ -926,6 +951,163 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
     LOG_DEVEL(LOG_LEVEL_INFO, "gfx_wiretosurface1: left %d top "
               "%d width %d height %d mon_index %d",
               left, top, width, height, mon_index);
+
+    /* AVC444: the accel-assist sent two H.264 streams framed as
+       [4-byte LE len1][stream1][4-byte LE len2][stream2]. Package them as an
+       RFX_AVC444_BITMAP_STREAM (MS-RDPEGFX 2.2.4.4):
+         cbAvc420EncodedBitstreamInfo (bits 0-29 = len of bitstream1, 30-31 = LC)
+         avc420EncodedBitstream1 (metablock1 + stream1)   [main: luma + 1/4 chroma]
+         avc420EncodedBitstream2 (metablock2 + stream2)   [aux: remaining chroma]
+       LC = 0 means both views present. */
+    if ((codec_id == XR_RDPGFX_CODECID_AVC444 ||
+            codec_id == XR_RDPGFX_CODECID_AVC444V2) &&
+            ENC_IS_BIT_SET(flags, 0))
+    {
+        unsigned char *d = (unsigned char *) enc_gfx_cmd->data;
+        int avail = enc_gfx_cmd->data_bytes;
+        int len1;
+        int len2;
+        char *s1;
+        char *s2;
+
+        /* The two bitstream lengths come out of shared memory written by
+           accel-assist, so validate them before using either as an offset.
+           Reading len2 at d[4 + len1] with an unchecked len1 indexes off the
+           end of the mapping. */
+        if (avail < 8)
+        {
+            LOG(LOG_LEVEL_ERROR, "gfx_wiretosurface1: AVC444 payload too "
+                "small, %d bytes", avail);
+            g_free(s->data); g_free(c_rects); g_free(d_rects); g_free(crects);
+            return NULL;
+        }
+        len1 = d[0] | (d[1] << 8) | (d[2] << 16) | (d[3] << 24);
+        if ((len1 < 0) || (len1 > avail - 8))
+        {
+            LOG(LOG_LEVEL_ERROR, "gfx_wiretosurface1: AVC444 len1 %d out of "
+                "range, payload %d bytes", len1, avail);
+            g_free(s->data); g_free(c_rects); g_free(d_rects); g_free(crects);
+            return NULL;
+        }
+        s1 = (char *) (d + 4);
+        /* len2 == 0 means the helper skipped the auxiliary view for this
+           frame; the command becomes LC=1, luma only. */
+        len2 = d[4 + len1] | (d[4 + len1 + 1] << 8)
+             | (d[4 + len1 + 2] << 16) | (d[4 + len1 + 3] << 24);
+        if ((len2 < 0) || (len2 > avail - 8 - len1))
+        {
+            LOG(LOG_LEVEL_ERROR, "gfx_wiretosurface1: AVC444 len2 %d out of "
+                "range, payload %d bytes len1 %d", len2, avail, len1);
+            g_free(s->data); g_free(c_rects); g_free(d_rects); g_free(crects);
+            return NULL;
+        }
+        s2 = (char *) (d + 4 + len1 + 4);
+        char *info_p = s->p;
+        char *str1_start;
+        char *save_p;
+        int size1;
+
+        /* Metablock rects for both views.
+
+           FreeRDP's general_ChromaV1ToYUV444 walks the B4/B5 tiles
+           *relative to the rect*: pSrc[0] is offset by roi->top, padHeigth
+           is derived from the roi height, and the uY/vY tile counters
+           restart at zero for every rect. The AV shader that packs the aux
+           plane anchors the 16-row tiling at frame row 0 unconditionally.
+           The two agree only when the rect's top is a multiple of 16.
+
+           Declaring the damage rects here mis-maps every rect whose top is
+           unaligned, and the damage lands entirely in B4/B5 -- all columns
+           of the odd chroma rows -- i.e. horizontal banding, appearing only
+           where the screen changed. aa444map in ~/aa444work quantifies it:
+           roi 0,200 1920x400 gets 49.6% of its chroma samples wrong at
+           MAE 85, while any 16-aligned top is bit-exact.
+
+           So both views declare a single full-frame rect. That satisfies
+           the alignment invariant trivially and keeps the two chroma
+           sources -- main's even rows, aux's odd rows -- refreshing from
+           the same frame, so their quantisation error never comes from
+           different points in time. Both streams are encoded full-frame
+           anyway (the shaders only scissor what they redraw; the encoder
+           always sees the whole surface and P-skips the untouched
+           macroblocks), so this costs a few bytes of metablock, not
+           bitrate.
+
+           Set XRDP_AVC444_DAMAGE_RECTS=1 to declare the damage rects on
+           the main view instead, for A/B comparison. The aux view has no
+           such switch: unaligned aux rects are simply incorrect. */
+        {
+            static int use_damage_rects = -1;
+            struct xrdp_egfx_rect full;
+            struct xrdp_egfx_rect *main_rects;
+            int main_num_rects;
+
+            if (use_damage_rects < 0)
+            {
+                const char *env = g_getenv("XRDP_AVC444_DAMAGE_RECTS");
+                use_damage_rects = (env != NULL && g_atoi(env) != 0);
+            }
+            full.x1 = 0;
+            full.y1 = 0;
+            full.x2 = width;
+            full.y2 = height;
+            main_rects = use_damage_rects ? d_rects : &full;
+            main_num_rects = use_damage_rects ? num_rects_d : 1;
+
+            out_uint32_le(s, 0); /* cbAvc420EncodedBitstreamInfo, backfilled */
+            str1_start = s->p;
+            if (out_RFX_AVC420_METABLOCK(&dst_rect, s, main_rects,
+                                         main_num_rects) != 0 ||
+                    !s_check_rem_out(s, len1))
+            {
+                g_free(s->data); g_free(c_rects); g_free(d_rects); g_free(crects);
+                return NULL;
+            }
+            out_uint8a(s, s1, len1);
+            size1 = (int) (s->p - str1_start);
+            if (len2 > 0)
+            {
+                if (out_RFX_AVC420_METABLOCK(&dst_rect, s, &full, 1) != 0 ||
+                        !s_check_rem_out(s, len2))
+                {
+                    g_free(s->data); g_free(c_rects); g_free(d_rects);
+                    g_free(crects);
+                    return NULL;
+                }
+                out_uint8a(s, s2, len2);
+            }
+        }
+        /* backfill cbAvc420EncodedBitstreamInfo: LC in bits 30-31, and in
+           bits 0-29 the size of metablock1 plus bitstream1 -- which is what
+           the client subtracts its own metablock1 length from to find where
+           bitstream1 ends (see rdpgfx_codec.c). LC=0 is luma and chroma,
+           LC=1 luma only, and for LC=1 nothing follows bitstream1. */
+        save_p = s->p;
+        s->p = info_p;
+        out_uint32_le(s, (((unsigned int) (len2 > 0 ? 0 : 1)) << 30) |
+                      (((unsigned int) size1) & 0x3FFFFFFF));
+        s->p = save_p;
+
+        g_free(c_rects);
+        g_free(d_rects);
+        s_mark_end(s);
+        bitmap_data_length = (int) (s->end - s->data);
+        if (self->frame_log)
+        {
+            LOG(LOG_LEVEL_INFO, "gfx_wiretosurface1: AVC444 codec_id 0x%4.4x "
+                "LC %d len1 %d len2 %d size1(bs1+meta) %d total %d pack %d ms",
+                codec_id, len2 > 0 ? 0 : 1, len1, len2, size1,
+                bitmap_data_length,
+                (int) (g_get_elapsed_ms() - t_pack));
+        }
+        rv = xrdp_egfx_wire_to_surface1(bulk, surface_id, codec_id,
+                                        pixel_format, &dst_rect,
+                                        s->data, bitmap_data_length);
+        g_free(s->data);
+        g_free(crects);
+        return rv;
+    }
+
     /* RFX_AVC420_METABLOCK */
     if (out_RFX_AVC420_METABLOCK(&dst_rect, s, d_rects, num_rects_d) != 0)
     {
@@ -942,7 +1124,27 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
 
     if (ENC_IS_BIT_SET(flags, 0))
     {
-        /* already compressed */
+        /* already compressed -- the H.264 bytes came pre-encoded from
+           accel-assist (VAAPI hardware path). Note this once per session
+           so the operator can confirm hardware encoding is active without
+           having to grep the per-display xorgxrdp/accel-assist logs. */
+        if (!self->hw_accel_announced)
+        {
+            LOG(LOG_LEVEL_INFO,
+                "gfx_wiretosurface1: AVC420 hardware encoding active "
+                "(accel-assist), first compressed frame received: %d bytes",
+                enc_gfx_cmd->data_bytes);
+            self->hw_accel_announced = 1;
+        }
+        /* Per-frame size, so AVC420 can be measured on the same axis as the
+           AVC444 line below -- without it the two codecs cannot be compared
+           on a like-for-like workload, and idle time is easily mistaken for
+           a codec problem. Opt-in, since it is one line per frame. */
+        if (self->frame_log)
+        {
+            LOG(LOG_LEVEL_INFO, "gfx_wiretosurface1: AVC420 codec_id 0x%4.4x "
+                "len1 %d", codec_id, enc_gfx_cmd->data_bytes);
+        }
         out_uint8a(s, enc_gfx_cmd->data, enc_gfx_cmd->data_bytes);
     }
     else

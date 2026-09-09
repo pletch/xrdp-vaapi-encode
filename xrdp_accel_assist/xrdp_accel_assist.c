@@ -31,6 +31,7 @@
 #include "string_calls.h"
 #include "log.h"
 
+#include "xrdp_client_info.h"
 #include "xrdp_accel_assist.h"
 #include "xrdp_accel_assist_x11.h"
 
@@ -50,6 +51,7 @@ struct xorgxrdp_info
 };
 
 static int g_display_num = 0;
+static int g_force_avc444 = -1; /* -1 = not yet checked, see XRDP_ACCEL_AVC444 */
 
 /*****************************************************************************/
 static int
@@ -73,11 +75,30 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
     int encoder_flags;
     char *flags_pointer;
     char *final_pointer;
+    char *codec_id_pointer;
 
     (void)pixel_format;
-    (void)codec_id;
     (void)surface_id;
     (void)rv;
+
+    /* AVC444 (4:4:4) is normally chosen by xorgxrdp, which knows what the
+       client negotiated and asks for codec id 0x000E directly; the rewrite
+       below then does nothing. XRDP_ACCEL_AVC444 stays as a forcing override
+       for testing -- it upgrades AVC420 surface commands unconditionally,
+       which is only safe against a client that really can decode 0x000E. */
+    if (g_force_avc444 < 0)
+    {
+        const char *env = g_getenv("XRDP_ACCEL_AVC444");
+        /* Tri-state, matching xrdp_accel_assist_x11_avc444_enabled(): unset
+           follows the negotiated capability, "0" forces off, anything else
+           forces on. Only the force-on case rewrites a codec id here. */
+        g_force_avc444 = (env != NULL) && (g_strcmp(env, "0") != 0);
+        if (g_force_avc444)
+        {
+            LOG(LOG_LEVEL_INFO, "gfx_wiretosurface1: XRDP_ACCEL_AVC444 is "
+                "set, forcing AVC444 regardless of client capabilities");
+        }
+    }
 
     if (xi->shmem_fd_ret != -1)
     {
@@ -99,10 +120,21 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
         return 1;
     }
     in_uint16_le(s, surface_id);
+    codec_id_pointer = s->p;
     in_uint16_le(s, codec_id);
     in_uint8(s, pixel_format);
     flags_pointer = s->p;
     in_uint32_le(s, flags);
+    if (g_force_avc444 && codec_id == 0x000B) /* AVC420 -> AVC444 */
+    {
+        codec_id = 0x000E;
+    }
+    /* The aux layout is chosen by the helper, not by xorgxrdp, so the codec
+       id has to follow it: 0x000E carries ChromaV1, 0x000F ChromaV2. */
+    if (codec_id == 0x000E && xrdp_accel_assist_x11_avc444_v2())
+    {
+        codec_id = 0x000F;
+    }
     LOG_DEVEL(LOG_LEVEL_INFO, "gfx_wiretosurface1: surface_id %d codec_id %d "
               "pixel_format %d flags %d",
               surface_id, codec_id, pixel_format, flags);
@@ -166,20 +198,36 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
     (void)top;
 
     cdata_bytes = GFX_MAP_SIZE;
-    encoder_flags = 0;
+    /* Carry xorgxrdp's own flag bits through rather than starting from zero.
+       Nothing reads them here today, but rebuilding the word discards
+       anything that side puts in it, silently: a bit added later reads as
+       clear, which for most flags looks like ordinary behaviour rather than
+       an error. That cost an evening once already. */
+    encoder_flags = flags & ~(unsigned int) XH_ENC_FLAGS_FORCEIDR;
     if (xi->idr_count > 0)
     {
-        encoder_flags = XH_ENC_FLAGS_FORCEIDR;
+        encoder_flags |= XH_ENC_FLAGS_FORCEIDR;
         xi->idr_count--;
     }
     rv = xrdp_accel_assist_x11_encode_pixmap(0, 0,
          width, height, surface_id,
          num_rects_c, crects,
          addr, &cdata_bytes,
-         encoder_flags);
+         codec_id, encoder_flags);
     LOG_DEVEL(LOG_LEVEL_INFO, "gfx_wiretosurface1: rv %d cdata_bytes %d",
               rv, cdata_bytes);
+    if (codec_id == 0x000E || codec_id == 0x000F)
+    {
+        int alen1 = ((unsigned char *) addr)[0]
+                  | (((unsigned char *) addr)[1] << 8)
+                  | (((unsigned char *) addr)[2] << 16)
+                  | (((unsigned char *) addr)[3] << 24);
+        LOG(LOG_LEVEL_INFO, "gfx_wiretosurface1: AVC444 codec_id 0x%4.4x "
+            "rv %d cdata_bytes %d (len1 %d)", codec_id, rv, cdata_bytes, alen1);
+    }
 
+    s->p = codec_id_pointer;
+    out_uint16_le(s, codec_id); /* forward the (possibly forced) codec id */
     s->p = flags_pointer;
     flags |= 1;
     out_uint32_le(s, flags); /* set already encoded bit */
@@ -440,7 +488,7 @@ xorg_process_message_64(struct xorgxrdp_info *xi, struct stream *s)
                          (flags >> 28) & 0xF,
                          num_crects, crects,
                          bmpdata + 4,
-                         &cdata_bytes, encoder_flags);
+                         &cdata_bytes, 0x000B /* AVC420 */, encoder_flags);
                     if (rv == ENCODER_ERROR)
                     {
                         LOG(LOG_LEVEL_ERROR, "error %d", rv);
@@ -496,6 +544,7 @@ xorg_process_message(struct xorgxrdp_info *xi, struct stream *s)
     int magic;
     int con_id;
     int mon_id;
+    int caps;
     int ret;
 
     xi->shmem_fd_ret = -1;
@@ -568,6 +617,23 @@ xorg_process_message(struct xorgxrdp_info *xi, struct stream *s)
                     LOG(LOG_LEVEL_DEBUG, "calling xrdp_accel_assist_x11_create_pixmap");
                     xrdp_accel_assist_x11_create_pixmap(width, height, magic,
                                                         con_id, mon_id);
+                    break;
+                case 4:
+                    /* Session capabilities, sent by xorgxrdp ahead of the
+                       type-2 pixmap creates in the same batch because the
+                       encoder's geometry depends on them. An xorgxrdp that
+                       does not send this leaves the capabilities at zero;
+                       an accel-assist that does not understand it skips the
+                       message on its size field, so either half may be
+                       older than the other.
+
+                       Ids here are shared with xrdp: this batch is forwarded
+                       on verbatim and xrdp's lib_mod_process_message parses
+                       the same bytes. 3 is already memory-allocation-complete
+                       there, and xrdp acts on it, so do not reuse it. */
+                    in_uint32_le(s, caps);
+                    LOG(LOG_LEVEL_INFO, "session capabilities 0x%8.8x", caps);
+                    xrdp_accel_assist_x11_set_caps(caps);
                     break;
             }
             s->p = phold + size;

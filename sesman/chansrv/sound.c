@@ -80,6 +80,8 @@ static int    g_bytes_in_stream = 0;
 struct fifo  *g_in_fifo;
 int    g_bytes_in_fifo = 0;
 static int    g_time_diff = 0;
+/* XRDP_SOUND_MAX_LATENCY_MS, -1 until read, 0 = disabled */
+static int    g_snd_max_latency_ms = -1;
 static int    g_best_time_diff = 0;
 
 
@@ -911,8 +913,41 @@ sound_send_wave_data(char *data, int data_bytes)
     int res;
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "sound_send_wave_data: sending %d bytes", data_bytes);
-    if (g_time_diff > g_best_time_diff + 250)
+    /* Two ways to decide we are behind.
+
+       The original test is relative: the averaged wave-confirm round trip
+       has grown 250 ms beyond the best ever seen. That catches a round trip
+       that degrades over a session, but it cannot see a latency that was
+       already there when the stream opened, because g_best_time_diff is
+       learned from the first fifty confirms and so calibrates to whatever
+       the starting latency happened to be. Measured against mstsc over a
+       LAN: the client settles at a steady 1085 ms behind with a best of
+       1081, an over-best of 4 ms, and the corrector never fires. The audio
+       is a second late for the whole session and nothing here notices.
+
+       XRDP_SOUND_MAX_LATENCY_MS adds an absolute ceiling for that case.
+       Zero, the default, keeps the previous behaviour exactly. */
+    if (g_snd_max_latency_ms < 0)
     {
+        const char *env = g_getenv("XRDP_SOUND_MAX_LATENCY_MS");
+
+        g_snd_max_latency_ms = (env != NULL) ? atoi(env) : 0;
+        if (g_snd_max_latency_ms < 0)
+        {
+            g_snd_max_latency_ms = 0;
+        }
+        if (g_snd_max_latency_ms > 0)
+        {
+            LOG(LOG_LEVEL_INFO, "sound: dropping audio above %d ms of "
+                "measured latency", g_snd_max_latency_ms);
+        }
+    }
+    if ((g_time_diff > g_best_time_diff + 250) ||
+        ((g_snd_max_latency_ms > 0) && (g_time_diff > g_snd_max_latency_ms)))
+    {
+        /* Send a quarter of the chunk as silence: three quarters of this
+           block of audio is discarded, which is what actually shortens the
+           client's queue and brings the sound back towards the picture. */
         data_bytes = data_bytes / 4;
         data_bytes = data_bytes & ~3;
         g_memset(data, 0, data_bytes);
@@ -1038,6 +1073,29 @@ sound_process_wave_confirm(struct stream *s, int size)
         }
     }
     g_time_diff = acc;
+    /* Audio drift tracing. The corrector in sound_send_wave_data only ever
+       sees the wave-confirm round trip, so it cannot distinguish a growing
+       network delay from a client that acknowledges promptly and then plays
+       late out of its own buffer. Log both the instantaneous and the
+       averaged figure periodically so the two can be told apart against the
+       observed lip-sync error. XRDP_SOUND_DRIFT_LOG=1 to enable. */
+    {
+        static int drift_log = -1;
+        static int drift_count = 0;
+
+        if (drift_log < 0)
+        {
+            const char *env = g_getenv("XRDP_SOUND_DRIFT_LOG");
+            drift_log = (env != NULL && atoi(env) != 0);
+        }
+        if (drift_log && ((drift_count++ % 50) == 0))
+        {
+            LOG(LOG_LEVEL_INFO, "sound drift: rtt %d ms, mean %d ms, "
+                "best %d ms, over-best %d ms, blocks sent %d, buffered %d B",
+                time_diff, g_time_diff, g_best_time_diff,
+                g_time_diff - g_best_time_diff, g_cBlockNo, g_buf_index);
+        }
+    }
     return 0;
 }
 

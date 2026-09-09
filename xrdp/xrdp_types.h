@@ -64,7 +64,8 @@ struct xrdp_mod
     int (*mod_get_wait_objs)(struct xrdp_mod *v, tbus *read_objs, int *rcount,
                              tbus *write_objs, int *wcount, int *timeout);
     int (*mod_check_wait_objs)(struct xrdp_mod *v);
-    int (*mod_frame_ack)(struct xrdp_mod *v, int flags, int frame_id);
+    int (*mod_frame_ack)(struct xrdp_mod *v, int flags, int frame_id,
+                         int rtt_ms);
     int (*mod_suppress_output)(struct xrdp_mod *v, int suppress,
                                int left, int top, int right, int bottom);
     int (*mod_server_monitor_resize)(struct xrdp_mod *v,

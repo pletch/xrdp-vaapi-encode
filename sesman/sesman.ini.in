@@ -255,3 +255,102 @@ EnableSyslog=true
 PULSE_SCRIPT=@sesmansysconfdir@/pulse/default.pa
 ;XRDP_USE_ACCEL_ASSIST=1
 ;XRDP_NVIDIA_GRID=1
+
+; ---------------------------------------------------------------------------
+; Hardware-accelerated H.264 (xrdp_accel_assist). All optional and all off
+; unless set. XRDP_USE_ACCEL_ASSIST above must be enabled for any of them to
+; have an effect.
+;
+; AVC444 sends a second H.264 picture carrying the chroma that 4:2:0 drops,
+; giving true 4:4:4 colour. It is what keeps subpixel-antialiased text crisp.
+; The client must advertise support; xrdp negotiates and falls back to AVC420
+; on its own, so this can be left on. Set to 0 to force AVC420.
+;XRDP_ACCEL_AVC444=1
+; Which AVC444 chroma layout to use. Normally derived from the confirmed
+; EGFX capability version -- 10.2 and later get the v2 layout, a bare 10.0
+; client is held to v1 -- because MS-RDPEGFX has no capability flag that
+; separates them and a client that cannot parse codec id 0x000F has no way
+; to say so. Set to 1 to force v2 or 0 to force v1.
+;XRDP_ACCEL_AVC444_V2=1
+; How often the auxiliary chroma picture is sent, in frames. 1 sends it every
+; frame, which is correct but roughly doubles the encode cost. Higher values
+; refresh chroma less often; luma still updates every frame, so the cost is
+; brief colour lag on fast motion. 8 measured far smoother than 1 with no
+; visible penalty on desktop content.
+;XRDP_AVC444_CHROMA_INTERVAL=8
+; Constant quantiser, 1-51. Lower is better quality and more bits. 26 is a
+; reasonable desktop default. The auxiliary view carries chroma in its luma
+; plane, so it gets its own value.
+;XRDP_VAAPI_QP=26
+;XRDP_VAAPI_AUX_QP=26
+; Rate control. By default the encoder runs at constant QP, which holds
+; quality steady but leaves frame size unbounded -- a high-motion frame can be
+; an order of magnitude larger than a still one. Setting a bitrate in kbit/s
+; switches to VBR, where the QPs above become the initial and maximum
+; quantiser. Useful on a bandwidth-constrained link; on a LAN it measured no
+; smoother than constant QP, so leave it unset unless bandwidth is the limit.
+;XRDP_VAAPI_BITRATE=5000
+; Render node to encode on, when the default pick is wrong.
+;XRDP_VAAPI_DEVICE=/dev/dri/renderD128
+;
+; Audio. The drift corrector in chansrv fires when the wave-confirm round trip
+; grows 250 ms beyond the best ever seen, which catches a round trip that
+; degrades during a session but not a latency that was already present when
+; the stream opened. This adds an absolute ceiling in milliseconds: above it,
+; audio is dropped to shorten the client's queue. 0, the default, disables it.
+; A client that buffers the opening burst can otherwise sit a full second
+; behind the picture for the whole session.
+;XRDP_SOUND_MAX_LATENCY_MS=250
+;
+; Capture pacing (read by xorgxrdp, not by the encoder).
+;
+; How often the screen is captured is normally fixed, seeded from
+; h264_frame_interval in xrdp.ini. Fixed, it has to be tuned to the slowest
+; client that will connect and then throttles every other client sharing the
+; session. Measured on one host, same session and same content: a native
+; client acknowledged frames in 11-18 ms while a browser client at HiDPI took
+; 222-289. No single value serves both.
+;
+; XORGXRDP_ADAPTIVE_PACE=1 steers the interval per connection from the round
+; trip xrdp measures to that client, so each gets the rate it can actually
+; take. h264_frame_interval then only seeds it. MIN and MAX bound the result;
+; the floor should not go below the source's own refresh (see VFREQ), since
+; capturing faster than the desktop paints finds nothing changed.
+;XORGXRDP_ADAPTIVE_PACE=1
+;XORGXRDP_PACE_MIN_MS=20
+;XORGXRDP_PACE_MAX_MS=100
+;
+; Capture depth. One means strict lockstep: nothing is captured until the
+; previous frame has been acknowledged, which leaves the pipeline idle for a
+; whole round trip. Two captures the next frame while the previous is still in
+; flight. Measured with a native client and a saturating source, going from
+; one to two took 26 fps to 51, with blocked capture callbacks falling from
+; 155-173 per hundred frames to 1-6.
+;
+; Two is safe only because each capture buffer is given the damage it missed
+; as well as the current frame's: the AVC444 auxiliary view is rendered
+; full-frame and reads the whole source texture, so a buffer holding only its
+; own share of the damage shows blocks of stale content.
+;XORGXRDP_CAPTURE_DEPTH=2
+;
+; The refresh rate the virtual output advertises. There is no physical one, and
+; the value is a fiction either way, but applications that pace to the RandR
+; mode will not paint faster than it -- so 60 fps content on a 50 Hz output
+; loses every sixth frame, which reads as judder. Raising it also raises the
+; damage rate for every client on the session, and one that cannot keep up
+; pays for that in latency rather than frames. Default 50, range 1-240.
+;XORGXRDP_VFREQ=50
+;
+; Diagnostics. All of these log per frame or per audio block and should be off
+; in production.
+;XRDP_VAAPI_TIMING=1
+; Dumps the sequence parameter set as hex, once per session. It carries the
+; colour signalling, the H.264 level and the reference counts, none of which
+; are visible anywhere else -- a decoder reporting something we did not intend
+; is otherwise indistinguishable from a decoder ignoring what we sent.
+;XRDP_VAAPI_LOG_SPS=1
+;XORGXRDP_TIMING=1
+;XRDP_SOUND_DRIFT_LOG=1
+;XRDP_AVC444_DUMP_DIR=/tmp/avc444
+;XRDP_AVC444_DUMP_FRAMES=1
+; ---------------------------------------------------------------------------

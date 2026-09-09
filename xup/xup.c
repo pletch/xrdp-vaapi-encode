@@ -228,6 +228,8 @@ convert_xrdp_client_info_to_xup_client_info(
     dst->rfx_frame_interval = src->rfx_frame_interval;
     dst->h264_frame_interval = src->h264_frame_interval;
     dst->normal_frame_interval = src->normal_frame_interval;
+
+    dst->gfx_avc444 = src->gfx_avc444;
 }
 
 /******************************************************************************/
@@ -1238,7 +1240,7 @@ process_server_paint_rect_shmem(struct mod *amod, struct stream *s)
 /******************************************************************************/
 /* return error */
 static int
-send_paint_rect_ex_ack(struct mod *mod, int flags, int frame_id)
+send_paint_rect_ex_ack(struct mod *mod, int flags, int frame_id, int rtt_ms)
 {
     int len;
     struct stream *s;
@@ -1249,6 +1251,17 @@ send_paint_rect_ex_ack(struct mod *mod, int flags, int frame_id)
     out_uint16_le(s, 106);
     out_uint32_le(s, flags);
     out_uint32_le(s, frame_id);
+    /* Round trip from our sending this frame to the client acknowledging it,
+       appended after the two original words. The message is length-prefixed,
+       so a peer that does not know about this field stops after frame_id and
+       ignores it. Zero when unknown.
+
+       This is the client's own latency: xrdp stamps the send time when the
+       encoder hands the frame over and the acknowledgement arrives
+       asynchronously, so unlike the send-to-ack gap xorgxrdp can measure, it
+       does not include xorgxrdp's own capture interval. That makes it the
+       only figure here suitable for steering that interval. */
+    out_uint32_le(s, rtt_ms);
     s_mark_end(s);
     len = (int)(s->end - s->data);
     s_pop_layer(s, iso_hdr);
@@ -2121,11 +2134,12 @@ lib_mod_check_wait_objs(struct mod *mod)
 /******************************************************************************/
 /* return error */
 static int
-lib_mod_frame_ack(struct mod *amod, int flags, int frame_id)
+lib_mod_frame_ack(struct mod *amod, int flags, int frame_id, int rtt_ms)
 {
     LOG_DEVEL(LOG_LEVEL_TRACE,
-              "lib_mod_frame_ack: flags 0x%8.8x frame_id %d", flags, frame_id);
-    send_paint_rect_ex_ack(amod, flags, frame_id);
+              "lib_mod_frame_ack: flags 0x%8.8x frame_id %d rtt %d ms",
+              flags, frame_id, rtt_ms);
+    send_paint_rect_ex_ack(amod, flags, frame_id, rtt_ms);
     return 0;
 }
 

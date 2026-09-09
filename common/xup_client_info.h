@@ -70,9 +70,23 @@ struct xup_client_info
     int rfx_frame_interval;
     int h264_frame_interval;
     int normal_frame_interval;
+
+    /* The EGFX capability set xrdp confirmed to the client permits
+       RDPGFX_CODECID_AVC444 (0x000E), the dual-view 4:4:4 chroma encoding,
+       and not merely AVC420. Set alongside capture_code, so it arrives by
+       the same route and at the same time. xorgxrdp uses it to pick the
+       codec id it asks for and to tell the accel-assist helper how to size
+       its encoder. Zero unless EGFX H.264 was negotiated at all. */
+    /* 0 none, 1 AVC444 v1 chroma layout, 2 v2 */
+    int gfx_avc444;
 };
 
 /* yyyymmdd of last incompatible change to xup_client_info */
-#define XUP_CLIENT_INFO_CURRENT_VERSION 20250528
+/* gfx_avc444 carries an AVC444 LEVEL (0 none, 1 v1, 2 v2) from this
+   version on; before it, any non-zero value meant only "AVC444 supported".
+   A consumer that treats "not 2" as "v1" would silently downgrade every
+   session served by an older xrdp, so it must check the version first. */
+#define XUP_CLIENT_INFO_LEVEL_AVC444_VERSION 20260908
+#define XUP_CLIENT_INFO_CURRENT_VERSION 20260908
 
 #endif // XUP_CLIENT_INFO_H

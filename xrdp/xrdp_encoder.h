@@ -32,6 +32,17 @@ struct xrdp_encoder
     int codec_id;
     int codec_quality;
     int max_compressed_bytes;
+    /* XRDP_GFX_FRAME_LOG=1: log one line per encoded frame, for both AVC420
+       and AVC444, so the two can be compared on the same workload.
+
+       Read from the xrdp process's own environment, like the other
+       XRDP_GFX_* knobs beside it -- NOT from sesman.ini [SessionVariables],
+       which only reaches the session (Xorg, xorgxrdp, accel-assist) and
+       never xrdp. Set it in an xrdp.service systemd drop-in. The
+       XRDP_ACCEL_AVC444 / XRDP_AVC444_* / XRDP_VAAPI_* knobs are the other
+       way round: those are read in the session and do belong in
+       sesman.ini. */
+    int frame_log;
     tbus xrdp_encoder_event_to_proc;
     tbus xrdp_encoder_event_processed;
     tbus xrdp_encoder_term_request;
@@ -48,6 +59,22 @@ struct xrdp_encoder
     int frame_id_client; /* last frame id received from client */
     int frame_id_server; /* last frame id received from Xorg */
     int frame_id_server_sent;
+    /* XRDP_GFX_FRAME_LOG: how long the client takes to acknowledge a frame,
+       and how deep its own queue is when it does. The client reports its
+       queue depth in every ack, which is the one direct measure of whether
+       it is keeping up -- the encode timings only cover our end of the pipe.
+       Sent times are a ring indexed by frame id. */
+    unsigned int frame_sent_ms[64];
+    /* Most recent client acknowledgement round trip, milliseconds. Passed
+       down to the module so it can pace capture by the client's real
+       latency rather than by a figure that includes its own pacing. */
+    int last_rtt_ms;
+    int ack_count;
+    int ack_rtt_total_ms;
+    int ack_rtt_max_ms;
+    int ack_qdepth_total;
+    int ack_qdepth_max;
+    int ack_inflight_total;
     int frames_in_flight;
     int gfx;
     int gfx_ack_off;
@@ -60,6 +87,11 @@ struct xrdp_encoder
     xrdp_encoder_h264_create_proc xrdp_encoder_h264_create;
     xrdp_encoder_h264_delete_proc xrdp_encoder_h264_delete;
     xrdp_encoder_h264_encode_proc xrdp_encoder_h264_encode;
+    int hw_accel_announced;     /* 1 once we've logged that accel-assist is
+                                   feeding pre-encoded H.264 -- proves the
+                                   VAAPI hardware path is active without
+                                   needing to grep the xorgxrdp/accel-assist
+                                   logs */
 };
 
 /* cmd_id = 0 */

@@ -36,6 +36,15 @@ struct xh_rect
 };
 
 #define XH_ENC_FLAGS_FORCEIDR (1 << 0)
+/* AVC444: encode the auxiliary (chroma) view rather than the main view.
+   Both views are pictures of the SAME H.264 sequence -- see the comment on
+   xrdp_accel_assist_vaapi_encode. */
+#define XH_ENC_FLAGS_AUXVIEW  (1 << 1)
+
+/* Session capability bits, sent by xorgxrdp as message type 3 of the
+   accel-assist control batch. */
+#define XH_CAPS_AVC444        (1 << 0)
+#define XH_CAPS_AVC444_V2     (1 << 1)
 
 enum encoder_result
 {

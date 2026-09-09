@@ -106,7 +106,13 @@ enum xrdp_encoder_flags
     ENCODE_COMPLETE                        = 1 << 0,
     GFX_PROGRESSIVE_RFX                    = 1 << 1,
     GFX_H264                               = 1 << 2,
-    KEY_FRAME_REQUESTED                    = 1 << 3
+    KEY_FRAME_REQUESTED                    = 1 << 3,
+    /* Which of the two accel-assist capture buffers this frame was copied
+       into. xorgxrdp alternates them so it can capture the next frame while
+       the helper is still reading the previous one; without the index the
+       two would have to agree by counting, which a dropped frame breaks.
+       Bits 28-31 are the monitor index. */
+    ACCEL_ASSIST_BUFFER_1                  = 1 << 4
 };
 
 /* Size definitions for some arrays in xrdp_client_info */
@@ -279,6 +285,21 @@ struct xrdp_client_info
 
     enum unicode_input_state unicode_input_support;
     enum xrdp_capture_code capture_code;
+
+    /* EGFX: the capability set xrdp confirmed to the client permits
+       RDPGFX_CODECID_AVC444 (0x000E), the dual-view 4:4:4 chroma encoding,
+       not just AVC420. Set by xrdp_mm_egfx_caps_advertise() from the version
+       and flags of the confirmed capset; zero unless EGFX H.264 was
+       negotiated at all. The module (xorgxrdp) reads this to decide which
+       codec id to ask the encoder for.
+
+       Appended at the end of the struct deliberately: xorgxrdp is built
+       against this header separately, so inserting a field anywhere else
+       shifts the offsets of everything after it and breaks any module
+       binary that has not been rebuilt in lockstep. */
+    /* AVC444 level the confirmed EGFX capability set supports:
+       0 none, 1 the v1 chroma layout, 2 the v2 layout. */
+    int gfx_avc444;
 };
 
 /*
