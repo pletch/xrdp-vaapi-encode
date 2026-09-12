@@ -23,6 +23,9 @@
 #endif
 
 #include "xrdp_encoder.h"
+/* XH_AVC444_AUX_RECT_MAGIC: the AVC444 aux-rect trailer contract,
+   shared with the accel-assist helper that writes it. */
+#include "xrdp_accel_assist.h"
 #include "xrdp.h"
 #include "ms-rdpbcgr.h"
 #include "thread_calls.h"
@@ -695,11 +698,28 @@ process_enc_rfx(struct xrdp_encoder *self, XRDP_ENC_DATA *enc)
 #if defined(XRDP_X264) || defined(XRDP_OPENH264)
 
 /*****************************************************************************/
+/* Emit an RFX_AVC420_METABLOCK for one view.
+
+   align_x / align_y are the alignment the declared rects must satisfy; each
+   rect is rounded outward to that grid (and re-clamped to the destination
+   area, so the final band at the right/bottom edge of a surface whose size
+   is not a multiple of the alignment is simply short).
+
+   AVC420 uses 2x2: H.264 chroma is half-resolution, so an odd-width or
+   odd-height rect leaves no clean way to map chroma at the boundary --
+   FreeRDP's YUV420 primitive asserts (((nWidth % 2) == 0)) and crashes,
+   mstsc tolerates it but mis-renders the chroma plane (visible as
+   horizontal stripes during P-frame updates).
+
+   The AVC444 views need more; see gfx_wiretosurface1. */
 static int
 out_RFX_AVC420_METABLOCK(struct xrdp_egfx_rect *dst_rect,
                          struct stream *s,
                          struct xrdp_egfx_rect *rects,
-                         int num_rects)
+                         int num_rects,
+                         int align_x,
+                         int align_y,
+                         int *num_emitted)
 {
     struct xrdp_region *reg;
     struct xrdp_rect rect;
@@ -721,20 +741,16 @@ out_RFX_AVC420_METABLOCK(struct xrdp_egfx_rect *dst_rect,
                          rects[index].x2 - dst_rect->x1 + 1);
         rect.bottom = MIN(dst_rect->y2 - dst_rect->y1,
                           rects[index].y2 - dst_rect->y1 + 1);
-        /* Force even dimensions on each rect. H.264 chroma is half-resolution
-           (4:2:0 / 4:4:4 alike) -- each chroma sample covers a 2x2 luma block.
-           An odd-width or odd-height rect leaves no clean way to map chroma at
-           the boundary: FreeRDP's YUV444 SSE primitive asserts
-           (((nWidth % 2) == 0)) and crashes; mstsc tolerates it but mis-renders
-           the chroma plane (visible as horizontal stripes during P-frame
-           updates). The expansion above already adds an asymmetric +/-1
-           margin, which is what produces the odd dimensions in the first
-           place. Round the top-left edges down to even and the bottom-right
-           edges up to even (re-clamped to the destination area). */
-        rect.left &= ~1;
-        rect.top  &= ~1;
-        rect.right  = MIN(dst_rect->x2 - dst_rect->x1, (rect.right  + 1) & ~1);
-        rect.bottom = MIN(dst_rect->y2 - dst_rect->y1, (rect.bottom + 1) & ~1);
+        /* Round outward to the requested grid, re-clamping the bottom-right
+           edges to the destination area. pixman's union only ever cuts bands
+           at coordinates present in its inputs, so a region built entirely
+           from aligned rects yields aligned rects. */
+        rect.left = rect.left & ~(align_x - 1);
+        rect.top  = rect.top  & ~(align_y - 1);
+        rect.right  = MIN(dst_rect->x2 - dst_rect->x1,
+                          (rect.right  + align_x - 1) & ~(align_x - 1));
+        rect.bottom = MIN(dst_rect->y2 - dst_rect->y1,
+                          (rect.bottom + align_y - 1) & ~(align_y - 1));
         xrdp_region_add_rect(reg, &rect);
     }
     index = 0;
@@ -748,6 +764,10 @@ out_RFX_AVC420_METABLOCK(struct xrdp_egfx_rect *dst_rect,
     }
     xrdp_region_delete(reg);
     count = index;
+    if (num_emitted != NULL)
+    {
+        *num_emitted = count;
+    }
     while (index > 0)
     {
         out_uint8(s, 23); /* qp */
@@ -1002,62 +1022,161 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
             return NULL;
         }
         s2 = (char *) (d + 4 + len1 + 4);
+        /* Optional trailer: the rect accel-assist actually rendered the aux
+           over (XH_AVC444_AUX_RECT_MAGIC, see xrdp_accel_assist.h). Absent
+           for v1, absent from an older helper, and absent when the payload
+           left no room -- in all of which cases the aux falls back to
+           declaring the whole frame. */
+        int have_aux_rect = 0;
+        struct xrdp_egfx_rect wire_aux_rect;
+
+        g_memset(&wire_aux_rect, 0, sizeof(wire_aux_rect));
+        if (len2 > 0)
+        {
+            int used = 8 + len1 + len2;
+
+            if (avail - used >= XH_AVC444_AUX_RECT_BYTES)
+            {
+                const unsigned char *t = d + used;
+                unsigned int v[5];
+                int vi;
+
+                for (vi = 0; vi < 5; vi++)
+                {
+                    v[vi] = t[vi * 4] | (t[vi * 4 + 1] << 8) |
+                            (t[vi * 4 + 2] << 16) |
+                            ((unsigned int) t[vi * 4 + 3] << 24);
+                }
+                if (v[0] == XH_AVC444_AUX_RECT_MAGIC)
+                {
+                    int rx1 = (int) v[1];
+                    int ry1 = (int) v[2];
+                    int rx2 = (int) v[3];
+                    int ry2 = (int) v[4];
+
+                    /* Clamp rather than trust: this came out of shared
+                       memory, and it is about to become a metablock rect. */
+                    rx1 = MAX(0, MIN(rx1, width));
+                    ry1 = MAX(0, MIN(ry1, height));
+                    rx2 = MAX(0, MIN(rx2, width));
+                    ry2 = MAX(0, MIN(ry2, height));
+                    if ((rx2 > rx1) && (ry2 > ry1))
+                    {
+                        wire_aux_rect.x1 = rx1;
+                        wire_aux_rect.y1 = ry1;
+                        wire_aux_rect.x2 = rx2;
+                        wire_aux_rect.y2 = ry2;
+                        have_aux_rect = 1;
+                    }
+                }
+            }
+        }
         char *info_p = s->p;
         char *str1_start;
         char *save_p;
         int size1;
+        int emitted_rects = 0;
+        int emitted_aux_rects = 0;
 
         /* Metablock rects for both views.
 
-           FreeRDP's general_ChromaV1ToYUV444 walks the B4/B5 tiles
-           *relative to the rect*: pSrc[0] is offset by roi->top, padHeigth
-           is derived from the roi height, and the uY/vY tile counters
-           restart at zero for every rect. The AV shader that packs the aux
-           plane anchors the 16-row tiling at frame row 0 unconditionally.
-           The two agree only when the rect's top is a multiple of 16.
+           The two AVC444 chroma layouts have different addressing, so they
+           need different alignment of the declared rects.
 
-           Declaring the damage rects here mis-maps every rect whose top is
-           unaligned, and the damage lands entirely in B4/B5 -- all columns
-           of the odd chroma rows -- i.e. horizontal banding, appearing only
-           where the screen changed. aa444map in ~/aa444work quantifies it:
-           roi 0,200 1920x400 gets 49.6% of its chroma samples wrong at
-           MAE 85, while any 16-aligned top is bit-exact.
+           V1 (codec 0x000E, FreeRDP general_ChromaV1ToYUV444) is
+           rect-relative: pSrc[0] is offset by roi->top, padHeigth comes from
+           the roi height, and the uY/vY tile counters restart at zero for
+           every rect. The shader that packs the aux plane anchors its 16-row
+           tiling at frame row 0 unconditionally. After a 16k-row offset the
+           full-frame walk stands at uY = 8k and the rect-relative walk needs
+           uY_rect + roi->top / 2 = uY_rect + 8k, so the two coincide exactly
+           when -- and only when -- the rect's top is a multiple of 16. An
+           unaligned top mis-maps the whole of B4/B5, i.e. all columns of the
+           odd chroma rows: horizontal banding wherever the screen changed.
+           aa444map in ~/aa444work quantifies it: at roi 0,200 1920x400,
+           99.2% of the B4/B5 samples come back wrong at MAE 85.3, while
+           tops of 192 and 208 are bit-exact.
 
-           So both views declare a single full-frame rect. That satisfies
-           the alignment invariant trivially and keeps the two chroma
-           sources -- main's even rows, aux's odd rows -- refreshing from
-           the same frame, so their quantisation error never comes from
-           different points in time. Both streams are encoded full-frame
-           anyway (the shaders only scissor what they redraw; the encoder
-           always sees the whole surface and P-skips the untouched
-           macroblocks), so this costs a few bytes of metablock, not
-           bitrate.
+           V2 (codec 0x000F, general_ChromaV2ToYUV444) has no tiling and no
+           counters -- every source and destination row is computed from the
+           absolute frame row (y + roi->top, roi->top / 2, 2 * y + 1 +
+           roi->top). It needs only an even top, so that roi->top / 2 does
+           not truncate.
 
-           Set XRDP_AVC444_DAMAGE_RECTS=1 to declare the damage rects on
-           the main view instead, for A/B comparison. The aux view has no
-           such switch: unaligned aux rects are simply incorrect. */
+           Both layouts address chroma columns as roi->left / 2 and
+           roi->left / 4 and select destination phases on 4x+0 / 4x+2, so
+           both want left on a multiple of 4. Applying horizontal 4 to V1 as
+           well is harmless and avoids a second axis of conditionals.
+
+           The same aligned rect list goes to both views, which keeps main's
+           even chroma rows and aux's odd chroma rows refreshing from the
+           same frame, so their quantisation error never comes from different
+           points in time.
+
+           This is metadata only: both streams are still encoded full-frame
+           (the shaders only scissor what they redraw; the encoder always
+           sees the whole surface and P-skips the untouched macroblocks), so
+           declaring real rects changes how much the client copies out, not
+           the bitrate or the quality.
+
+           The aux view carries one extra condition. Under
+           XRDP_AVC444_CHROMA_INTERVAL > 1 the helper emits the aux only
+           every Nth frame and renders it over the damage accumulated since
+           the last one (xrdp_accel_assist_x11.c: the aux_x1..aux_y2 box for
+           v2, the whole frame for v1), because chroma would otherwise go
+           stale wherever the screen changed in the frames it skipped. So on
+           an aux frame the aux plane is current over more than this frame's
+           rects, and declaring only this frame's rects would leave the
+           client never copying out the rest: a region that changed during
+           the skipped frames would keep its odd-row/odd-col chroma from the
+           last aux frame, while its luma and even-row chroma came from the
+           main view at the time it changed. That looks like the v1
+           misalignment artifact -- horizontal colour striping in changed
+           regions -- but it is distinguishable: this one appears only in
+           regions that changed between aux frames, and clears when they
+           change again on an aux frame.
+
+           So the aux declares the full frame whenever any luma-only frame
+           has gone by since the last aux. That is safe rather than merely
+           conservative: outside the accumulated box the aux texture is
+           persistent and still holds the chroma from when that region last
+           changed, so copying it out writes back what is already there. At
+           the default CHROMA_INTERVAL=1 the run is always zero and the aux
+           gets the damage rects like the main view.
+
+           Set XRDP_GFX_AVC444_FULL_RECTS=1 to go back to declaring a single
+           full-frame rect on both views, as a kill switch. Like the other
+           XRDP_GFX_* knobs this is read from the xrdp process's own
+           environment -- an xrdp.service drop-in -- not from sesman.ini
+           [SessionVariables], which never reaches xrdp.
+
+           align_x/align_y must be powers of two; the rounding is mask
+           arithmetic. True at all three call sites. */
         {
-            static int use_damage_rects = -1;
+            static int use_full_rects = -1;
             struct xrdp_egfx_rect full;
-            struct xrdp_egfx_rect *main_rects;
-            int main_num_rects;
+            struct xrdp_egfx_rect *meta_rects;
+            int meta_num_rects;
+            int align_y;
 
-            if (use_damage_rects < 0)
+            if (use_full_rects < 0)
             {
-                const char *env = g_getenv("XRDP_AVC444_DAMAGE_RECTS");
-                use_damage_rects = (env != NULL && g_atoi(env) != 0);
+                const char *env = g_getenv("XRDP_GFX_AVC444_FULL_RECTS");
+                use_full_rects = (env != NULL && g_atoi(env) != 0);
             }
             full.x1 = 0;
             full.y1 = 0;
             full.x2 = width;
             full.y2 = height;
-            main_rects = use_damage_rects ? d_rects : &full;
-            main_num_rects = use_damage_rects ? num_rects_d : 1;
+            meta_rects = use_full_rects ? &full : d_rects;
+            meta_num_rects = use_full_rects ? 1 : num_rects_d;
+            align_y = (codec_id == XR_RDPGFX_CODECID_AVC444V2) ? 2 : 16;
 
             out_uint32_le(s, 0); /* cbAvc420EncodedBitstreamInfo, backfilled */
             str1_start = s->p;
-            if (out_RFX_AVC420_METABLOCK(&dst_rect, s, main_rects,
-                                         main_num_rects) != 0 ||
+            if (out_RFX_AVC420_METABLOCK(&dst_rect, s, meta_rects,
+                                         meta_num_rects, 4, align_y,
+                                         &emitted_rects) != 0 ||
                     !s_check_rem_out(s, len1))
             {
                 g_free(s->data); g_free(c_rects); g_free(d_rects); g_free(crects);
@@ -1067,7 +1186,26 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
             size1 = (int) (s->p - str1_start);
             if (len2 > 0)
             {
-                if (out_RFX_AVC420_METABLOCK(&dst_rect, s, &full, 1) != 0 ||
+                struct xrdp_egfx_rect *aux_rects = meta_rects;
+                int aux_num_rects = meta_num_rects;
+
+                if (have_aux_rect)
+                {
+                    /* Exactly what the helper rendered, including its own
+                       full-frame fallbacks -- so this is right whether or
+                       not frames were skipped. */
+                    aux_rects = &wire_aux_rect;
+                    aux_num_rects = 1;
+                }
+                else if (self->avc444_luma_only_run[mon_index] > 0)
+                {
+                    aux_rects = &full;
+                    aux_num_rects = 1;
+                }
+                self->avc444_luma_only_run[mon_index] = 0;
+                if (out_RFX_AVC420_METABLOCK(&dst_rect, s, aux_rects,
+                                             aux_num_rects, 4, align_y,
+                                             &emitted_aux_rects) != 0 ||
                         !s_check_rem_out(s, len2))
                 {
                     g_free(s->data); g_free(c_rects); g_free(d_rects);
@@ -1075,6 +1213,10 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
                     return NULL;
                 }
                 out_uint8a(s, s2, len2);
+            }
+            else
+            {
+                self->avc444_luma_only_run[mon_index]++;
             }
         }
         /* backfill cbAvc420EncodedBitstreamInfo: LC in bits 30-31, and in
@@ -1095,9 +1237,11 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
         if (self->frame_log)
         {
             LOG(LOG_LEVEL_INFO, "gfx_wiretosurface1: AVC444 codec_id 0x%4.4x "
-                "LC %d len1 %d len2 %d size1(bs1+meta) %d total %d pack %d ms",
+                "LC %d len1 %d len2 %d size1(bs1+meta) %d total %d "
+                "rects %d/%d aux_rects %d pack %d ms",
                 codec_id, len2 > 0 ? 0 : 1, len1, len2, size1,
-                bitmap_data_length,
+                bitmap_data_length, emitted_rects, num_rects_d,
+                emitted_aux_rects,
                 (int) (g_get_elapsed_ms() - t_pack));
         }
         rv = xrdp_egfx_wire_to_surface1(bulk, surface_id, codec_id,
@@ -1109,7 +1253,8 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
     }
 
     /* RFX_AVC420_METABLOCK */
-    if (out_RFX_AVC420_METABLOCK(&dst_rect, s, d_rects, num_rects_d) != 0)
+    if (out_RFX_AVC420_METABLOCK(&dst_rect, s, d_rects, num_rects_d,
+                                 2, 2, NULL) != 0)
     {
         g_free(s->data);
         g_free(c_rects);

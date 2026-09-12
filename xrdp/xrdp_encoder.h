@@ -59,6 +59,15 @@ struct xrdp_encoder
     int frame_id_client; /* last frame id received from client */
     int frame_id_server; /* last frame id received from Xorg */
     int frame_id_server_sent;
+    /* AVC444: luma-only frames seen since the last frame that carried an
+       auxiliary view, per monitor. Under XRDP_AVC444_CHROMA_INTERVAL > 1 the
+       helper sends the aux every Nth frame and accumulates the damage of the
+       frames it skipped into it, so on an aux frame the aux plane is current
+       over more than that frame's damage rects. gfx_wiretosurface1 uses this
+       to widen the aux metablock to the full frame in that case; a nonzero
+       count means damage was accumulated that this frame's rects do not
+       cover. */
+    int avc444_luma_only_run[16];
     /* XRDP_GFX_FRAME_LOG: how long the client takes to acknowledge a frame,
        and how deep its own queue is when it does. The client reports its
        queue depth in every ack, which is the one direct measure of whether

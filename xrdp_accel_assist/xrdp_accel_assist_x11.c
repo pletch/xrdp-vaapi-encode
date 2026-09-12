@@ -867,37 +867,50 @@ xrdp_accel_assist_x11_avc444_v2(void)
    MS-RDPEGFX 2.2.4.5 lets a frame carry luma only, by setting LC=1 and
    omitting the second bitstream, and a Windows host exploits that.
 
-   Measured on video playback, busiest sustained 30s of each run so idle
-   time does not skew the frame rate:
+   The cost that binds is PICTURES per second, not bytes -- encode
+   submissions, decode calls and WebCodecs chunks all scale with picture
+   count. Measured on video playback, busiest sustained 30s of each run so
+   idle time does not skew the frame rate:
 
                      fps   Mbit/s   KB/frame   pictures/s
      AVC420         29.6     0.91        3.8         29.6
      interval 3     28.9     8.24       34.8         38.6
      interval 1     24.3     2.21       11.1         48.5
 
-   The limiter is PICTURES per second, not bytes. Interval 3 pushes 4x the
-   bitrate and still runs faster, because it submits 38.6 pictures/s against
-   48.5 -- encode submissions, decode calls and WebCodecs chunks all scale
-   with picture count, and bytes do not bind at these rates.
+   Interval 3 pushed 4x the bitrate there and still ran faster. That 4x was
+   never inherent: before the auxiliary view became a long-term reference, an
+   interval above 1 had to code the aux non-reference (see single_ref in the
+   VAAPI encoder), so it predicted from the main picture of the same frame --
+   luma, not packed chroma -- and coded as good as intra, 77.3 KB against 4.3
+   KB. With LTR the previous aux survives the sliding window across however
+   many main pictures are skipped, and the aux stays predicted: interval 3
+   came down to 1.84 Mbit/s, aux p50 5.9 KB. So the bitrate argument for
+   interval 1 is gone, and the numbers above are kept only as the pre-LTR
+   history that explains the shape.
 
-   So the two settings trade against each other: interval 3 buys frame rate
-   with bandwidth, interval 1 the reverse. Interval 3 is the better default
-   on a LAN; interval 1 if bandwidth is scarce.
+   What now argues against a LARGE interval is on the other side:
 
-   The 4x bitrate is not inherent, it is a defect of this implementation: an
-   interval above 1 forces the aux non-reference (see single_ref in the VAAPI
-   encoder), and a non-reference aux predicts from the main picture of the
-   same frame -- luma, not packed chroma -- so it codes as good as intra,
-   77.3 KB against 4.3 KB at interval 1.
+     - Latency. Chroma trails luma by up to interval-1 frames -- around 280
+       ms at interval 8 and 25 fps, against 80 ms at interval 3.
 
-   And the forced non-reference is not required by skipping itself: frame_num
-   is assigned to the reference pictures actually emitted, so an aux that is
-   never encoded leaves no gap. The real constraint is that the previous aux
-   survive in the DPB across the intervening main pictures, which a 2-frame
-   sliding window cannot do. Holding it as a LONG-TERM reference would give
-   interval 3's picture rate with interval 1's 4.3 KB aux -- both wins at
-   once, and the obvious next move. Confirm iHD honours LTR first; it
-   already ignored ref_pic_list_modification. */
+     - The damage box. The v2 aux pass is confined to the accumulated damage
+       (see the caller), and that box is only reset when the aux is actually
+       sent. A longer interval accumulates more damage per aux frame and
+       reaches the half-the-frame full-frame fallback sooner, so the cost of
+       an aux frame rises with the interval instead of staying flat. It
+       degrades to the old full-frame behaviour, no worse, but the saving
+       from raising the interval is sublinear.
+
+   And the saving itself saturates. Pictures per frame: interval 1 = 2.0,
+   3 = 1.33, 5 = 1.20, 8 = 1.125. 1->3 removes a third of the pictures,
+   3->8 another sixth. Two linear costs against a saturating benefit put the
+   useful range around 3 to 5 rather than higher.
+
+   Default 1 is conservative and not what the measurements favour; raise it
+   once a run at 4 has been compared against 1 on feel and on the frame log.
+   Worth counting how often the aux hits the full-frame fallback while doing
+   that -- if it fires on most aux frames, the interval is buying latency and
+   nothing else. */
 static int
 xrdp_accel_assist_x11_chroma_interval(void)
 {
@@ -1506,6 +1519,14 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
         enum encoder_result rv2;
         static int idr_period = -1;
         int frame_no = mi->avc444_frame_count++;
+        /* The rect the aux was rendered over, forwarded to xrdp so it can
+           declare it rather than assuming the whole frame. Only meaningful
+           for v2: the v1 pass is full-frame by construction. */
+        int have_aux_rect = 0;
+        int aux_x1 = 0;
+        int aux_y1 = 0;
+        int aux_x2 = 0;
+        int aux_y2 = 0;
         int send_aux;
         int aux_i;
         int aux_stage;
@@ -1567,13 +1588,11 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
            len2 stays 0 and xrdp emits LC=1, a luma-only frame with no second
            bitstream. See xrdp_accel_assist_x11_chroma_interval().
 
-           The aux is rendered full-frame for both layouts. v1 has no choice:
-           its B4/B5 tiling maps a damage rect to scattered destination rows.
-           v2's mapping is affine, so partial rendering and damage-rect aux
-           metablocks are both possible there (aa444map says left must be a
-           multiple of 4 and top even) -- not done yet, since the GL pass is
-           cheap next to the encode and the decode, and the encoder P-skips
-           the unchanged macroblocks anyway. */
+           v1 is rendered full-frame and has no choice: its B4/B5 tiling maps
+           a damage rect to scattered destination rows. v2's mapping is
+           affine, so its pass is confined to the accumulated damage box and
+           that same box is what the metablock declares (aa444map says left
+           must be a multiple of 4 and top even). */
         /* Accumulate this frame's damage for the auxiliary view, whether or
            not it goes out now. */
         for (aux_i = 0; aux_i < num_crects; aux_i++)
@@ -1636,6 +1655,13 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
                                                  mi, si, mi->enc_texture_aux,
                                                  1, &aux_rect,
                                                  mi->pad_h, mi->enc_w4, 1);
+                /* Whatever the branch above settled on, including the
+                   full-frame fallbacks, is what xrdp must declare. */
+                have_aux_rect = 1;
+                aux_x1 = aux_rect.x;
+                aux_y1 = aux_rect.y;
+                aux_x2 = aux_rect.x + aux_rect.w;
+                aux_y2 = aux_rect.y + aux_rect.h;
             }
             else
             {
@@ -1717,6 +1743,27 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
         p[4 + len1 + 0] = len2 & 0xff;         p[4 + len1 + 1] = (len2 >> 8) & 0xff;
         p[4 + len1 + 2] = (len2 >> 16) & 0xff; p[4 + len1 + 3] = (len2 >> 24) & 0xff;
         *cdata_bytes = 8 + len1 + len2;
+        if (have_aux_rect && (len2 > 0) &&
+                (*cdata_bytes + XH_AVC444_AUX_RECT_BYTES <= avail))
+        {
+            unsigned char *t = p + *cdata_bytes;
+            unsigned int vals[5];
+            int vi;
+
+            vals[0] = XH_AVC444_AUX_RECT_MAGIC;
+            vals[1] = (unsigned int) aux_x1;
+            vals[2] = (unsigned int) aux_y1;
+            vals[3] = (unsigned int) aux_x2;
+            vals[4] = (unsigned int) aux_y2;
+            for (vi = 0; vi < 5; vi++)
+            {
+                t[vi * 4 + 0] = vals[vi] & 0xff;
+                t[vi * 4 + 1] = (vals[vi] >> 8) & 0xff;
+                t[vi * 4 + 2] = (vals[vi] >> 16) & 0xff;
+                t[vi * 4 + 3] = (vals[vi] >> 24) & 0xff;
+            }
+            *cdata_bytes += XH_AVC444_AUX_RECT_BYTES;
+        }
         return rv;   /* main and aux force IDR together, so rv reflects both */
     }
 

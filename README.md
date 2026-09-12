@@ -32,10 +32,11 @@ H.264. SPS/PPS/slice headers are generated directly — no ffmpeg, no libx264.
   sequencer already enforces GL-before-VAAPI ordering on the GPU itself. The hard
   CPU-side stall was double-syncing; the next frame's GL work can now overlap with
   this frame's encode.
-* **Even-rect fix** in `out_RFX_AVC420_METABLOCK` — the existing −1/+1 chroma margin
-  expansion could produce odd-width rects, which FreeRDP's AVC SSE primitive asserts
-  on and crashes the client (and mstsc tolerates but mis-renders as stripes during
-  P-frame updates). All four edges are now rounded to even.
+* **Metablock rect alignment** in `out_RFX_AVC420_METABLOCK` — the −1/+1 chroma
+  margin expansion could produce odd-width rects, which FreeRDP's AVC SSE primitive
+  asserts on and crashes the client (and mstsc tolerates but mis-renders as stripes
+  during P-frame updates). Every rect is now rounded outward to a per-codec grid,
+  2×2 for AVC420 and more for the two AVC444 layouts — see **AVC444** below.
 * **Hardware-active log line** in `xrdp.log` on the first compressed frame received
   from accel-assist:
   ```
@@ -120,9 +121,43 @@ persistent corruption that looks like a chroma bug but is not.
   auxiliary picture's size still follows the age of its reference rather than how
   much was drawn.
 
-Note that the auxiliary view is rendered full-frame and so needs a *complete* source
-pixmap, not just the current damage. That constrains the capture side — see the
-xorgxrdp fork's README.
+* **The metablocks declare the damage rects**, not a single full-frame rect. A view's
+  metablock is what the client copies out of that view's decoded picture, so a
+  full-frame declaration turns every picture into a full-plane copy on the client
+  regardless of how little changed. Each view rounds its rects outward to its own
+  grid, because the two chroma layouts address differently:
+
+  | view | grid (x × y) | why |
+  | ---- | ------------ | --- |
+  | AVC420 | 2 × 2 | 4:2:0 chroma is half resolution on both axes |
+  | AVC444 v1 | 4 × 16 | `ChromaV1ToYUV444` walks the B4/B5 tiles *relative to the rect*, while the packing shader anchors its 16-row tiling at frame row 0; the two coincide only when the rect's top is a multiple of 16 |
+  | AVC444 v2 | 4 × 2 | `ChromaV2ToYUV444` is absolutely addressed and needs only an even top, but its `roi->left / 4` addressing and 4x+0 / 4x+2 destination phases need left on a multiple of 4 |
+
+  An unaligned v1 top mis-maps the whole of B4/B5 — every column of the odd chroma
+  rows — which reads as horizontal banding wherever the screen changed. The
+  `aa444map` round-trip harness puts 99.2% of B4/B5 samples wrong at MAE 85.3 for a
+  top of 200, and bit-exact at 192 or 208. `pixman`'s union only cuts bands at
+  coordinates present in its inputs, so a region built from aligned rects stays
+  aligned. This is metadata only — both views still encode a full picture — so it
+  changes what the client copies, not the bitrate or the quality.
+
+* **The auxiliary view declares the rect the helper actually rendered.** Under
+  `XRDP_AVC444_CHROMA_INTERVAL > 1` the auxiliary picture carries the damage
+  accumulated across the frames it skipped, which is more than the current frame's
+  rects; declaring only those would leave a region that changed during the skipped
+  frames holding its odd-row chroma from the last auxiliary frame. accel-assist has
+  that rectangle — it is what the v2 shader pass was scissored to — and appends it
+  to the shared-memory payload as an optional 20-byte trailer after
+  `[len1][stream1][len2][stream2]`. The trailer is optional in both directions, so a
+  mismatched pair of binaries falls back to declaring the whole frame rather than to
+  stale chroma. Measured on a 2992×1648 desktop at interval 8, the auxiliary view
+  went from a full-plane copy every time (29.3 ms a picture) to 37% of the plane
+  (12.6 ms), with client throughput rising from 30.4 to 40.8 fps.
+
+Note that the v1 auxiliary view is rendered full-frame, and the v2 view's accumulated
+box grows to the whole picture often enough, so either way the auxiliary pass needs a
+*complete* source pixmap rather than only the current damage. That constrains the
+capture side — see the xorgxrdp fork's README.
 
 * **Chroma is stored as the 2x2 mean**, not the even/even sample. The auxiliary
   view carries three of every four chroma samples; the fourth is never sent, and
@@ -161,6 +196,17 @@ All of these are `[SessionVariables]` in `sesman.ini`, documented there as well:
 | `XRDP_SOUND_MAX_LATENCY_MS` | 0 | drop audio above this measured latency |
 | `XRDP_VAAPI_LOG_SPS` | off | dump the SPS as hex once per session |
 
+These are read by the **xrdp process itself**, so they go in an
+`xrdp.service` systemd drop-in (`Environment=...`), not in `sesman.ini` --
+`[SessionVariables]` only reaches the session (Xorg, xorgxrdp, accel-assist)
+and never xrdp:
+
+| variable | default | effect |
+| -------- | ------- | ------ |
+| `XRDP_GFX_FRAME_LOG` | off | one log line per encoded frame |
+| `XRDP_GFX_FRAMES_IN_FLIGHT` | 2 | encoder queue depth |
+| `XRDP_GFX_AVC444_FULL_RECTS` | off | declare one full-frame AVC444 metablock rect instead of the damage rects |
+
 These are read by xorgxrdp rather than the encoder, and are documented in the
 [xorgxrdp fork](https://github.com/pletch/xorgxrdp-glamor-gbm):
 
@@ -170,6 +216,7 @@ These are read by xorgxrdp rather than the encoder, and are documented in the
 | `XORGXRDP_PACE_MIN_MS` / `_MAX_MS` | 20 / 100 | bounds for the above |
 | `XORGXRDP_CAPTURE_DEPTH` | 1 | 2 captures ahead of the acknowledgement |
 | `XORGXRDP_VFREQ` | 50 | refresh rate the virtual output advertises |
+| `XORGXRDP_COLLAPSE` | `count` | rule for replacing a complex dirty region with its bounding box: `count`, `area` or `never` |
 
 Together, adaptive pacing and capture depth 2 took a native client from 26 to
 51 fps on this host. The pacing loop needs the client round trip xrdp measures,

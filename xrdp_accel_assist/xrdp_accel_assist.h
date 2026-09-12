@@ -41,6 +41,26 @@ struct xh_rect
    xrdp_accel_assist_vaapi_encode. */
 #define XH_ENC_FLAGS_AUXVIEW  (1 << 1)
 
+/* Optional trailer on the AVC444 shared-memory payload.
+
+   The payload is framed [len1][stream1][len2][stream2]. When the auxiliary
+   view is present and its layout is v2, accel-assist appends the rectangle
+   it actually rendered the aux over -- the damage accumulated since the last
+   aux picture, not this frame's damage, because under
+   XRDP_AVC444_CHROMA_INTERVAL > 1 the aux carries the frames it skipped.
+   xrdp declares that rectangle in the aux metablock; without it xrdp has to
+   assume the whole frame, which at interval 8 makes every aux copy a
+   full-plane copy on the client.
+
+   The trailer is optional in both directions. An accel-assist that does not
+   append it leaves xrdp on the full-frame fallback, which is conservative
+   but correct; an xrdp that does not look for it ignores the extra bytes.
+   Neither half has to match the other's version.
+
+   Layout: magic, then x1, y1, x2, y2 as signed 32-bit little-endian. */
+#define XH_AVC444_AUX_RECT_MAGIC 0x52584141  /* "AAXR" */
+#define XH_AVC444_AUX_RECT_BYTES 20
+
 /* Session capability bits, sent by xorgxrdp as message type 3 of the
    accel-assist control batch. */
 #define XH_CAPS_AVC444        (1 << 0)
