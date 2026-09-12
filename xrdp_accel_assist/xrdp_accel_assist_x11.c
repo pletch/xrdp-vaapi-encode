@@ -906,11 +906,13 @@ xrdp_accel_assist_x11_avc444_v2(void)
    3->8 another sixth. Two linear costs against a saturating benefit put the
    useful range around 3 to 5 rather than higher.
 
-   Default 1 is conservative and not what the measurements favour; raise it
-   once a run at 4 has been compared against 1 on feel and on the frame log.
-   Worth counting how often the aux hits the full-frame fallback while doing
-   that -- if it fires on most aux frames, the interval is buying latency and
-   nothing else. */
+   Default 4. Interval 1 is unusable in practice -- it doubles the picture
+   rate and was never run for real; 8 was, and worked, but it predates the
+   damage box, which gives the larger interval a cost it did not have then.
+   4 keeps most of the picture-rate saving at a quarter of interval 8's
+   accumulation and half its chroma lag. Worth counting how often the aux
+   hits the full-frame fallback: if it fires on most aux frames, the
+   interval is buying latency and nothing else. */
 static int
 xrdp_accel_assist_x11_chroma_interval(void)
 {
@@ -920,7 +922,7 @@ xrdp_accel_assist_x11_chroma_interval(void)
     if (interval < 0)
     {
         env = g_getenv("XRDP_AVC444_CHROMA_INTERVAL");
-        interval = (env != NULL) ? g_atoi(env) : 1;
+        interval = (env != NULL) ? g_atoi(env) : 4;
         if (interval < 1)
         {
             interval = 1;

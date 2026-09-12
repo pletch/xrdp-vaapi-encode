@@ -106,9 +106,12 @@ persistent corruption that looks like a chroma bug but is not.
   header is written directly, because iHD predicts from the LTR but does not emit
   the `dec_ref_pic_marking()` MMCO that tells the decoder about it.
 * **Chroma interval** — the auxiliary picture only needs to be sent periodically.
-  `XRDP_AVC444_CHROMA_INTERVAL=8` refreshes chroma every eighth frame while luma
-  updates every frame, and measured far smoother than every-frame chroma with no
-  visible penalty on desktop content. Frames without it carry `LC=1` (luma only).
+  The default of 4 refreshes chroma every fourth frame while luma updates every
+  frame, and measures far smoother than every-frame chroma with no visible penalty
+  on desktop content. Frames without it carry `LC=1` (luma only). Larger intervals
+  work — 8 was the previous default — but chroma then lags luma by up to
+  interval-1 frames, and the auxiliary view's accumulated damage box reaches its
+  full-frame fallback sooner, so the saving falls off.
 * **Packed shaders** — the RGB→NV12 conversion writes four destination bytes per
   fragment as RGBA8 over a quarter-width viewport, for both the main and auxiliary
   views.
@@ -190,7 +193,7 @@ All of these are `[SessionVariables]` in `sesman.ini`, documented there as well:
 | -------- | ------- | ------ |
 | `XRDP_USE_ACCEL_ASSIST` | off | required for any of the below |
 | `XRDP_ACCEL_AVC444` | off | AVC444; negotiated, falls back to AVC420 |
-| `XRDP_AVC444_CHROMA_INTERVAL` | 1 | frames between auxiliary (chroma) pictures |
+| `XRDP_AVC444_CHROMA_INTERVAL` | 4 | frames between auxiliary (chroma) pictures |
 | `XRDP_VAAPI_QP` / `_AUX_QP` | 26 | constant quantiser, 1-51 |
 | `XRDP_VAAPI_BITRATE` | 0 (CQP) | kbit/s; switches to VBR |
 | `XRDP_SOUND_MAX_LATENCY_MS` | 0 | drop audio above this measured latency |
