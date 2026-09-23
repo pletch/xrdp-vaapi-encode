@@ -255,3 +255,113 @@ EnableSyslog=true
 PULSE_SCRIPT=@sesmansysconfdir@/pulse/default.pa
 ;XRDP_USE_ACCEL_ASSIST=1
 ;XRDP_NVIDIA_GRID=1
+
+; ---------------------------------------------------------------------------
+; Hardware-accelerated H.264 (xrdp_accel_assist). All optional and all off
+; unless set. XRDP_USE_ACCEL_ASSIST above must be enabled for any of them to
+; have an effect.
+;
+; AVC444 sends a second H.264 picture carrying the chroma that 4:2:0 drops,
+; giving true 4:4:4 colour. It is what keeps subpixel-antialiased text crisp.
+; The client must advertise support; xrdp negotiates and falls back to AVC420
+; on its own, so this can be left on. Set to 0 to force AVC420.
+;XRDP_ACCEL_AVC444=1
+; Which AVC444 chroma layout to use. Normally derived from the confirmed
+; EGFX capability version -- 10.2 and later get the v2 layout, a bare 10.0
+; client is held to v1 -- because MS-RDPEGFX has no capability flag that
+; separates them and a client that cannot parse codec id 0x000F has no way
+; to say so. Set to 1 to force v2 or 0 to force v1.
+;XRDP_ACCEL_AVC444_V2=1
+; How often the auxiliary chroma picture is sent, in frames. 1 sends it every
+; frame, which is correct but roughly doubles the encode cost. Higher values
+; refresh chroma less often; luma still updates every frame, so the cost is
+; brief colour lag on fast motion.
+;XRDP_AVC444_CHROMA_INTERVAL=4
+; Upper bound on that colour lag, in milliseconds. The interval above is a
+; rate limit, not a deadline: frames are damage-driven, so a quiet desktop
+; emitting a frame a second stretches "every fourth frame" to four seconds,
+; and a change is then drawn with chroma from seconds earlier. The auxiliary
+; picture also goes out whenever this long has passed since the last one.
+; During motion the interval always fires first and this costs nothing. Set
+; to 0 to disable the deadline and count frames only.
+;XRDP_AVC444_CHROMA_MAX_MS=200
+; A synchronised IDR on both views at most this often, in milliseconds. Some
+; clients' decoders -- mstsc's hardware-decoding path on at least some Intel
+; GPUs -- occasionally get the two views into a bad state that shows as pink
+; and green patches and persists until an IDR; this bounds it to one period.
+; It rides on the next frame, so a still desktop costs nothing. 0 disables it.
+;XRDP_AVC444_IDR_MS=10000
+; ...and only once this many KB have been sent since the last IDR, so a
+; desktop that merely ticks (a clock showing seconds) does not pay for one
+; every period. About one IDR's worth at 1080p; 0 removes the minimum.
+;XRDP_AVC444_IDR_MIN_KB=100
+; Constant quantiser, 1-51. Lower is better quality and more bits. The
+; defaults are 28 for the main view and 18 for the auxiliary view, which
+; carries chroma in its luma plane and so gets its own value. 26 for the main
+; view is a reasonable desktop setting where bandwidth allows.
+;XRDP_VAAPI_QP=28
+;XRDP_VAAPI_AUX_QP=18
+; Rate control. By default the encoder runs at constant QP, which holds
+; quality steady but leaves frame size unbounded -- a high-motion frame can be
+; an order of magnitude larger than a still one. Setting a bitrate in kbit/s
+; switches to VBR, where the QPs above become the initial and maximum
+; quantiser. Useful on a bandwidth-constrained link; on a LAN it measured no
+; smoother than constant QP, so leave it unset unless bandwidth is the limit.
+;XRDP_VAAPI_BITRATE=5000
+; Render node to encode on, when the default pick is wrong.
+;XRDP_VAAPI_DEVICE=/dev/dri/renderD128
+;
+; Audio. The drift corrector in chansrv fires when the wave-confirm round trip
+; grows 250 ms beyond the best ever seen, which catches a round trip that
+; degrades during a session but not a latency that was already present when
+; the stream opened. This adds an absolute ceiling in milliseconds: above it,
+; audio is dropped to shorten the client's queue. 0, the default, disables it.
+; A client that buffers the opening burst can otherwise sit a full second
+; behind the picture for the whole session.
+;XRDP_SOUND_MAX_LATENCY_MS=250
+;
+; Capture pacing (read by xorgxrdp, not by the encoder).
+;
+; How often the screen is captured is normally fixed, seeded from
+; h264_frame_interval in xrdp.ini. Fixed, it has to be tuned to the slowest
+; client that will connect and then throttles every other client sharing the
+; session. Measured on one host, same session and same content: a native
+; client acknowledged frames in 11-18 ms while a browser client at HiDPI took
+; 222-289. No single value serves both.
+;
+; XORGXRDP_ADAPTIVE_PACE=1 steers the interval per connection from the round
+; trip xrdp measures to that client, so each gets the rate it can actually
+; take. h264_frame_interval then only seeds it. MIN and MAX bound the result;
+; the floor should not go below the source's own refresh (see VFREQ), since
+; capturing faster than the desktop paints finds nothing changed.
+;XORGXRDP_ADAPTIVE_PACE=1
+;XORGXRDP_PACE_MIN_MS=20
+;XORGXRDP_PACE_MAX_MS=100
+;
+; Capture depth. One means strict lockstep: nothing is captured until the
+; previous frame has been acknowledged, which leaves the pipeline idle for a
+; whole round trip. Two captures the next frame while the previous is still in
+; flight. Measured with a native client and a saturating source, going from
+; one to two took 26 fps to 51, with blocked capture callbacks falling from
+; 155-173 per hundred frames to 1-6.
+;
+; Two is safe only because each capture buffer is given the damage it missed
+; as well as the current frame's: the AVC444 auxiliary view is rendered
+; full-frame and reads the whole source texture, so a buffer holding only its
+; own share of the damage shows blocks of stale content.
+;XORGXRDP_CAPTURE_DEPTH=2
+;
+; The refresh rate the virtual output advertises. There is no physical one, and
+; the value is a fiction either way, but applications that pace to the RandR
+; mode will not paint faster than it -- so 60 fps content on a 50 Hz output
+; loses every sixth frame, which reads as judder. Raising it also raises the
+; damage rate for every client on the session, and one that cannot keep up
+; pays for that in latency rather than frames. Default 50, range 1-240.
+;XORGXRDP_VFREQ=50
+;
+; Diagnostics, off in production. The SPS and the audio round trip are also
+; logged at debug level (XRDP_ACCEL_ASSIST_LOG_LEVEL, chansrv's log level).
+;XRDP_VAAPI_TIMING=1
+;XORGXRDP_TIMING=1
+;XRDP_AVC444_DUMP_DIR=/tmp/avc444
+; ---------------------------------------------------------------------------
