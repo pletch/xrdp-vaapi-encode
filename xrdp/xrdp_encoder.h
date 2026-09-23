@@ -79,6 +79,7 @@ struct xrdp_encoder
     xrdp_encoder_h264_create_proc xrdp_encoder_h264_create;
     xrdp_encoder_h264_delete_proc xrdp_encoder_h264_delete;
     xrdp_encoder_h264_encode_proc xrdp_encoder_h264_encode;
+    int hw_accel_announced;     /* hardware path logged once */
 };
 
 /* cmd_id = 0 */

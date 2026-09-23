@@ -36,6 +36,23 @@ struct xh_rect
 };
 
 #define XH_ENC_FLAGS_FORCEIDR (1 << 0)
+/* AVC444: encode the auxiliary (chroma) view. Both views are pictures of
+   one H.264 sequence. */
+#define XH_ENC_FLAGS_AUXVIEW  (1 << 1)
+
+/* Optional trailer on the AVC444 payload
+   ([len1][stream1][len2][stream2]): for a v2 aux view, the rect the aux
+   was rendered over (accumulated damage since the last aux), for xrdp to
+   declare in the aux metablock. Without it xrdp declares the full frame.
+   Optional in both directions.
+
+   Layout: magic, then x1, y1, x2, y2 as signed 32-bit little-endian. */
+#define XH_AVC444_AUX_RECT_MAGIC 0x52584141  /* "AAXR" */
+#define XH_AVC444_AUX_RECT_BYTES 20
+
+/* Session capability bits from xorgxrdp's control batch. */
+#define XH_CAPS_AVC444        (1 << 0)
+#define XH_CAPS_AVC444_V2     (1 << 1)
 
 enum encoder_result
 {
