@@ -36,6 +36,7 @@
 #include "chansrv_common.h"
 #include "chansrv_config.h"
 #include "list.h"
+#include "string_calls.h"
 #include "audin.h"
 
 #if defined(XRDP_FDK_AAC)
@@ -80,8 +81,9 @@ static int    g_bytes_in_stream = 0;
 struct fifo  *g_in_fifo;
 int    g_bytes_in_fifo = 0;
 static int    g_time_diff = 0;
+/* XRDP_SOUND_MAX_LATENCY_MS, -1 until read, 0 = disabled */
+static int    g_snd_max_latency_ms = -1;
 static int    g_best_time_diff = 0;
-
 
 static struct stream *g_stream_inp = NULL;
 static struct stream *g_stream_incoming_packet = NULL;
@@ -911,8 +913,31 @@ sound_send_wave_data(char *data, int data_bytes)
     int res;
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "sound_send_wave_data: sending %d bytes", data_bytes);
-    if (g_time_diff > g_best_time_diff + 250)
+    /* Behind if the averaged wave-confirm round trip has grown 250 ms past
+       the best seen. That misses latency present from the start, since the
+       best is learned from the first confirms, so
+       XRDP_SOUND_MAX_LATENCY_MS adds an absolute ceiling (0, the default,
+       disables it). */
+    if (g_snd_max_latency_ms < 0)
     {
+        const char *env = g_getenv("XRDP_SOUND_MAX_LATENCY_MS");
+
+        g_snd_max_latency_ms = (env != NULL) ? g_atoi(env) : 0;
+        if (g_snd_max_latency_ms < 0)
+        {
+            g_snd_max_latency_ms = 0;
+        }
+        if (g_snd_max_latency_ms > 0)
+        {
+            LOG(LOG_LEVEL_INFO, "sound: dropping audio above %d ms of "
+                "measured latency", g_snd_max_latency_ms);
+        }
+    }
+    if ((g_time_diff > g_best_time_diff + 250) ||
+            ((g_snd_max_latency_ms > 0) && (g_time_diff > g_snd_max_latency_ms)))
+    {
+        /* Send a quarter as silence, discarding the rest of the block, to
+           shorten the client's queue. */
         data_bytes = data_bytes / 4;
         data_bytes = data_bytes & ~3;
         g_memset(data, 0, data_bytes);
@@ -1038,6 +1063,19 @@ sound_process_wave_confirm(struct stream *s, int size)
         }
     }
     g_time_diff = acc;
+    /* The instantaneous and averaged round trip, periodically, at debug
+       level. */
+    {
+        static int drift_count = 0;
+
+        if ((drift_count++ % 50) == 0)
+        {
+            LOG(LOG_LEVEL_DEBUG, "sound drift: rtt %d ms, mean %d ms, "
+                "best %d ms, over-best %d ms, blocks sent %d, buffered %d B",
+                time_diff, g_time_diff, g_best_time_diff,
+                g_time_diff - g_best_time_diff, g_cBlockNo, g_buf_index);
+        }
+    }
     return 0;
 }
 
@@ -1603,4 +1641,3 @@ sound_start_sink_listener(void)
     }
     return 0;
 }
-
