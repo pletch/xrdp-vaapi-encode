@@ -61,6 +61,7 @@ waitforx/waitforx
 xrdp/xrdp
 xrdp/xrdp.ini
 xrdp_configure_options.h
+xrdpapi/xrdp-xrdpapi-connectmon
 xrdpapi/xrdp-xrdpapi-simple
 .vscode/*
 xrdp_accel_assist/xrdp-accel-assist
