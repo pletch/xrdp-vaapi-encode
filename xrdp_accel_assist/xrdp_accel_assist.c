@@ -31,6 +31,7 @@
 #include "string_calls.h"
 #include "log.h"
 
+#include "xrdp_client_info.h"
 #include "xrdp_accel_assist.h"
 #include "xrdp_accel_assist_x11.h"
 
@@ -50,6 +51,7 @@ struct xorgxrdp_info
 };
 
 static int g_display_num = 0;
+static int g_force_avc444 = -1; /* -1 = not yet checked, see XRDP_ACCEL_AVC444 */
 
 /*****************************************************************************/
 static int
@@ -73,11 +75,27 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
     int encoder_flags;
     char *flags_pointer;
     char *final_pointer;
+    char *codec_id_pointer;
 
     (void)pixel_format;
-    (void)codec_id;
     (void)surface_id;
     (void)rv;
+
+    /* xorgxrdp normally asks for the AVC444 codec id itself.
+       XRDP_ACCEL_AVC444 forces the upgrade of AVC420 commands, for testing;
+       only safe with a client that can decode 0x000E. */
+    if (g_force_avc444 < 0)
+    {
+        const char *env = g_getenv("XRDP_ACCEL_AVC444");
+        /* Tri-state as in xrdp_accel_assist_x11_avc444_enabled(); only
+           force-on rewrites here. */
+        g_force_avc444 = (env != NULL) && (g_strcmp(env, "0") != 0);
+        if (g_force_avc444)
+        {
+            LOG(LOG_LEVEL_INFO, "gfx_wiretosurface1: XRDP_ACCEL_AVC444 is "
+                "set, forcing AVC444 regardless of client capabilities");
+        }
+    }
 
     if (xi->shmem_fd_ret != -1)
     {
@@ -99,10 +117,20 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
         return 1;
     }
     in_uint16_le(s, surface_id);
+    codec_id_pointer = s->p;
     in_uint16_le(s, codec_id);
     in_uint8(s, pixel_format);
     flags_pointer = s->p;
     in_uint32_le(s, flags);
+    if (g_force_avc444 && codec_id == 0x000B) /* AVC420 -> AVC444 */
+    {
+        codec_id = 0x000E;
+    }
+    /* The codec id follows the helper's aux layout: 0x000E v1, 0x000F v2. */
+    if (codec_id == 0x000E && xrdp_accel_assist_x11_avc444_v2())
+    {
+        codec_id = 0x000F;
+    }
     LOG_DEVEL(LOG_LEVEL_INFO, "gfx_wiretosurface1: surface_id %d codec_id %d "
               "pixel_format %d flags %d",
               surface_id, codec_id, pixel_format, flags);
@@ -166,20 +194,33 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
     (void)top;
 
     cdata_bytes = GFX_MAP_SIZE;
-    encoder_flags = 0;
+    /* Keep xorgxrdp's flag bits rather than rebuilding the word, so a bit
+       added later is not silently cleared. */
+    encoder_flags = flags & ~(unsigned int) XH_ENC_FLAGS_FORCEIDR;
     if (xi->idr_count > 0)
     {
-        encoder_flags = XH_ENC_FLAGS_FORCEIDR;
+        encoder_flags |= XH_ENC_FLAGS_FORCEIDR;
         xi->idr_count--;
     }
     rv = xrdp_accel_assist_x11_encode_pixmap(0, 0,
          width, height, surface_id,
          num_rects_c, crects,
          addr, &cdata_bytes,
-         encoder_flags);
+         codec_id, encoder_flags);
     LOG_DEVEL(LOG_LEVEL_INFO, "gfx_wiretosurface1: rv %d cdata_bytes %d",
               rv, cdata_bytes);
+    if (codec_id == 0x000E || codec_id == 0x000F)
+    {
+        int alen1 = ((unsigned char *) addr)[0]
+                    | (((unsigned char *) addr)[1] << 8)
+                    | (((unsigned char *) addr)[2] << 16)
+                    | (((unsigned char *) addr)[3] << 24);
+        LOG(LOG_LEVEL_INFO, "gfx_wiretosurface1: AVC444 codec_id 0x%4.4x "
+            "rv %d cdata_bytes %d (len1 %d)", codec_id, rv, cdata_bytes, alen1);
+    }
 
+    s->p = codec_id_pointer;
+    out_uint16_le(s, codec_id); /* forward the (possibly forced) codec id */
     s->p = flags_pointer;
     flags |= 1;
     out_uint32_le(s, flags); /* set already encoded bit */
@@ -440,7 +481,7 @@ xorg_process_message_64(struct xorgxrdp_info *xi, struct stream *s)
                          (flags >> 28) & 0xF,
                          num_crects, crects,
                          bmpdata + 4,
-                         &cdata_bytes, encoder_flags);
+                         &cdata_bytes, 0x000B /* AVC420 */, encoder_flags);
                     if (rv == ENCODER_ERROR)
                     {
                         LOG(LOG_LEVEL_ERROR, "error %d", rv);
@@ -496,6 +537,7 @@ xorg_process_message(struct xorgxrdp_info *xi, struct stream *s)
     int magic;
     int con_id;
     int mon_id;
+    int caps;
     int ret;
 
     xi->shmem_fd_ret = -1;
@@ -568,6 +610,16 @@ xorg_process_message(struct xorgxrdp_info *xi, struct stream *s)
                     LOG(LOG_LEVEL_DEBUG, "calling xrdp_accel_assist_x11_create_pixmap");
                     xrdp_accel_assist_x11_create_pixmap(width, height, magic,
                                                         con_id, mon_id);
+                    break;
+                case 4:
+                    /* Session capabilities, sent by xorgxrdp before the
+                       pixmap creates that depend on them. Either side may be
+                       older: unknown messages are skipped by size. Ids are
+                       shared with xrdp, which parses the same batch; 3 is
+                       taken there. */
+                    in_uint32_le(s, caps);
+                    LOG(LOG_LEVEL_INFO, "session capabilities 0x%8.8x", caps);
+                    xrdp_accel_assist_x11_set_caps(caps);
                     break;
             }
             s->p = phold + size;

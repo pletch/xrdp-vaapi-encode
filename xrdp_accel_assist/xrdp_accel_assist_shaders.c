@@ -35,6 +35,7 @@ void main(void)\n\
     gl_FragColor = texture2D(tex, gl_FragCoord.xy / tex_size);\n\
 }\n";
 
+/* Four bytes per fragment, as in the MV shader below; 2x2 chroma mean. */
 static const GLchar g_fs_rgb_to_yuv420[] = "\
 uniform sampler2D tex;\n\
 uniform vec2 tex_size;\n\
@@ -43,43 +44,43 @@ uniform vec4 umath;\n\
 uniform vec4 vmath;\n\
 void main(void)\n\
 {\n\
-    vec4 pix;\n\
-    float x;\n\
+    vec4 p0;\n\
+    vec4 p1;\n\
+    vec4 p2;\n\
+    vec4 p3;\n\
+    vec4 ca;\n\
+    vec4 cb;\n\
+    float bx;\n\
     float y;\n\
-    x = gl_FragCoord.x;\n\
+    float sy;\n\
+    bx = floor(gl_FragCoord.x) * 4.0;\n\
     y = gl_FragCoord.y;\n\
     if (y < tex_size.y)\n\
     {\n\
-        pix = texture2D(tex, vec2(x, y) / tex_size);\n\
-        pix.a = 1.0;\n\
-        pix = vec4(clamp(dot(ymath, pix), 0.0, 1.0), 0.0, 0.0, 1.0);\n\
-        gl_FragColor = pix;\n\
+        p0 = texture2D(tex, vec2(bx + 0.5, y) / tex_size); p0.a = 1.0;\n\
+        p1 = texture2D(tex, vec2(bx + 1.5, y) / tex_size); p1.a = 1.0;\n\
+        p2 = texture2D(tex, vec2(bx + 2.5, y) / tex_size); p2.a = 1.0;\n\
+        p3 = texture2D(tex, vec2(bx + 3.5, y) / tex_size); p3.a = 1.0;\n\
+        gl_FragColor = clamp(vec4(dot(ymath, p0), dot(ymath, p1),\n\
+                                  dot(ymath, p2), dot(ymath, p3)),\n\
+                             0.0, 1.0);\n\
     }\n\
     else\n\
     {\n\
-        y = floor(y - tex_size.y) * 2.0 + 0.5;\n\
-        if (mod(x, 2.0) < 1.0)\n\
-        {\n\
-            pix = texture2D(tex, vec2(x, y) / tex_size);\n\
-            pix += texture2D(tex, vec2(x + 1.0, y) / tex_size);\n\
-            pix += texture2D(tex, vec2(x, y + 1.0) / tex_size);\n\
-            pix += texture2D(tex, vec2(x + 1.0, y + 1.0) / tex_size);\n\
-            pix /= 4.0;\n\
-            pix.a = 1.0;\n\
-            pix = vec4(clamp(dot(umath, pix), 0.0, 1.0), 0.0, 0.0, 1.0);\n\
-            gl_FragColor = pix;\n\
-        }\n\
-        else\n\
-        {\n\
-            pix = texture2D(tex, vec2(x, y) / tex_size);\n\
-            pix += texture2D(tex, vec2(x - 1.0, y) / tex_size);\n\
-            pix += texture2D(tex, vec2(x, y + 1.0) / tex_size);\n\
-            pix += texture2D(tex, vec2(x - 1.0, y + 1.0) / tex_size);\n\
-            pix /= 4.0;\n\
-            pix.a = 1.0;\n\
-            pix = vec4(clamp(dot(vmath, pix), 0.0, 1.0), 0.0, 0.0, 1.0);\n\
-            gl_FragColor = pix;\n\
-        }\n\
+        sy = floor(y - tex_size.y) * 2.0 + 0.5;\n\
+        ca = texture2D(tex, vec2(bx + 0.5, sy) / tex_size)\n\
+           + texture2D(tex, vec2(bx + 1.5, sy) / tex_size)\n\
+           + texture2D(tex, vec2(bx + 0.5, sy + 1.0) / tex_size)\n\
+           + texture2D(tex, vec2(bx + 1.5, sy + 1.0) / tex_size);\n\
+        ca *= 0.25; ca.a = 1.0;\n\
+        cb = texture2D(tex, vec2(bx + 2.5, sy) / tex_size)\n\
+           + texture2D(tex, vec2(bx + 3.5, sy) / tex_size)\n\
+           + texture2D(tex, vec2(bx + 2.5, sy + 1.0) / tex_size)\n\
+           + texture2D(tex, vec2(bx + 3.5, sy + 1.0) / tex_size);\n\
+        cb *= 0.25; cb.a = 1.0;\n\
+        gl_FragColor = clamp(vec4(dot(umath, ca), dot(vmath, ca),\n\
+                                  dot(umath, cb), dot(vmath, cb)),\n\
+                             0.0, 1.0);\n\
     }\n\
 }\n";
 
@@ -160,43 +161,66 @@ MAIN VIEW - NV12
     ...
     0E 0E 2E 2E 4E 4E 6E 6E 8E 8E AE AE CE CE EE EE
 */
+/* pad_h: the Y/UV plane boundary of the destination. For AVC444 both
+   views share one sequence, so both use the 16-aligned height the aux view
+   requires (MS-RDPEGFX 2.2.4.4.2). Rows past the source are clamped and
+   never read by the client. */
+/* The NV12 destination is written as RGBA8 over a quarter-width viewport,
+   four bytes per fragment: single-byte writes to the linear dma-buf
+   coalesce badly, and it removes the per-fragment U/V branch.
+   gl_FragColor.r is the lowest address, so fragment x writes bytes
+   4x .. 4x+3. */
 static const GLchar g_fs_rgb_to_yuv420_mv[] = "\
 uniform sampler2D tex;\n\
 uniform vec2 tex_size;\n\
+uniform float pad_h;\n\
 uniform vec4 ymath;\n\
 uniform vec4 umath;\n\
 uniform vec4 vmath;\n\
 void main(void)\n\
 {\n\
-    vec4 pix;\n\
-    float x;\n\
+    vec4 p0;\n\
+    vec4 p1;\n\
+    vec4 p2;\n\
+    vec4 p3;\n\
+    vec4 ca;\n\
+    vec4 cb;\n\
+    float bx;\n\
     float y;\n\
-    x = gl_FragCoord.x;\n\
+    float sy;\n\
+    bx = floor(gl_FragCoord.x) * 4.0;\n\
     y = gl_FragCoord.y;\n\
-    if (y < tex_size.y)\n\
+    if (y < pad_h)\n\
     {\n\
-        pix = texture2D(tex, vec2(x, y) / tex_size);\n\
-        pix.a = 1.0;\n\
-        pix = vec4(clamp(dot(ymath, pix), 0.0, 1.0), 0.0, 0.0, 1.0);\n\
-        gl_FragColor = pix;\n\
+        /* four luma bytes from four consecutive source pixels */\n\
+        p0 = texture2D(tex, vec2(bx + 0.5, y) / tex_size); p0.a = 1.0;\n\
+        p1 = texture2D(tex, vec2(bx + 1.5, y) / tex_size); p1.a = 1.0;\n\
+        p2 = texture2D(tex, vec2(bx + 2.5, y) / tex_size); p2.a = 1.0;\n\
+        p3 = texture2D(tex, vec2(bx + 3.5, y) / tex_size); p3.a = 1.0;\n\
+        gl_FragColor = clamp(vec4(dot(ymath, p0), dot(ymath, p1),\n\
+                                  dot(ymath, p2), dot(ymath, p3)),\n\
+                             0.0, 1.0);\n\
     }\n\
     else\n\
     {\n\
-        y = floor(y - tex_size.y) * 2.0 + 0.5;\n\
-        if (mod(x, 2.0) < 1.0)\n\
-        {\n\
-            pix = texture2D(tex, vec2(x, y) / tex_size);\n\
-            pix.a = 1.0;\n\
-            pix = vec4(clamp(dot(umath, pix), 0.0, 1.0), 0.0, 0.0, 1.0);\n\
-            gl_FragColor = pix;\n\
-        }\n\
-        else\n\
-        {\n\
-            pix = texture2D(tex, vec2(x - 1.0, y) / tex_size);\n\
-            pix.a = 1.0;\n\
-            pix = vec4(clamp(dot(vmath, pix), 0.0, 1.0), 0.0, 0.0, 1.0);\n\
-            gl_FragColor = pix;\n\
-        }\n\
+        /* NV12 UV row: U,V,U,V, each the MEAN of its 2x2 block. Under\n\
+           AVC444 the decoder recovers the fourth chroma sample as\n\
+           4*mean - u1 - u2 - u3 (FreeRDP prim_YUV.c), so a plain sample\n\
+           here speckles high-contrast edges. */\n\
+        sy = floor(y - pad_h) * 2.0 + 0.5;\n\
+        ca = texture2D(tex, vec2(bx + 0.5, sy) / tex_size)\n\
+           + texture2D(tex, vec2(bx + 1.5, sy) / tex_size)\n\
+           + texture2D(tex, vec2(bx + 0.5, sy + 1.0) / tex_size)\n\
+           + texture2D(tex, vec2(bx + 1.5, sy + 1.0) / tex_size);\n\
+        ca *= 0.25; ca.a = 1.0;\n\
+        cb = texture2D(tex, vec2(bx + 2.5, sy) / tex_size)\n\
+           + texture2D(tex, vec2(bx + 3.5, sy) / tex_size)\n\
+           + texture2D(tex, vec2(bx + 2.5, sy + 1.0) / tex_size)\n\
+           + texture2D(tex, vec2(bx + 3.5, sy + 1.0) / tex_size);\n\
+        cb *= 0.25; cb.a = 1.0;\n\
+        gl_FragColor = clamp(vec4(dot(umath, ca), dot(vmath, ca),\n\
+                                  dot(umath, cb), dot(vmath, cb)),\n\
+                             0.0, 1.0);\n\
     }\n\
 }\n";
 
@@ -221,63 +245,77 @@ AUXILIARY VIEW - NV12
     ...
     1E 1E 3E 3E 5E 5E 7E 7E 9E 9E BE BE DE DE FE FE
 */
+/* The v1 aux surface is (W, H_PAD), H_PAD = (H+15)&~15. pad_h sets the
+   plane boundary; tex_size normalises source sampling. Rows past the
+   source are clamped and never read. */
 static const GLchar g_fs_rgb_to_yuv420_av[] = "\
 uniform sampler2D tex;\n\
 uniform vec2 tex_size;\n\
+uniform float pad_h;\n\
 uniform vec4 umath;\n\
 uniform vec4 vmath;\n\
 void main(void)\n\
 {\n\
-    vec4 pix;\n\
-    float x;\n\
+    vec4 p0;\n\
+    vec4 p1;\n\
+    vec4 p2;\n\
+    vec4 p3;\n\
+    vec4 ca;\n\
+    vec4 cb;\n\
+    float bx;\n\
     float y;\n\
     float y1;\n\
-    x = gl_FragCoord.x;\n\
+    float sy;\n\
+    bx = floor(gl_FragCoord.x) * 4.0;\n\
     y = gl_FragCoord.y;\n\
-    if (y < tex_size.y)\n\
+    if (y < pad_h)\n\
     {\n\
         y1 = mod(y, 16.0);\n\
         if (y1 < 8.0)\n\
         {\n\
-            y = floor(y / 16.0) * 8.0 + y1;\n\
-            y = floor(y) * 2.0 + 1.5;\n\
-            pix = texture2D(tex, vec2(x, y) / tex_size);\n\
-            pix.a = 1.0;\n\
-            pix = vec4(clamp(dot(umath, pix), 0.0, 1.0), 0.0, 0.0, 1.0);\n\
-            gl_FragColor = pix;\n\
+            sy = floor(y / 16.0) * 8.0 + y1;\n\
+            sy = floor(sy) * 2.0 + 1.5;\n\
+            p0 = texture2D(tex, vec2(bx + 0.5, sy) / tex_size); p0.a = 1.0;\n\
+            p1 = texture2D(tex, vec2(bx + 1.5, sy) / tex_size); p1.a = 1.0;\n\
+            p2 = texture2D(tex, vec2(bx + 2.5, sy) / tex_size); p2.a = 1.0;\n\
+            p3 = texture2D(tex, vec2(bx + 3.5, sy) / tex_size); p3.a = 1.0;\n\
+            gl_FragColor = clamp(vec4(dot(umath, p0), dot(umath, p1),\n\
+                                      dot(umath, p2), dot(umath, p3)),\n\
+                                 0.0, 1.0);\n\
         }\n\
         else\n\
         {\n\
-            y = floor(y / 16.0) * 8.0 + (y1 - 8.0);\n\
-            y = floor(y) * 2.0 + 1.5;\n\
-            pix = texture2D(tex, vec2(x, y) / tex_size);\n\
-            pix.a = 1.0;\n\
-            pix = vec4(clamp(dot(vmath, pix), 0.0, 1.0), 0.0, 0.0, 1.0);\n\
-            gl_FragColor = pix;\n\
+            sy = floor(y / 16.0) * 8.0 + (y1 - 8.0);\n\
+            sy = floor(sy) * 2.0 + 1.5;\n\
+            p0 = texture2D(tex, vec2(bx + 0.5, sy) / tex_size); p0.a = 1.0;\n\
+            p1 = texture2D(tex, vec2(bx + 1.5, sy) / tex_size); p1.a = 1.0;\n\
+            p2 = texture2D(tex, vec2(bx + 2.5, sy) / tex_size); p2.a = 1.0;\n\
+            p3 = texture2D(tex, vec2(bx + 3.5, sy) / tex_size); p3.a = 1.0;\n\
+            gl_FragColor = clamp(vec4(dot(vmath, p0), dot(vmath, p1),\n\
+                                      dot(vmath, p2), dot(vmath, p3)),\n\
+                                 0.0, 1.0);\n\
         }\n\
     }\n\
     else\n\
     {\n\
-        y = floor(y - tex_size.y) * 2.0 + 0.5;\n\
-        if (mod(x, 2.0) < 1.0)\n\
-        {\n\
-            pix = texture2D(tex, vec2(x + 1.0, y) / tex_size);\n\
-            pix.a = 1.0;\n\
-            pix = vec4(clamp(dot(umath, pix), 0.0, 1.0), 0.0, 0.0, 1.0);\n\
-            gl_FragColor = pix;\n\
-        }\n\
-        else\n\
-        {\n\
-            pix = texture2D(tex, vec2(x, y) / tex_size);\n\
-            pix.a = 1.0;\n\
-            pix = vec4(clamp(dot(vmath, pix), 0.0, 1.0), 0.0, 0.0, 1.0);\n\
-            gl_FragColor = pix;\n\
-        }\n\
+        /* bx is a multiple of four, so the four destination bytes are\n\
+           even, odd, even, odd: U and V of source column bx + 1, then of\n\
+           bx + 3. Two fetches cover them. */\n\
+        sy = floor(y - pad_h) * 2.0 + 0.5;\n\
+        ca = texture2D(tex, vec2(bx + 1.5, sy) / tex_size); ca.a = 1.0;\n\
+        cb = texture2D(tex, vec2(bx + 3.5, sy) / tex_size); cb.a = 1.0;\n\
+        gl_FragColor = clamp(vec4(dot(umath, ca), dot(vmath, ca),\n\
+                                  dot(umath, cb), dot(vmath, cb)),\n\
+                             0.0, 1.0);\n\
     }\n\
 }\n";
 
 /*
 AUXILIARY VIEW V2 - NV12
+
+The U/V split sits at half the 16-aligned width (FreeRDP's nTotalWidth;
+mstsc agrees): x1 = ceil(W/16)*8, plane width ceil(W/16)*16. Columns past
+the source are clamped and never read.
 
     /----------U----------\ /----------V----------\
     10 30 50 70 90 B0 D0 F0 10 30 50 70 90 B0 D0 F0
@@ -298,50 +336,47 @@ uniform vec4 umath;\n\
 uniform vec4 vmath;\n\
 void main(void)\n\
 {\n\
-    vec4 pix;\n\
-    float x;\n\
+    vec4 p0;\n\
+    vec4 p1;\n\
+    vec4 p2;\n\
+    vec4 p3;\n\
+    vec4 m;\n\
+    float bx;\n\
     float y;\n\
     float x1;\n\
-    x = gl_FragCoord.x;\n\
+    float base;\n\
+    float sx;\n\
+    float sy;\n\
+    bx = floor(gl_FragCoord.x) * 4.0;\n\
     y = gl_FragCoord.y;\n\
-    x1 = tex_size.x / 2.0;\n\
-    if (y < tex_size.y)\n\
+    x1 = ceil(tex_size.x / 16.0) * 8.0;\n\
+    /* x1 is a multiple of eight, so a four-byte group never straddles the\n\
+       U/V split and one branch settles the whole fragment. */\n\
+    if (bx < x1)\n\
     {\n\
-        if (x < x1)\n\
-        {\n\
-            x = floor(x) * 2.0 + 1.5;\n\
-            pix = texture2D(tex, vec2(x, y) / tex_size);\n\
-            pix.a = 1.0;\n\
-            pix = vec4(clamp(dot(umath, pix), 0.0, 1.0), 0.0, 0.0, 1.0);\n\
-            gl_FragColor = pix;\n\
-        }\n\
-        else\n\
-        {\n\
-            x = floor(x - x1) * 2.0 + 1.5;\n\
-            pix = texture2D(tex, vec2(x, y) / tex_size);\n\
-            pix.a = 1.0;\n\
-            pix = vec4(clamp(dot(vmath, pix), 0.0, 1.0), 0.0, 0.0, 1.0);\n\
-            gl_FragColor = pix;\n\
-        }\n\
+        base = bx;\n\
+        m = umath;\n\
     }\n\
     else\n\
     {\n\
-        y = floor(y - tex_size.y) * 2.0 + 1.5;\n\
-        if (x < x1)\n\
-        {\n\
-            x = floor(x) * 2.0 + 0.5;\n\
-            pix = texture2D(tex, vec2(x, y) / tex_size);\n\
-            pix.a = 1.0;\n\
-            pix = vec4(clamp(dot(umath, pix), 0.0, 1.0), 0.0, 0.0, 1.0);\n\
-            gl_FragColor = pix;\n\
-        }\n\
-        else\n\
-        {\n\
-            x = floor(x - x1) * 2.0 + 0.5;\n\
-            pix = texture2D(tex, vec2(x, y) / tex_size);\n\
-            pix.a = 1.0;\n\
-            pix = vec4(clamp(dot(vmath, pix), 0.0, 1.0), 0.0, 0.0, 1.0);\n\
-            gl_FragColor = pix;\n\
-        }\n\
+        base = bx - x1;\n\
+        m = vmath;\n\
     }\n\
+    if (y < tex_size.y)\n\
+    {\n\
+        sx = base * 2.0 + 1.5;\n\
+        sy = y;\n\
+    }\n\
+    else\n\
+    {\n\
+        sx = base * 2.0 + 0.5;\n\
+        sy = floor(y - tex_size.y) * 2.0 + 1.5;\n\
+    }\n\
+    p0 = texture2D(tex, vec2(sx,       sy) / tex_size); p0.a = 1.0;\n\
+    p1 = texture2D(tex, vec2(sx + 2.0, sy) / tex_size); p1.a = 1.0;\n\
+    p2 = texture2D(tex, vec2(sx + 4.0, sy) / tex_size); p2.a = 1.0;\n\
+    p3 = texture2D(tex, vec2(sx + 6.0, sy) / tex_size); p3.a = 1.0;\n\
+    gl_FragColor = clamp(vec4(dot(m, p0), dot(m, p1),\n\
+                              dot(m, p2), dot(m, p3)),\n\
+                         0.0, 1.0);\n\
 }\n";

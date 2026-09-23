@@ -1,7 +1,7 @@
 /**
  * xrdp: A Remote Desktop Protocol server.
  *
- * Copyright (C) Jay Sorg 2022-2024
+ * Copyright (C) 2026 Tim Pletcher, all xrdp contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,20 +16,27 @@
  * limitations under the License.
  */
 
-#ifndef _XRDP_ACCEL_ASSIST_NVENC_H
-#define _XRDP_ACCEL_ASSIST_NVENC_H
+#ifndef _XRDP_ACCEL_ASSIST_VAAPI_H
+#define _XRDP_ACCEL_ASSIST_VAAPI_H
 
 int
-xrdp_accel_assist_nvenc_init(void);
-/* tex_aux is the AVC444 aux view's texture, 0 for AVC420. */
+xrdp_accel_assist_vaapi_init(void);
+/* tex_aux is the AVC444 aux view's texture, 0 for AVC420; both views are
+   pictures of one H.264 sequence. */
 int
-xrdp_accel_assist_nvenc_create_encoder(int width, int height, int tex,
+xrdp_accel_assist_vaapi_create_encoder(int width, int height, int tex,
                                        int tex_aux, int tex_format,
                                        struct enc_info **ei);
 int
-xrdp_accel_assist_nvenc_delete_encoder(struct enc_info *ei);
+xrdp_accel_assist_vaapi_delete_encoder(struct enc_info *ei);
+/* Encode both AVC444 views, submitting each before waiting on either. */
 enum encoder_result
-xrdp_accel_assist_nvenc_encode(struct enc_info *ei, int tex,
+xrdp_accel_assist_vaapi_encode_dual(struct enc_info *ei,
+                                    void *cdata1, int *cdata1_bytes,
+                                    void *cdata2, int *cdata2_bytes,
+                                    int flags);
+enum encoder_result
+xrdp_accel_assist_vaapi_encode(struct enc_info *ei, int tex,
                                void *cdata, int *cdata_bytes,
                                int flags);
 

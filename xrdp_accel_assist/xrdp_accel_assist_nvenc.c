@@ -101,7 +101,8 @@ xrdp_accel_assist_nvenc_init(void)
 /*****************************************************************************/
 int
 xrdp_accel_assist_nvenc_create_encoder(int width, int height, int tex,
-                                       int tex_format, struct enc_info **ei)
+                                       int tex_aux, int tex_format,
+                                       struct enc_info **ei)
 {
     NV_ENC_CREATE_BITSTREAM_BUFFER bitstreamParams;
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS params;
@@ -118,6 +119,14 @@ xrdp_accel_assist_nvenc_create_encoder(int width, int height, int tex,
     int qp_int;
     int averageBitRate_int;
     int rc_set;
+
+    if (tex_aux != 0)
+    {
+        /* AVC444 needs both views in one H.264 sequence; the nvenc backend
+           has no interleaved-view support yet. */
+        LOG(LOG_LEVEL_ERROR, "nvenc: AVC444 auxiliary view not supported");
+        return 1;
+    }
 
     lei = g_new0(struct enc_info, 1);
     if (lei == NULL)

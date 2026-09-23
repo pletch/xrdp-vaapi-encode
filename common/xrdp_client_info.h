@@ -106,7 +106,10 @@ enum xrdp_encoder_flags
     ENCODE_COMPLETE                        = 1 << 0,
     GFX_PROGRESSIVE_RFX                    = 1 << 1,
     GFX_H264                               = 1 << 2,
-    KEY_FRAME_REQUESTED                    = 1 << 3
+    KEY_FRAME_REQUESTED                    = 1 << 3,
+    /* Which accel-assist capture buffer this frame used, so the two sides
+       need not count frames. Bits 28-31 are the monitor index. */
+    ACCEL_ASSIST_BUFFER_1                  = 1 << 4
 };
 
 /* Size definitions for some arrays in xrdp_client_info */

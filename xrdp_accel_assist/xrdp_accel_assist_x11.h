@@ -35,6 +35,10 @@ int
 xrdp_accel_assist_x11_check_wait_objs(void);
 int
 xrdp_accel_assist_x11_delete_all_pixmaps(void);
+void
+xrdp_accel_assist_x11_set_caps(int caps);
+int
+xrdp_accel_assist_x11_avc444_v2(void);
 int
 xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
                                     int con_id, int mon_id);
@@ -43,6 +47,6 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
                                     int mon_id, int num_crects,
                                     struct xh_rect *crects,
                                     void *cdata, int *cdata_bytes,
-                                    int flags);
+                                    int codec_id, int flags);
 
 #endif
