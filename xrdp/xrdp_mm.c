@@ -624,6 +624,24 @@ xrdp_mm_process_rail_create_window(struct xrdp_mm *self, struct stream *s)
     {
         rv = libxrdp_orders_send(self->wm->session);
     }
+    if (rv == 0 && (flags & WINDOW_ORDER_STATE_NEW) &&
+            self->mod != NULL && self->mod->mod_event != NULL)
+    {
+        /* The client paints a RemoteApp window from the screen updates
+           that follow its creation; the window's contents may have been
+           sent before (a compositor shows a window before chansrv hears of
+           it). Ask for them again. */
+        int x = rwso.window_offset_x < 0 ? 0 : rwso.window_offset_x;
+        int y = rwso.window_offset_y < 0 ? 0 : rwso.window_offset_y;
+        int w = rwso.window_width - (x - rwso.window_offset_x);
+        int h = rwso.window_height - (y - rwso.window_offset_y);
+
+        if (w > 0 && h > 0)
+        {
+            self->mod->mod_event(self->mod, WM_INVALIDATE,
+                                 MAKELONG(y, x), MAKELONG(h, w), 0, 0);
+        }
+    }
     g_free(rwso.title_info);
     g_free(rwso.window_rects);
     g_free(rwso.visibility_rects);

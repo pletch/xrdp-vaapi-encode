@@ -37,6 +37,9 @@
 #if defined(XRDP_WAYLAND_CLIPBOARD)
 #include "clipboard_wl.h"
 #endif
+#if defined(XRDP_WAYLAND_RAIL)
+#include "rail_wl.h"
+#endif
 #include "devredir.h"
 #include "list.h"
 #include "file.h"
@@ -1744,6 +1747,9 @@ channel_thread_loop(void *in_val)
 #if defined(XRDP_WAYLAND_CLIPBOARD)
             clipboard_wl_check_wait_objs();
 #endif
+#if defined(XRDP_WAYLAND_RAIL)
+            rail_wl_check_wait_objs();
+#endif
             sound_check_wait_objs();
             devredir_check_wait_objs();
             xfuse_check_wait_objs();
@@ -1765,6 +1771,9 @@ channel_thread_loop(void *in_val)
             xcommon_get_wait_objs(objs, &num_objs, &timeout);
 #if defined(XRDP_WAYLAND_CLIPBOARD)
             clipboard_wl_get_wait_objs(objs, &num_objs, &timeout);
+#endif
+#if defined(XRDP_WAYLAND_RAIL)
+            rail_wl_get_wait_objs(objs, &num_objs, &timeout);
 #endif
             sound_get_wait_objs(objs, &num_objs, &timeout);
             devredir_get_wait_objs(objs, &num_objs, &timeout);

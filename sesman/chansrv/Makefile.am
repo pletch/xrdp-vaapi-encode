@@ -102,6 +102,13 @@ xrdp_chansrv_SOURCES += \
   clipboard_wl.h \
   clipboard_wl_image.c \
   clipboard_wl_image.h
+if XRDP_WAYLAND_RAIL
+AM_CPPFLAGS += $(XRDP_WAYLAND_RAIL_CFLAGS)
+CHANSRV_EXTRA_LIBS += $(XRDP_WAYLAND_RAIL_LIBS)
+xrdp_chansrv_SOURCES += \
+  rail_wl.c \
+  rail_wl.h
+endif
 BUILT_SOURCES = \
   ext-data-control-v1-client-protocol.h \
   ext-data-control-v1-protocol.c

@@ -36,6 +36,9 @@
 #include <X11/cursorfont.h>
 #include "chansrv.h"
 #include "rail.h"
+#if defined(XRDP_WAYLAND_RAIL)
+#include "rail_wl.h"
+#endif
 #include "xcommon.h"
 #include "log.h"
 #include "os_calls.h"
@@ -64,6 +67,10 @@ static Atom g_rwd_atom = 0;
 int g_rail_up = 0;
 /* rail_init found no X display: ignore the channel */
 static int g_rail_no_display = 0;
+#if defined(XRDP_WAYLAND_RAIL)
+/* a Wayland RemoteApp session: rail_wl.c does the work */
+static int g_rail_wl = 0;
+#endif
 
 /* for rail_is_another_wm_running */
 static int g_rail_running = 1;
@@ -389,6 +396,13 @@ int
 rail_init(void)
 {
     LOG_DEVEL(LOG_LEVEL_DEBUG, "chansrv::rail_init:");
+#if defined(XRDP_WAYLAND_RAIL)
+    if (rail_wl_enabled())
+    {
+        g_rail_wl = 1;
+        return rail_wl_init();
+    }
+#endif
     if (xcommon_init() != 0)
     {
         /* RemoteApp manages X windows: without an X display (a Wayland
@@ -410,6 +424,13 @@ rail_init(void)
 int
 rail_deinit(void)
 {
+#if defined(XRDP_WAYLAND_RAIL)
+    if (g_rail_wl)
+    {
+        g_rail_wl = 0;
+        return rail_wl_deinit();
+    }
+#endif
     if (g_rail_up)
     {
         list_delete(g_window_list);
@@ -1197,6 +1218,12 @@ rail_data_in(struct stream *s, int chan_id, int chan_flags, int length,
     int size;
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "chansrv::rail_data_in:");
+#if defined(XRDP_WAYLAND_RAIL)
+    if (g_rail_wl)
+    {
+        return rail_wl_data_in(s, chan_id, chan_flags, length, total_length);
+    }
+#endif
     if (g_rail_no_display)
     {
         return 0; /* rail_init said why */
