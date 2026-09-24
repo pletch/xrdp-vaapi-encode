@@ -174,6 +174,9 @@ x-special/gnome-copied-files
 #include "chansrv_common.h"
 #include "chansrv_config.h"
 #include "clipboard.h"
+#if defined(XRDP_WAYLAND_CLIPBOARD)
+#include "clipboard_wl.h"
+#endif
 #include "clipboard_file.h"
 #include "clipboard_common.h"
 #include "xcommon.h"
@@ -347,6 +350,14 @@ clipboard_init(void)
         return 0;
     }
 
+#if defined(XRDP_WAYLAND_CLIPBOARD)
+    /* a Wayland session: its selection, not Xwayland's */
+    if (clipboard_wl_enabled())
+    {
+        return clipboard_wl_init();
+    }
+#endif
+
     xfuse_init();
     if (xcommon_init() != 0)
     {
@@ -492,6 +503,9 @@ int
 clipboard_deinit(void)
 {
     LOG_DEVEL(LOG_LEVEL_INFO, "clipboard_deinit:");
+#if defined(XRDP_WAYLAND_CLIPBOARD)
+    clipboard_wl_deinit(); /* no-op unless it was started */
+#endif
     if (g_wnd != 0)
     {
         XDestroyWindow(g_display, g_wnd);
@@ -1435,6 +1449,13 @@ clipboard_data_in(struct stream *s, int chan_id, int chan_flags, int length,
     int rv;
     struct stream *ls;
 
+#if defined(XRDP_WAYLAND_CLIPBOARD)
+    if (clipboard_wl_enabled())
+    {
+        return clipboard_wl_data_in(s, chan_id, chan_flags, length,
+                                    total_length);
+    }
+#endif
     if (!g_clip_up)
     {
         LOG_DEVEL(LOG_LEVEL_ERROR, "aborting clipboard_data_in - clipboard has not "
