@@ -90,6 +90,30 @@ xrdp_chansrv_SOURCES += \
   smartcard_dummy.c
 endif
 
+if XRDP_WAYLAND
+AM_CPPFLAGS += -DXRDP_WAYLAND_CLIPBOARD $(XRDP_WAYLAND_CFLAGS) \
+  $(XRDP_WAYLAND_PNG_CFLAGS)
+CHANSRV_EXTRA_LIBS += $(XRDP_WAYLAND_LIBS) $(XRDP_WAYLAND_PNG_LIBS)
+nodist_xrdp_chansrv_SOURCES = \
+  ext-data-control-v1-client-protocol.h \
+  ext-data-control-v1-protocol.c
+xrdp_chansrv_SOURCES += \
+  clipboard_wl.c \
+  clipboard_wl.h \
+  clipboard_wl_image.c \
+  clipboard_wl_image.h
+BUILT_SOURCES = \
+  ext-data-control-v1-client-protocol.h \
+  ext-data-control-v1-protocol.c
+CLEANFILES = $(BUILT_SOURCES)
+EXT_DATA_CONTROL_XML = \
+  $(WAYLAND_PROTOCOLS_DIR)/staging/ext-data-control/ext-data-control-v1.xml
+ext-data-control-v1-client-protocol.h: $(EXT_DATA_CONTROL_XML)
+	$(WAYLAND_SCANNER) client-header $< $@
+ext-data-control-v1-protocol.c: $(EXT_DATA_CONTROL_XML)
+	$(WAYLAND_SCANNER) private-code $< $@
+endif
+
 xrdp_chansrv_LDFLAGS = \
   $(X_LIBS)
 
