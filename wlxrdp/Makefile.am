@@ -42,8 +42,10 @@ wlxrdp_LDADD = \
   $(top_builddir)/common/libcommon.la \
   $(XRDP_WAYLAND_LIBS)
 
-# wlroots protocols, from wlr-protocols / wlroots (MIT)
+# the compositor contract; the wlroots protocols, from wlr-protocols /
+# wlroots (MIT)
 EXTRA_DIST = \
+  COMPOSITOR.md \
   protocols/virtual-keyboard-unstable-v1.xml \
   protocols/wlr-virtual-pointer-unstable-v1.xml \
   protocols/wlr-output-management-unstable-v1.xml

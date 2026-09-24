@@ -35,6 +35,8 @@
  *     buttons are evdev codes.
  *
  * Adapters are compiled in, and tried in order; WLXRDP_ADAPTER names one.
+ * COMPOSITOR.md has the whole contract: what a compositor must offer, and
+ * the session's start-up and shutdown handshake with sesexec.
  */
 
 #ifndef _WLA_H
