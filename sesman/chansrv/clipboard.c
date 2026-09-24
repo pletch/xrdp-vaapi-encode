@@ -348,7 +348,14 @@ clipboard_init(void)
     }
 
     xfuse_init();
-    xcommon_init();
+    if (xcommon_init() != 0)
+    {
+        /* no X display (a Wayland session with chansrv built without the
+           Wayland clipboard): no clipboard, rather than Xlib on NULL */
+        LOG(LOG_LEVEL_ERROR, "clipboard_init: no X display, the clipboard "
+            "is not available");
+        return 1;
+    }
     g_incr_max_req_size = XMaxRequestSize(g_display) * 4 - 24;
     g_memset(&g_clip_c2s, 0, sizeof(g_clip_c2s));
     g_memset(&g_clip_s2c, 0, sizeof(g_clip_s2c));

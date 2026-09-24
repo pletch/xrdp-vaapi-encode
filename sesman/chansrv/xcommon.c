@@ -143,7 +143,8 @@ xcommon_get_wait_objs(tbus *objs, int *count, int *timeout)
 {
     int lcount;
 
-    if (((!g_clip_up) && (!g_rail_up)) || (objs == 0) || (count == 0))
+    if (((!g_clip_up) && (!g_rail_up)) || g_display == 0 ||
+            (objs == 0) || (count == 0))
     {
         return 0;
     }
@@ -162,7 +163,7 @@ xcommon_check_wait_objs(void)
     int clip_rv;
     int rail_rv;
 
-    if ((!g_clip_up) && (!g_rail_up))
+    if (((!g_clip_up) && (!g_rail_up)) || g_display == 0)
     {
         return 0;
     }

@@ -62,6 +62,8 @@ extern Atom g_wm_state;              /* in xcommon.c */
 static Atom g_rwd_atom = 0;
 
 int g_rail_up = 0;
+/* rail_init found no X display: ignore the channel */
+static int g_rail_no_display = 0;
 
 /* for rail_is_another_wm_running */
 static int g_rail_running = 1;
@@ -339,7 +341,16 @@ int
 rail_init(void)
 {
     LOG_DEVEL(LOG_LEVEL_DEBUG, "chansrv::rail_init:");
-    xcommon_init();
+    if (xcommon_init() != 0)
+    {
+        /* RemoteApp manages X windows: without an X display (a Wayland
+           session) there is nothing to manage */
+        LOG(LOG_LEVEL_ERROR, "rail_init: no X display, RemoteApp is not "
+            "available in this session");
+        g_rail_no_display = 1;
+        return 1;
+    }
+    g_rail_no_display = 0;
 
     return 0;
 }
