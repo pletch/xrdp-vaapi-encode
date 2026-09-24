@@ -6,10 +6,137 @@
 
 # xrdp - an open source RDP server
 
-> **Wayland sessions:** the child branch
-> [`feature/wayland`](https://github.com/pletch/xrdp-vaapi-encode/tree/feature/wayland)
-> builds on this one and adds experimental Wayland sessions - a desktop on a
-> Wayland compositor instead of Xorg, encoded by the same VA-API helper.
+## This branch: VA-API encoding and Wayland sessions
+
+`feature/wayland` is this fork's VA-API branch (`feature/vaapi-accel-assist`)
+plus experimental **Wayland sessions**:
+
+* **[Wayland sessions](#fork-wayland-sessions-experimental)** - log in to a
+  desktop on a Wayland compositor (labwc) instead of Xorg, through the new
+  `wlxrdp` backend: GPU-encoded AVC420/AVC444 via the same helper, multi-monitor,
+  the client's display scale, clipboard with images and files, drives, audio,
+  and RemoteApp (over sway). Built with `--enable-wayland`; Xorg sessions are
+  unchanged.
+* **[VA-API hardware H.264 encoding](#fork-intel-vaapi-hardware-h264-encoding-ffmpeg-free)**
+  with AVC444 - the `xrdp_accel_assist` encoder both session types use.
+
+The VA-API work alone is on `feature/vaapi-accel-assist`.
+
+## Fork: Wayland sessions (experimental)
+
+This branch (`feature/wayland`) adds **Wayland sessions** on top of the VA-API
+encoder described below: log in and get a desktop running on a Wayland
+compositor instead of Xorg, encoded by the same `xrdp_accel_assist` VA-API helper
+(AVC420 or AVC444). It is experimental and off unless built with
+`--enable-wayland`; Xorg sessions are unchanged.
+
+**Pipeline:** a headless [labwc](https://labwc.github.io/) compositor (wlroots)
+runs the desktop (XFCE, or any session you choose). `wlxrdp`, a new backend,
+plays xorgxrdp's part on the xup socket: it captures each output with
+`ext-image-copy-capture` into GBM dma-bufs and hands them to accel-assist in its
+headless mode (`-w`), which runs the same RGB->NV12 / AVC444 shaders and VA-API
+encoder as for Xorg. Input goes back through the compositor's virtual keyboard
+and pointer. X11 applications run under Xwayland.
+
+```
+labwc output --ext-image-copy-capture--> GBM dma-buf --> xrdp_accel_assist -w
+  (shader, VA-API) --> xrdp --> client
+client input --> xrdp --> wlxrdp --> zwp_virtual_keyboard / zwlr_virtual_pointer --> labwc
+```
+
+### What works
+
+| feature | notes |
+| ------- | ----- |
+| GPU encoding | AVC420 and AVC444 through accel-assist, as for Xorg (`XRDP_USE_ACCEL_ASSIST=1`) |
+| CPU encoding | for clients or hosts the helper cannot serve: x264 H.264, RemoteFX, plain bitmaps (xrdp encodes) |
+| multi-monitor | each client monitor is a compositor output and a GFX surface; dynamic resize and layout changes |
+| display scale | follows the client's own scale: mstsc on a 200% laptop gets scale 2, per monitor with multiple monitors |
+| keyboard | the client's layout as an xkb keymap; characters it lacks (Unicode input) are typed through spare keys |
+| pointer | cursor shapes as RDP pointers; high-resolution wheel and touchpad scrolling |
+| clipboard | text, images and files, both ways; files into the session need `--enable-fuse` |
+| drive redirection | through FUSE (`--enable-fuse`), as for Xorg |
+| audio | the PulseAudio/PipeWire xrdp modules, as for Xorg |
+| RemoteApp | over sway (below) |
+| reconnect | to the running session; `reconnectwm.sh` runs with `WAYLAND_DISPLAY` set |
+
+Not yet: multitouch (xrdp has no MS-RDPEI; a client may still turn touch into
+mouse input on its own), GNOME (Mutter) or KDE (KWin) sessions, and Wayfire (its
+0.11 release has the capture protocol but needs wlroots 0.20).
+
+**Compositor adapters.** wlxrdp's core knows RDP (the xup protocol, pacing, the
+helper, the keyboard); an adapter (`wlxrdp/wla.h`) knows one family of
+compositors. `wla_wlr.c` drives wlroots compositors through standard protocols:
+output management, image copy capture, virtual keyboard and pointer. Other
+families (Mutter, KWin: PipeWire capture, libei input) would be further adapters.
+
+**RemoteApp.** labwc offers no way for another program to follow and place
+windows, so a RemoteApp login gets a separate session on
+[sway](https://swaywm.org/) (`sway-remoteapp.conf`, no desktop), whose IPC
+chansrv uses to map windows to RAIL window orders and carry out the client's
+moves, resizes and activations. The RAIL fixes that came with it (below) apply
+to Xorg RemoteApp sessions too.
+
+### Requirements
+
+Tested on Ubuntu 26.04 with labwc 0.9.3 (wlroots 0.19), sway 1.11, XFCE 4.20 and
+wayland-protocols 1.47. Needed to build: `wayland-client`, `wayland-protocols`
+>= 1.39 (`ext-image-copy-capture`, `ext-data-control`), `wayland-scanner`, `gbm`,
+`libdrm`, `xkbcommon`; optional: `json-c` (RemoteApp), `libpng` (PNG clipboard
+images), `libfuse3` (files and drives). At run time: `labwc`, `wlr-randr`, and
+`sway` for RemoteApp. The compositor must offer `ext-image-copy-capture`; otherwise
+wlxrdp refuses to start and logs the protocols it needs.
+
+### Building / enabling
+
+```
+./configure --enable-rfxcodec --enable-x264 --enable-vaapi --enable-wayland --enable-fuse
+```
+
+Uncomment the `[Wayland]` section in `xrdp.ini` (it is installed commented out),
+and choose it at the login screen. A client can pick it without the login
+screen by giving the section name as the domain: in mstsc, user name
+`Wayland\you`. Windows saves one set of credentials per host name, so to keep
+both an Xorg and a Wayland shortcut, reach the server by two names (host name
+and IP address). A RemoteApp connection to the `[Wayland]` section gets the sway
+session.
+
+The GPU path uses the same `[SessionVariables]` as Xorg (`XRDP_USE_ACCEL_ASSIST=1`,
+the AVC444 and QP settings in **Tuning** below). Wayland adds:
+
+| variable | default | effect |
+| -------- | ------- | ------ |
+| `XRDP_WAYLAND_MONITORS` | 4 | client monitors a session can show (headless outputs, all but the first off until used) |
+| `XRDP_WAYLAND_SCALE` | auto | `auto`: the client's scale, else 200% on a monitor over 2000 pixels wide; `client`: the client's, else 100%; or a number for every monitor (`150` or `1.5`) |
+| `XRDP_WAYLAND_PRIVATE_BUS` | off | `1` gives the desktop its own D-Bus session bus (no keyring); by default it uses the user's, unless another desktop session is already on it |
+| `XRDP_WAYLAND_RENDER_NODE` | `XRDP_VAAPI_DEVICE`, else `/dev/dri/renderD128` | the compositor's GPU |
+| `WLXRDP_ACCEL` | on | `0` takes the CPU path (xrdp encodes) |
+| `WLXRDP_AVC420` | unset | set: AVC420 even for AVC444 clients (half the decode work; see the mstsc known issue) |
+| `WLXRDP_DRM` | `/dev/dri/renderD128` | GBM device for the capture buffers |
+| `WLXRDP_DEBUG` | unset | debug logging |
+
+A user's own desktop command goes in `~/.config/xrdp/waylandsession`
+(executable); without it the session runs `xfce4-session`, or a terminal. The
+session scripts are `startwayland.sh` (the compositor) and `waylandsession.sh`
+(the desktop) in `/etc/xrdp`. wlxrdp logs to the journal (as `xrdp-sesman`, in
+the session's scope).
+
+### Changes outside Wayland
+
+The Wayland work needed a few fixes that apply to every session:
+
+* **RemoteApp with FreeRDP 3.31 and whole windows.** FreeRDP 3.31 starts a
+  RemoteApp session only after an Actively Monitored Desktop order with
+  `ARC_COMPLETED`, and waits for the server's handshake first; chansrv now sends
+  both. RAIL window orders carry the client area offset in screen coordinates
+  (0,0 made FreeRDP paint windows only from twice their offset), and a window the
+  client moves is reported back with its new offsets.
+* **The client's display scale** (`desktopScaleFactor` in the core data, sent by
+  mstsc for a single monitor) is read and passed to backends; xorgxrdp ignores it.
+* **chansrv without an X display** no longer crashes on a RemoteApp handshake or
+  the X11 clipboard.
+* **accel-assist** keeps up to four capture buffers per monitor (bits 4-5 of the
+  frame flags); xorgxrdp's two are unchanged.
 
 ## Fork: Intel VAAPI hardware H.264 encoding (ffmpeg-free)
 
@@ -514,7 +641,9 @@ xrdp
 | └── tcp_proxy · CLI app that forwards TCP connections to a remote host
 ├── vnc ········· VNC client module for xrdp
 ├── vrplayer ···· QT player redirecting video/audio to clients over xrdpvr channel
+├── wlxrdp ······ Wayland session backend (xup), with compositor adapters
 ├── xrdp ········ main server code
+├── xrdp_accel_assist  GPU encoding helper (VA-API H.264, AVC444)
 ├── xrdpapi ····· virtual channel API
 ├── xrdpvr ······ API for playing media over RDP
 └── xup ········· xorgxrdp client module
