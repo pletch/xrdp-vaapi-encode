@@ -6,6 +6,11 @@
 
 # xrdp - an open source RDP server
 
+> **Wayland sessions:** the child branch
+> [`feature/wayland`](https://github.com/pletch/xrdp-vaapi-encode/tree/feature/wayland)
+> builds on this one and adds experimental Wayland sessions - a desktop on a
+> Wayland compositor instead of Xorg, encoded by the same VA-API helper.
+
 ## Fork: Intel VAAPI hardware H.264 encoding (ffmpeg-free)
 
 This is a fork of xrdp that adds an **Intel VA-API hardware H.264 encoder** to the
