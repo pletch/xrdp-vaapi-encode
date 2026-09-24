@@ -622,7 +622,6 @@ xrdp_mm_process_rail_create_window(struct xrdp_mm *self, struct stream *s)
     return rv;
 }
 
-#if 0
 /*****************************************************************************/
 /* returns error
    process rail configure window order */
@@ -637,6 +636,12 @@ xrdp_mm_process_rail_configure_window(struct xrdp_mm *self, struct stream *s)
     struct rail_window_state_order rwso;
 
     g_memset(&rwso, 0, sizeof(rwso));
+    /* window id, 12 geometry fields, window rect count */
+    if (!s_check_rem_and_log(s, 4 + 12 * 4 + 2,
+                             "xrdp_mm_process_rail_configure_window"))
+    {
+        return 1;
+    }
     in_uint32_le(s, window_id);
 
     LOG(LOG_LEVEL_DEBUG, "xrdp_mm_process_rail_configure_window: 0x%8.8x", window_id);
@@ -654,6 +659,12 @@ xrdp_mm_process_rail_configure_window(struct xrdp_mm *self, struct stream *s)
     in_uint32_le(s, rwso.window_width);
     in_uint32_le(s, rwso.window_height);
     in_uint16_le(s, rwso.num_window_rects);
+    /* the window rects, visible offset and visibility rect count */
+    if (!s_check_rem_and_log(s, rwso.num_window_rects * 8 + 4 + 4 + 2,
+                             "xrdp_mm_process_rail_configure_window"))
+    {
+        return 1;
+    }
     if (rwso.num_window_rects > 0)
     {
         bytes = sizeof(struct rail_window_rect) * rwso.num_window_rects;
@@ -669,6 +680,13 @@ xrdp_mm_process_rail_configure_window(struct xrdp_mm *self, struct stream *s)
     in_uint32_le(s, rwso.visible_offset_x);
     in_uint32_le(s, rwso.visible_offset_y);
     in_uint16_le(s, rwso.num_visibility_rects);
+    /* the visibility rects and the flags */
+    if (!s_check_rem_and_log(s, rwso.num_visibility_rects * 8 + 4,
+                             "xrdp_mm_process_rail_configure_window"))
+    {
+        g_free(rwso.window_rects);
+        return 1;
+    }
     if (rwso.num_visibility_rects > 0)
     {
         bytes = sizeof(struct rail_window_rect) * rwso.num_visibility_rects;
@@ -682,6 +700,19 @@ xrdp_mm_process_rail_configure_window(struct xrdp_mm *self, struct stream *s)
         }
     }
     in_uint32_le(s, flags);
+    /* A geometry update: libxrdp would read any other field the flags name,
+       such as the title, which this order does not carry */
+    flags &= WINDOW_ORDER_TYPE_WINDOW |
+             WINDOW_ORDER_FIELD_CLIENT_AREA_OFFSET |
+             WINDOW_ORDER_FIELD_CLIENT_AREA_SIZE |
+             WINDOW_ORDER_FIELD_RP_CONTENT |
+             WINDOW_ORDER_FIELD_ROOT_PARENT |
+             WINDOW_ORDER_FIELD_WND_OFFSET |
+             WINDOW_ORDER_FIELD_WND_CLIENT_DELTA |
+             WINDOW_ORDER_FIELD_WND_SIZE |
+             WINDOW_ORDER_FIELD_WND_RECTS |
+             WINDOW_ORDER_FIELD_VIS_OFFSET |
+             WINDOW_ORDER_FIELD_VISIBILITY;
     rv = libxrdp_orders_init(self->wm->session);
     if (rv == 0)
     {
@@ -695,7 +726,6 @@ xrdp_mm_process_rail_configure_window(struct xrdp_mm *self, struct stream *s)
     g_free(rwso.visibility_rects);
     return rv;
 }
-#endif
 
 /*****************************************************************************/
 /* returns error
@@ -828,6 +858,52 @@ xrdp_mm_egfx_caps_avc444(int version, int flags)
 }
 
 /*****************************************************************************/
+/* chansrv's Monitored Desktop order ([MS-RDPERP] 2.2.1.3.3): flags, active
+   window id, then a z-order of up to 255 window ids */
+static int
+xrdp_mm_process_rail_monitored_desktop(struct xrdp_mm *self, struct stream *s)
+{
+    struct rail_monitored_desktop_order mdo;
+    int ids[255];
+    int flags;
+    int count;
+    int index;
+    int rv;
+
+    if (!s_check_rem(s, 12))
+    {
+        return 1;
+    }
+    in_uint32_le(s, flags);
+    in_uint32_le(s, mdo.active_window_id);
+    in_uint32_le(s, count);
+    if (count < 0 || count > 255 || !s_check_rem(s, count * 4))
+    {
+        LOG(LOG_LEVEL_ERROR, "xrdp_mm_process_rail_monitored_desktop: "
+            "bad z-order count %d", count);
+        return 1;
+    }
+    for (index = 0; index < count; index++)
+    {
+        in_uint32_le(s, ids[index]);
+    }
+    mdo.num_window_ids = count;
+    mdo.window_ids = ids;
+    LOG(LOG_LEVEL_DEBUG, "xrdp_mm_process_rail_monitored_desktop: flags 0x%x",
+        flags);
+    rv = libxrdp_orders_init(self->wm->session);
+    if (rv == 0)
+    {
+        rv = libxrdp_monitored_desktop(self->wm->session, &mdo, flags);
+    }
+    if (rv == 0)
+    {
+        rv = libxrdp_orders_send(self->wm->session);
+    }
+    return rv;
+}
+
+/*****************************************************************************/
 /* returns error
    process alternate secondary drawing orders for rail channel */
 static int
@@ -852,6 +928,13 @@ xrdp_mm_process_rail_drawing_orders(struct xrdp_mm *self, struct stream *s)
             break;
         case 8: /* update title info */
             rv = xrdp_mm_process_rail_update_window_text(self, s);
+            break;
+        case 10: /* configure_window: a window's new place and size (X11
+                    chansrv answers the client's window moves with it) */
+            rv = xrdp_mm_process_rail_configure_window(self, s);
+            break;
+        case 12: /* monitored desktop */
+            rv = xrdp_mm_process_rail_monitored_desktop(self, s);
             break;
         default:
             break;
