@@ -231,6 +231,32 @@ now_ms32(void)
 #define MIN_MON_SIDE 200
 #define MAX_MON_SIDE 8192
 #define MAX_LAYOUT_SIDE 16384
+/* All monitors together, in pixels: each costs 4 bytes in every capture
+   buffer (three per monitor), besides the compositor's own and the
+   helper's. Without a budget a client may ask for four 8192x8192 monitors,
+   3 GiB of capture buffers alone. XRDP_WAYLAND_MAX_PIXELS sets it. */
+#define DEFAULT_MAX_PIXELS 40000000
+
+static int64_t
+max_pixels(void)
+{
+    const char *env = getenv("XRDP_WAYLAND_MAX_PIXELS");
+    char *end;
+    long long v;
+
+    if (env == NULL || env[0] == '\0')
+    {
+        return DEFAULT_MAX_PIXELS;
+    }
+    v = strtoll(env, &end, 10);
+    if (end == env || *end != '\0' || v <= 0)
+    {
+        LOG(LOG_LEVEL_WARNING, "XRDP_WAYLAND_MAX_PIXELS=%s is not a pixel "
+            "count; using %d", env, DEFAULT_MAX_PIXELS);
+        return DEFAULT_MAX_PIXELS;
+    }
+    return (int64_t) v;
+}
 
 /* A monitor's scale, in percent: XRDP_WAYLAND_SCALE, a number (percent,
    or a factor like 1.5), sets it for every monitor; otherwise the client's
@@ -348,6 +374,22 @@ layout_set(struct be *b, int count, const struct monitor_info *mi,
         LOG(LOG_LEVEL_ERROR, "a %lldx%lld layout is too big",
             (long long) total_w, (long long) total_h);
         return 1;
+    }
+    {
+        int64_t pixels = 0;
+        int64_t budget = max_pixels();
+
+        for (i = 0; i < count; i++)
+        {
+            pixels += w[i] * h[i];
+        }
+        if (pixels > budget)
+        {
+            LOG(LOG_LEVEL_ERROR, "a layout of %lld pixels is over the "
+                "session's budget of %lld (XRDP_WAYLAND_MAX_PIXELS)",
+                (long long) pixels, (long long) budget);
+            return 1;
+        }
     }
     b->active = count;
     b->total_w = (int) total_w;

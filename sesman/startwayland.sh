@@ -25,6 +25,8 @@
 #                             200%), else 200% over 2000 pixels wide;
 #                             "client", the client's, else 100%; or a
 #                             number for every monitor (150 or 1.5)
+#   XRDP_WAYLAND_MAX_PIXELS   all monitors together, in pixels (default
+#                             40000000); a larger layout is refused
 
 XRDP_CFG_DIR=$(dirname "$(readlink -f "$0")")
 
