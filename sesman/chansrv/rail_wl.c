@@ -41,10 +41,12 @@
 #include <config_ac.h>
 #endif
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -728,6 +730,96 @@ read_uni(struct stream *s, unsigned int num_bytes)
     return rv;
 }
 
+/* the text single-quoted for sh, as a new string */
+static char *
+shell_quote(const char *text)
+{
+    char *out = g_new(char, g_strlen(text) * 4 + 3);
+    char *p = out;
+
+    if (out == NULL)
+    {
+        return NULL;
+    }
+    *p++ = '\'';
+    for (; *text != '\0'; text++)
+    {
+        if (*text == '\'')
+        {
+            g_strcpy(p, "'\\''");
+            p += 4;
+        }
+        else
+        {
+            *p++ = *text;
+        }
+    }
+    *p++ = '\'';
+    *p = '\0';
+    return out;
+}
+
+/* Run the client's program in the session, through sway so that it gets
+   the session's environment. The arguments are a command line, as Windows
+   passes them, for sh. They do not go into the sway command itself: sway
+   splits commands at ';' and ',' even in the arguments of exec, and keeps
+   the backslashes of any escaping, so a program and its arguments go into
+   a private script (mkstemp, removed as it runs) and sway runs that. */
+static void
+run_program(const char *exe, const char *args)
+{
+    const char *dir = g_getenv("XDG_RUNTIME_DIR");
+    char path[256];
+    char cmd[300];
+    char *quoted;
+    const char *q;
+    FILE *f;
+    int fd;
+
+    /* the script's path goes into the sway command: keep it plain */
+    if (dir == NULL || dir[0] != '/' || g_strlen(dir) > 200)
+    {
+        dir = "/tmp";
+    }
+    for (q = dir; *q != '\0'; q++)
+    {
+        if (!isalnum((unsigned char) *q) && g_strchr("/._-", *q) == NULL)
+        {
+            dir = "/tmp";
+            break;
+        }
+    }
+    g_snprintf(path, sizeof(path), "%s/xrdp-remoteapp-XXXXXX", dir);
+    quoted = shell_quote(exe);
+    fd = (quoted != NULL) ? mkstemp(path) : -1;
+    if (fd < 0)
+    {
+        LOG(LOG_LEVEL_ERROR, "rail_wl: no script for [%s]: %s", exe,
+            g_get_strerror());
+        g_free(quoted);
+        return;
+    }
+    f = fdopen(fd, "w");
+    if (f == NULL)
+    {
+        close(fd);
+        unlink(path);
+        g_free(quoted);
+        return;
+    }
+    fprintf(f, "rm -f -- \"$0\"\nexec %s%s%s\n", quoted,
+            args[0] != '\0' ? " " : "", args);
+    g_free(quoted);
+    if (fclose(f) != 0)
+    {
+        LOG(LOG_LEVEL_ERROR, "rail_wl: cannot write %s", path);
+        unlink(path);
+        return;
+    }
+    g_snprintf(cmd, sizeof(cmd), "exec sh %s", path);
+    sway_command(cmd);
+}
+
 /* [MS-RDPERP] 2.2.2.3.1: run the program, with its arguments, via sway */
 static void
 process_exec(struct stream *s)
@@ -760,41 +852,8 @@ process_exec(struct stream *s)
     args = read_uni(s, args_len);
     if (exe != NULL && dir != NULL && args != NULL)
     {
-        /* the program single-quoted; the arguments as a command line, as
-           Windows passes them */
-        int size = 16 + g_strlen(exe) * 4 + g_strlen(args);
-        char *cmd = g_new(char, size);
-        char *p = cmd;
-        const char *q;
-
-        if (cmd != NULL)
-        {
-            p += g_snprintf(p, size, "exec '");
-            for (q = exe; *q != '\0'; q++)
-            {
-                if (*q == '\'')
-                {
-                    g_strcpy(p, "'\\''");
-                    p += 4;
-                }
-                else
-                {
-                    *p++ = *q;
-                }
-            }
-            *p++ = '\'';
-            if (args[0] != '\0')
-            {
-                *p++ = ' ';
-                g_strcpy(p, args);
-                p += g_strlen(args);
-            }
-            *p = '\0';
-            LOG(LOG_LEVEL_INFO, "rail_wl: the client runs [%s] [%s]", exe,
-                args);
-            sway_command(cmd);
-            g_free(cmd);
-        }
+        LOG(LOG_LEVEL_INFO, "rail_wl: the client runs [%s] [%s]", exe, args);
+        run_program(exe, args);
     }
     g_free(exe);
     g_free(dir);
