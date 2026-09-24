@@ -34,6 +34,12 @@
 #include "xrdp_client_info.h"
 #include "xrdp_accel_assist.h"
 #include "xrdp_accel_assist_x11.h"
+#include <X11/Xlib.h> /* Pixmap, in the EGL header's prototypes */
+#include "xrdp_accel_assist_egl.h"
+
+#if defined(XRDP_VAAPI)
+#include <gbm.h>
+#endif
 
 #define ARRAYSIZE(x) (sizeof(x)/sizeof(*(x)))
 
@@ -51,6 +57,7 @@ struct xorgxrdp_info
 };
 
 static int g_display_num = 0;
+static int g_headless = 0; /* -w: frames arrive as dma-bufs, no X */
 static int g_force_avc444 = -1; /* -1 = not yet checked, see XRDP_ACCEL_AVC444 */
 
 /*****************************************************************************/
@@ -537,6 +544,73 @@ xorg_process_message_64(struct xorgxrdp_info *xi, struct stream *s)
 }
 
 /*****************************************************************************/
+/* XH_BATCH_DMABUF_BUFFER: import one capture buffer; its fd follows the
+   batch on the socket. */
+static int
+xorg_process_dmabuf_buffer(struct xorgxrdp_info *xi, struct stream *s)
+{
+    int width;
+    int height;
+    int mon_id;
+    int buf;
+    unsigned int fourcc;
+    unsigned int stride;
+    unsigned int offset;
+    unsigned int mod_lo;
+    unsigned int mod_hi;
+    unsigned int num_fds;
+    int fd;
+    char msg[4];
+    inf_image_t image;
+    int rv;
+
+    if (!g_headless || !s_check_rem(s, XH_BATCH_DMABUF_BUFFER_BYTES - 4))
+    {
+        return 1;
+    }
+    in_uint16_le(s, width);
+    in_uint16_le(s, height);
+    in_uint32_le(s, mon_id);
+    in_uint32_le(s, buf);
+    in_uint32_le(s, fourcc);
+    in_uint32_le(s, stride);
+    in_uint32_le(s, offset);
+    in_uint32_le(s, mod_lo);
+    in_uint32_le(s, mod_hi);
+
+    fd = -1;
+    num_fds = 0;
+    if (g_tcp_can_recv(xi->xorg_trans->sck, 5000) == 0 ||
+            g_sck_recv_fd_set(xi->xorg_trans->sck, msg, 4, &fd, 1,
+                              &num_fds) != 4 || num_fds != 1)
+    {
+        LOG(LOG_LEVEL_ERROR, "dma-buf buffer: no fd");
+        return 1;
+    }
+    LOG(LOG_LEVEL_INFO, "dma-buf buffer: mon %d buf %d %dx%d fourcc 0x%8.8x "
+        "stride %u modifier 0x%8.8x%8.8x", mon_id, buf, width, height,
+        fourcc, stride, mod_hi, mod_lo);
+    rv = 0;
+    if (buf == 0)
+    {
+        rv = xrdp_accel_assist_x11_create_surface(width, height, mon_id);
+    }
+    if (rv == 0)
+    {
+        rv = xrdp_accel_assist_inf_egl_import_dmabuf(
+                 width, height, fourcc, fd, offset, stride,
+                 ((unsigned long long) mod_hi << 32) | mod_lo, &image);
+    }
+    if (rv == 0)
+    {
+        rv = xrdp_accel_assist_x11_set_source_image(mon_id, buf, image);
+    }
+    /* the EGLImage holds the buffer; the fd is no longer needed */
+    g_file_close(fd);
+    return rv;
+}
+
+/*****************************************************************************/
 /* data going from xorg to xrdp */
 static int
 xorg_process_message(struct xorgxrdp_info *xi, struct stream *s)
@@ -625,6 +699,13 @@ xorg_process_message(struct xorgxrdp_info *xi, struct stream *s)
                     LOG(LOG_LEVEL_DEBUG, "calling xrdp_accel_assist_x11_create_pixmap");
                     xrdp_accel_assist_x11_create_pixmap(width, height, magic,
                                                         con_id, mon_id);
+                    break;
+                case XH_BATCH_DMABUF_BUFFER:
+                    if (xorg_process_dmabuf_buffer(xi, s) != 0)
+                    {
+                        LOG(LOG_LEVEL_ERROR, "xorg_process_message: "
+                            "dma-buf buffer failed");
+                    }
                     break;
                 case 4:
                     /* Session capabilities, sent by xorgxrdp before the
@@ -992,16 +1073,15 @@ main(int argc, char **argv)
     int timeout;
     struct xorgxrdp_info xi;
 
-    if (argc < 2)
+    /* -d: frames from xorgxrdp (X pixmaps); -w: from a non-X frame source
+       (the Wayland backend), as dma-bufs, with no X display */
+    if (argc < 2 || (strcmp(argv[1], "-d") != 0 &&
+                     strcmp(argv[1], "-w") != 0))
     {
-        g_writeln("need to pass -d");
+        g_writeln("need to pass -d or -w");
         return 0;
     }
-    if (strcmp(argv[1], "-d") != 0)
-    {
-        g_writeln("need to pass -d");
-        return 0;
-    }
+    g_headless = strcmp(argv[1], "-w") == 0;
     g_init("xrdp_accel_assist");
 
     if (xrdp_accel_assist_setup_log() != 0)
@@ -1011,7 +1091,29 @@ main(int argc, char **argv)
     LOG(LOG_LEVEL_INFO, "startup");
     g_memset(&xi, 0, sizeof(xi));
     g_signal_pipe(sigpipe_func);
-    if (xrdp_accel_assist_x11_init() != 0)
+    if (g_headless)
+    {
+#if defined(XRDP_VAAPI)
+        const char *dev = g_getenv("XRDP_VAAPI_DEVICE");
+        int drm_fd;
+        struct gbm_device *gbm;
+
+        /* the same render node the encoder opens */
+        drm_fd = g_file_open_ex(dev != NULL ? dev : "/dev/dri/renderD128",
+                                1, 1, 0, 0);
+        gbm = (drm_fd >= 0) ? gbm_create_device(drm_fd) : NULL;
+        if (gbm == NULL || xrdp_accel_assist_x11_init_headless(gbm) != 0)
+        {
+            LOG(LOG_LEVEL_ERROR, "headless (dma-buf) init failed");
+            return 1;
+        }
+        LOG(LOG_LEVEL_INFO, "headless: frames arrive as dma-bufs");
+#else
+        LOG(LOG_LEVEL_ERROR, "-w needs a build with --enable-vaapi");
+        return 1;
+#endif
+    }
+    else if (xrdp_accel_assist_x11_init() != 0)
     {
         LOG(LOG_LEVEL_ERROR, "xrdp_accel_assist_x11_init failed");
         return 1;

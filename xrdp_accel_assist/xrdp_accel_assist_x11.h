@@ -29,6 +29,14 @@ struct enc_info;
 
 int
 xrdp_accel_assist_x11_init(void);
+/* Headless: no X display; frames come from dma-bufs (Wayland capture). */
+int
+xrdp_accel_assist_x11_init_headless(void *gbm_device);
+int
+xrdp_accel_assist_x11_create_surface(int width, int height, int mon_id);
+int
+xrdp_accel_assist_x11_set_source_image(int mon_id, int buf,
+                                       inf_image_t inf_image);
 int
 xrdp_accel_assist_x11_get_wait_objs(intptr_t *objs, int *obj_count);
 int

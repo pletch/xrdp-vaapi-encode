@@ -22,6 +22,17 @@
 int
 xrdp_accel_assist_inf_egl_init(void);
 int
+xrdp_accel_assist_inf_egl_init_gbm(void *gbm_device);
+int
+xrdp_accel_assist_inf_egl_import_dmabuf(int width, int height,
+                                        unsigned int fourcc, int fd,
+                                        unsigned int offset,
+                                        unsigned int stride,
+                                        unsigned long long modifier,
+                                        inf_image_t *inf_image);
+int
+xrdp_accel_assist_inf_egl_destroy_dmabuf(inf_image_t inf_image);
+int
 xrdp_accel_assist_inf_egl_create_image(Pixmap pixmap, inf_image_t *inf_image);
 int
 xrdp_accel_assist_inf_egl_destroy_image(inf_image_t inf_image);

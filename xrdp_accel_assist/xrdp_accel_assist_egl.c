@@ -126,6 +126,99 @@ xrdp_accel_assist_inf_egl_init(void)
 }
 
 /*****************************************************************************/
+/* Headless init for a non-X source (Wayland capture): EGL on the GBM
+   platform with a surfaceless context, no X display. */
+int
+xrdp_accel_assist_inf_egl_init_gbm(void *gbm_device)
+{
+    int egl_ver;
+    int ok;
+
+    ok = eglBindAPI(EGL_OPENGL_API);
+    LOG(LOG_LEVEL_INFO, "eglBindAPI ok %d", ok);
+    /* the EXT entry point: epoxy cannot resolve the EGL 1.5 one before a
+       display exists */
+    g_egl_display = eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR, gbm_device,
+                    NULL);
+    LOG(LOG_LEVEL_INFO, "g_egl_display %p (GBM)", g_egl_display);
+    if (g_egl_display == EGL_NO_DISPLAY ||
+            !eglInitialize(g_egl_display, NULL, NULL))
+    {
+        LOG(LOG_LEVEL_ERROR, "eglInitialize failed on the GBM platform");
+        return 1;
+    }
+    egl_ver = epoxy_egl_version(g_egl_display);
+    LOG(LOG_LEVEL_INFO, "egl_ver %d", egl_ver);
+    if ((!xrdp_accel_assist_check_ext("EGL_EXT_image_dma_buf_import")) ||
+            (!xrdp_accel_assist_check_ext("EGL_EXT_image_dma_buf_import_modifiers")) ||
+            (!xrdp_accel_assist_check_ext("EGL_MESA_image_dma_buf_export")) ||
+            (!xrdp_accel_assist_check_ext("EGL_KHR_surfaceless_context")) ||
+            (!xrdp_accel_assist_check_ext("EGL_KHR_no_config_context")))
+    {
+        LOG(LOG_LEVEL_ERROR, "missing ext");
+        eglTerminate(g_egl_display);
+        return 1;
+    }
+    g_egl_context = eglCreateContext(g_egl_display, EGL_NO_CONFIG_KHR,
+                                     EGL_NO_CONTEXT, g_create_context_attr);
+    LOG(LOG_LEVEL_INFO, "g_egl_context %p", g_egl_context);
+    if (g_egl_context == EGL_NO_CONTEXT)
+    {
+        eglTerminate(g_egl_display);
+        return 1;
+    }
+    ok = eglMakeCurrent(g_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        g_egl_context);
+    LOG(LOG_LEVEL_INFO, "eglMakeCurrent (surfaceless) ok %d", ok);
+    return ok ? 0 : 1;
+}
+
+/*****************************************************************************/
+/* Wrap a single-plane dma-buf (e.g. a captured XRGB8888 frame) in an
+   EGLImage. The fd stays owned by the caller. */
+int
+xrdp_accel_assist_inf_egl_import_dmabuf(int width, int height,
+                                        unsigned int fourcc, int fd,
+                                        unsigned int offset,
+                                        unsigned int stride,
+                                        unsigned long long modifier,
+                                        inf_image_t *inf_image)
+{
+    EGLAttrib attrs[] =
+    {
+        EGL_WIDTH, width,
+        EGL_HEIGHT, height,
+        EGL_LINUX_DRM_FOURCC_EXT, fourcc,
+        EGL_DMA_BUF_PLANE0_FD_EXT, fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, stride,
+        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLAttrib)(modifier & 0xffffffff),
+        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLAttrib)(modifier >> 32),
+        EGL_NONE
+    };
+    EGLImage image;
+
+    image = eglCreateImage(g_egl_display, EGL_NO_CONTEXT,
+                           EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
+    if (image == EGL_NO_IMAGE)
+    {
+        LOG(LOG_LEVEL_ERROR, "eglCreateImage(dma-buf) failed 0x%x",
+            eglGetError());
+        return 1;
+    }
+    *inf_image = (inf_image_t) image;
+    return 0;
+}
+
+/*****************************************************************************/
+int
+xrdp_accel_assist_inf_egl_destroy_dmabuf(inf_image_t inf_image)
+{
+    eglDestroyImage(g_egl_display, (EGLImage) inf_image);
+    return 0;
+}
+
+/*****************************************************************************/
 int
 xrdp_accel_assist_inf_egl_create_image(Pixmap pixmap, inf_image_t *inf_image)
 {

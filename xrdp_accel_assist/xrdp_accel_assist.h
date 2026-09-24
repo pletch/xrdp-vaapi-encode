@@ -50,6 +50,17 @@ struct xh_rect
 #define XH_AVC444_AUX_RECT_MAGIC 0x52584141  /* "AAXR" */
 #define XH_AVC444_AUX_RECT_BYTES 20
 
+/* Control batch (message type 100) sub-message from a frame source that
+   is not Xorg (the Wayland backend, which starts the helper with -w): one
+   capture buffer as a dma-buf. The fd follows the batch over SCM_RIGHTS,
+   one per sub-message, in order. The first buffer of a monitor creates its
+   encode surface. xrdp skips the id by size.
+
+   Layout after id and size: width, height (u16); mon_id, buf (0 or 1),
+   drm fourcc, stride, offset (u32); modifier (u64, lo then hi). */
+#define XH_BATCH_DMABUF_BUFFER 5
+#define XH_BATCH_DMABUF_BUFFER_BYTES (4 + 2 + 2 + 4 * 5 + 8)
+
 /* Session capability bits from xorgxrdp's control batch. */
 #define XH_CAPS_AVC444        (1 << 0)
 #define XH_CAPS_AVC444_V2     (1 << 1)

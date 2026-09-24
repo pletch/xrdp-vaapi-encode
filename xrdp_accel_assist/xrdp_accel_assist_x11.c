@@ -117,6 +117,14 @@ static struct enc_funcs g_enc_funcs[] =
     }
 };
 
+/*****************************************************************************/
+static int
+inf_dmabuf_nop(inf_image_t inf_image)
+{
+    (void) inf_image;
+    return 0;
+}
+
 /* GL interface: EGL or GLX */
 struct inf_funcs
 {
@@ -142,6 +150,15 @@ static struct inf_funcs g_inf_funcs[] =
         xrdp_accel_assist_inf_glx_destroy_image,
         xrdp_accel_assist_inf_glx_bind_tex_image,
         xrdp_accel_assist_inf_glx_release_tex_image
+    },
+    {
+        /* dma-buf source (headless, e.g. Wayland capture): the EGLImage is
+           attached to the source texture once, so bind/release are no-ops */
+        NULL,
+        NULL,
+        xrdp_accel_assist_inf_egl_destroy_dmabuf,
+        inf_dmabuf_nop,
+        inf_dmabuf_nop
     }
 };
 
@@ -149,6 +166,7 @@ static struct inf_funcs g_inf_funcs[] =
 /* 0 = va, 1 = nvenc */
 #define INF_EGL     0
 #define INF_GLX     1
+#define INF_DMABUF  2
 #define ENC_VA      0
 #define ENC_NVENC   1
 static int g_inf = INF_EGL;
@@ -161,9 +179,9 @@ struct mon_info
     /* Two capture buffers, so xorgxrdp can fill one while we read the
        other. xorgxrdp keeps both complete, which the full-frame AVC444 aux
        pass relies on. */
-    Pixmap pixmap[2];
-    inf_image_t inf_image[2];
-    GLuint bmp_texture[2];
+    Pixmap pixmap[ACCEL_ASSIST_MAX_BUFFERS];
+    inf_image_t inf_image[ACCEL_ASSIST_MAX_BUFFERS];
+    GLuint bmp_texture[ACCEL_ASSIST_MAX_BUFFERS];
     GLuint enc_texture;
     int cur_buf;                  /* capture buffer this frame used */
     /* Damage since the aux view was last rendered, as a bounding box. A
@@ -278,18 +296,13 @@ static struct rgb2yuv_matrix g_rgb2yux_matrix[3] =
 #include "xrdp_accel_assist_shaders.c"
 
 /*****************************************************************************/
+static int
+xrdp_accel_assist_gl_init(void);
+
+/*****************************************************************************/
 int
 xrdp_accel_assist_x11_init(void)
 {
-    const GLchar *vsource[XH_NUM_SHADERS];
-    const GLchar *fsource[XH_NUM_SHADERS];
-    GLint linked;
-    GLint compiled;
-    GLint vlength;
-    GLint flength;
-    GLuint quad_vbo;
-    int index;
-    int gl_ver;
     int major_opcode, first_event, first_error;
 
     /* x11 */
@@ -331,6 +344,39 @@ xrdp_accel_assist_x11_init(void)
         }
         LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_init: using EGL");
     }
+    return xrdp_accel_assist_gl_init();
+}
+
+/*****************************************************************************/
+/* Headless init for a non-X frame source: EGL on GBM, VA-API encode. */
+int
+xrdp_accel_assist_x11_init_headless(void *gbm_device)
+{
+    g_inf = INF_DMABUF;
+    g_enc = ENC_VA;
+    if (xrdp_accel_assist_inf_egl_init_gbm(gbm_device) != 0)
+    {
+        LOG(LOG_LEVEL_ERROR, "xrdp_accel_assist_x11_init_headless: "
+            "EGL (GBM) init failed");
+        return 1;
+    }
+    return xrdp_accel_assist_gl_init();
+}
+
+/*****************************************************************************/
+static int
+xrdp_accel_assist_gl_init(void)
+{
+    const GLchar *vsource[XH_NUM_SHADERS];
+    const GLchar *fsource[XH_NUM_SHADERS];
+    GLint linked;
+    GLint compiled;
+    GLint vlength;
+    GLint flength;
+    GLuint quad_vbo;
+    int index;
+    int gl_ver;
+
     gl_ver = epoxy_gl_version();
     LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_init: gl_ver %d", gl_ver);
     if (gl_ver < 30)
@@ -452,6 +498,10 @@ xrdp_accel_assist_x11_init(void)
 int
 xrdp_accel_assist_x11_get_wait_objs(intptr_t *objs, int *obj_count)
 {
+    if (g_display == NULL)
+    {
+        return 0; /* headless: no X connection */
+    }
     objs[*obj_count] = g_x_socket;
     (*obj_count)++;
     return 0;
@@ -463,6 +513,10 @@ xrdp_accel_assist_x11_check_wait_objs(void)
 {
     XEvent xevent;
 
+    if (g_display == NULL)
+    {
+        return 0;
+    }
     while (XPending(g_display) > 0)
     {
         LOG_DEVEL(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_check_wait_objs: "
@@ -482,23 +536,31 @@ xrdp_accel_assist_x11_delete_all_pixmaps(void)
     for (index = 0; index < MAX_MON; index++)
     {
         mi = g_mons + index;
-        if (mi->pixmap[0] != 0)
+        if (mi->pixmap[0] != 0 || mi->ei != NULL)
         {
             int buf;
 
             g_enc_funcs[g_enc].destroy_enc(mi->ei);
+            mi->ei = NULL;
             glDeleteTextures(1, &(mi->enc_texture));
             if (mi->enc_texture_aux != 0)
             {
                 glDeleteTextures(1, &(mi->enc_texture_aux));
                 mi->enc_texture_aux = 0;
             }
-            for (buf = 0; buf < 2; buf++)
+            for (buf = 0; buf < ACCEL_ASSIST_MAX_BUFFERS; buf++)
             {
                 glDeleteTextures(1, &(mi->bmp_texture[buf]));
-                g_inf_funcs[g_inf].destroy_image(mi->inf_image[buf]);
-                XFreePixmap(g_display, mi->pixmap[buf]);
-                mi->pixmap[buf] = 0;
+                if (mi->inf_image[buf] != 0)
+                {
+                    g_inf_funcs[g_inf].destroy_image(mi->inf_image[buf]);
+                    mi->inf_image[buf] = 0;
+                }
+                if (mi->pixmap[buf] != 0)
+                {
+                    XFreePixmap(g_display, mi->pixmap[buf]);
+                    mi->pixmap[buf] = 0;
+                }
             }
         }
     }
@@ -914,6 +976,9 @@ xrdp_accel_assist_x11_idr_min_bytes(void)
     return (unsigned int) min_kb * 1024;
 }
 
+static int
+create_encode_surface(struct mon_info *mi, int width, int height);
+
 /*****************************************************************************/
 int
 xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
@@ -922,7 +987,6 @@ xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
     struct mon_info *mi;
     XImage *ximage;
     int img[64];
-    GLuint enc_texture;
     int buf;
 
     mi = g_mons + mon_id % MAX_MON;
@@ -959,6 +1023,61 @@ xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
         XPutImage(g_display, mi->pixmap[buf], g_gc, ximage, 0, 0, 0, 0, 4, 4);
         XFree(ximage);
     }
+    return create_encode_surface(mi, width, height);
+}
+
+/*****************************************************************************/
+/* A monitor surface fed by a non-X source: no pixmaps; the caller attaches
+   each capture buffer with xrdp_accel_assist_x11_set_source_image(). */
+int
+xrdp_accel_assist_x11_create_surface(int width, int height, int mon_id)
+{
+    struct mon_info *mi;
+
+    mi = g_mons + mon_id % MAX_MON;
+    if (mi->ei != NULL)
+    {
+        LOG(LOG_LEVEL_ERROR, "xrdp_accel_assist_x11_create_surface: "
+            "error already setup");
+        return 1;
+    }
+    LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_create_surface: "
+        "width %d height %d mon_id %d", width, height, mon_id);
+    return create_encode_surface(mi, width, height);
+}
+
+/*****************************************************************************/
+/* Attach an image (a dma-buf EGLImage) as capture buffer buf's source
+   texture. Replaces, and destroys, any image attached before. */
+int
+xrdp_accel_assist_x11_set_source_image(int mon_id, int buf,
+                                       inf_image_t inf_image)
+{
+    struct mon_info *mi;
+
+    mi = g_mons + mon_id % MAX_MON;
+    if (buf < 0 || buf >= ACCEL_ASSIST_MAX_BUFFERS ||
+            mi->bmp_texture[buf] == 0)
+    {
+        return 1;
+    }
+    if (mi->inf_image[buf] != 0)
+    {
+        g_inf_funcs[g_inf].destroy_image(mi->inf_image[buf]);
+    }
+    mi->inf_image[buf] = inf_image;
+    glBindTexture(GL_TEXTURE_2D, mi->bmp_texture[buf]);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES) inf_image);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return 0;
+}
+
+/*****************************************************************************/
+static int
+create_encode_surface(struct mon_info *mi, int width, int height)
+{
+    GLuint enc_texture;
+    int buf;
 
     glEnable(GL_TEXTURE_2D);
     /* texture that gets encoded */
@@ -1018,7 +1137,7 @@ xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
         mi->viewport.h = height;
     }
     /* one source texture per capture buffer */
-    for (buf = 0; buf < 2; buf++)
+    for (buf = 0; buf < ACCEL_ASSIST_MAX_BUFFERS; buf++)
     {
         glGenTextures(1, &(mi->bmp_texture[buf]));
         glBindTexture(GL_TEXTURE_2D, mi->bmp_texture[buf]);
@@ -1384,6 +1503,20 @@ save_pixmap_to_file(Pixmap pix, int width, int height)
 #endif
 
 /*****************************************************************************/
+static void
+flush_gl(void)
+{
+    if (g_display != NULL)
+    {
+        XFlush(g_display);
+    }
+    else
+    {
+        glFlush();
+    }
+}
+
+/*****************************************************************************/
 static enum encoder_result
 encode_pixmap(int left, int top, int width, int height,
               int mon_id, int num_crects, struct xh_rect *crects,
@@ -1395,7 +1528,8 @@ encode_pixmap(int left, int top, int width, int height,
 
     mi = g_mons + mon_id % MAX_MON;
     /* Which capture buffer xorgxrdp used for this frame. */
-    mi->cur_buf = (flags & ACCEL_ASSIST_BUFFER_1) ? 1 : 0;
+    mi->cur_buf = flags & ACCEL_ASSIST_BUFFER_MASK;
+    mi->cur_buf >>= ACCEL_ASSIST_BUFFER_SHIFT;
     LOG_DEVEL(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_encode_pixmap: "
               "left %d top %d width %d height %d mon_id %d",
               left, top, width, height, mon_id);
@@ -1608,7 +1742,7 @@ encode_pixmap(int left, int top, int width, int height,
                                                  mi->pad_h * 3 / 2, 1);
             }
         }
-        XFlush(g_display);
+        flush_gl();
 
         len2 = 0;
         rv2 = INCREMENTAL_FRAME_ENCODED;
@@ -1711,7 +1845,7 @@ encode_pixmap(int left, int top, int width, int height,
                                      mi->enc_texture, num_crects, crects,
                                      mi->pad_h, mi->enc_w4, 0);
     /* flush before encoding, let encoders call glFinish() as needed */
-    XFlush(g_display);
+    flush_gl();
     /* encode */
     rv = g_enc_funcs[g_enc].encode(mi->ei, mi->enc_texture,
                                    cdata, cdata_bytes, flags);
