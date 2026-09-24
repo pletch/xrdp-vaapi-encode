@@ -64,6 +64,20 @@ dist_sesmansysconf_SCRIPTS = \
   startwm.sh \
   reconnectwm.sh
 
+# Wayland sessions: installed with --enable-wayland, shipped either way
+if XRDP_WAYLAND
+dist_sesmansysconf_SCRIPTS += \
+  startwayland.sh \
+  waylandsession.sh
+dist_sesmansysconf_DATA = \
+  sway-remoteapp.conf
+else
+EXTRA_DIST += \
+  startwayland.sh \
+  waylandsession.sh \
+  sway-remoteapp.conf
+endif
+
 SUBDIRS = \
   libsesman \
   sesexec \

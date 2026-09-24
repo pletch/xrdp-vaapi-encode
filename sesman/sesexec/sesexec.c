@@ -310,8 +310,6 @@ sesexec_is_ecp_active(void)
 static void
 sesexec_main_loop_cleanup(void)
 {
-    login_info_free(g_login_info);
-
     /* This session is no longer discoverable */
     sesexec_discover_disable();
 
@@ -324,6 +322,10 @@ sesexec_main_loop_cleanup(void)
         session_send_term(g_session_data, 1);
     }
     session_data_free(g_session_data);
+    /* Only now: stopping the session reaps its processes, and handling
+       their exits may still use the login */
+    login_info_free(g_login_info);
+    g_login_info = NULL;
 }
 
 /******************************************************************************/

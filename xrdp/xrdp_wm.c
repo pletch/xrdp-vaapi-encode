@@ -1871,6 +1871,16 @@ xrdp_wm_key_unicode(struct xrdp_wm *self, int device_flags, char32_t c16)
         }
     }
 
+    // A Wayland session's backend types it through its virtual keyboard,
+    // which reaches every application (IBus needs the compositor's help)
+    if (self->mm->code == WAYLAND_SESSION_CODE && self->mm->mod != NULL &&
+            self->mm->mod->mod_event != NULL)
+    {
+        self->mm->mod->mod_event(self->mm->mod, WM_KEYBRD_UNICODE, c32,
+                                 !(device_flags & KBDFLAGS_RELEASE), 0, 0);
+        return 0;
+    }
+
     // Send the character to chansrv if it's capable of doing something
     // with it
     if (self->mm->chan_trans != NULL &&

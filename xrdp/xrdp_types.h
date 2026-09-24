@@ -39,10 +39,12 @@
 #define XVNC_SESSION_CODE 0
 #define XVNC_UDS_SESSION_CODE 1
 #define XORG_SESSION_CODE 20
+/* A wlroots compositor with the wlxrdp backend (xup, like xorgxrdp) */
+#define WAYLAND_SESSION_CODE 1000
 
 /* To check whether touch events has been implemented on session type 'mm' */
 #define XRDP_MM_IMPLEMENTS_TOUCH(mm) \
-    ((mm)->code == XORG_SESSION_CODE)
+    ((mm)->code == XORG_SESSION_CODE || (mm)->code == WAYLAND_SESSION_CODE)
 
 struct source_info;
 struct list16;

@@ -34,6 +34,8 @@
 #endif
 
 #include <stdio.h>
+#include <ctype.h>
+#include <string.h>
 #include <errno.h>
 
 #include "arch.h"
@@ -63,6 +65,9 @@ struct session_data
     pid_t chansrv; ///< PID of chansrv
     time_t start_time;
     unsigned int connect_count;
+    time_t backend_restart_window; ///< Wayland: start of the restart count
+    unsigned int backend_restarts; ///< Wayland: backend restarts in it
+    int terminating; ///< session_send_term() has been called
     char display[MAX_DISPLAY_NAME_SIZE]; // Set by session_start()
     struct session_parameters params;
     // Flexible array member used to store strings in params and ip_addr;
@@ -102,6 +107,9 @@ session_data_new(const struct session_parameters *sp)
         sd->chansrv = -1;
         sd->start_time = 0;
         sd->connect_count = 0;
+        sd->backend_restart_window = 0;
+        sd->backend_restarts = 0;
+        sd->terminating = 0;
 
         /* Copy all the non-string session parameters... */
         sd->params = *sp;
@@ -861,6 +869,323 @@ process_startup_wait_time(struct session_data *sd)
 }
 
 /******************************************************************************/
+/* Wayland sessions (SCP_SESSION_TYPE_WAYLAND)
+ *
+ * sesexec's three children map onto a Wayland session as:
+ *   win_mgr   the compositor (startwayland.sh), which runs the desktop and
+ *             exits with it: the session lasts as long as it does
+ *   x_server  wlxrdp, the backend xrdp connects to (xup, like xorgxrdp)
+ *   chansrv   chansrv, with WAYLAND_DISPLAY set
+ * The compositor picks its own socket name; the session script reports the
+ * socket's absolute path through a file. The name becomes the session's
+ * display string; the path is WAYLAND_DISPLAY for the backend and chansrv,
+ * which then need no XDG_RUNTIME_DIR (sesexec does not set one). */
+
+#define WAYLAND_NAME_WAIT_MS 30000
+#define WAYLAND_BACKEND_WAIT_MS 10000
+
+/******************************************************************************/
+static void
+start_wayland_compositor(const struct login_info *login_info,
+                         const struct session_data *sd,
+                         void *closure)
+{
+    const char *name_file = (const char *)closure;
+    const struct session_parameters *sp = &sd->params;
+    const char *script = XRDP_CFG_PATH "/startwayland.sh";
+    char size[32];
+
+    env_set_user(login_info->uid,
+                 g_cfg->env_names,
+                 g_cfg->env_values);
+    auth_set_env(login_info->auth_info);
+    g_setenv_log("XRDP_WAYLAND_NAME_FILE", name_file, 1);
+    if (sp->type == SCP_SESSION_TYPE_WAYLAND_REMOTEAPP)
+    {
+        /* sway, no desktop: chansrv manages the windows */
+        g_setenv_log("XRDP_WAYLAND_REMOTEAPP", "1", 1);
+    }
+    if (sp->width > 0 && sp->height > 0)
+    {
+        g_snprintf(size, sizeof(size), "%dx%d", sp->width, sp->height);
+        g_setenv_log("XRDP_WAYLAND_SIZE", size, 1);
+    }
+    if (sp->shell[0] != '\0')
+    {
+        LOG(LOG_LEVEL_WARNING, "Wayland sessions ignore the requested "
+            "shell '%s'", sp->shell);
+    }
+    LOG_DEVEL_LEAKING_FDS("wayland compositor", 3, -1);
+
+    LOG(LOG_LEVEL_INFO, "Starting the Wayland compositor: %s", script);
+    g_execlp3(script, script, 0);
+
+    LOG(LOG_LEVEL_ERROR, "Can't start %s [%s]", script, g_get_strerror());
+}
+
+/******************************************************************************/
+static void
+start_wayland_backend(const struct login_info *login_info,
+                      const struct session_data *sd,
+                      void *closure /* unused */)
+{
+    const char *exe_path = XRDP_LIBEXEC_PATH "/wlxrdp";
+    char socket_path[XRDP_SOCKETS_MAXPATH];
+
+    env_set_user(login_info->uid,
+                 g_cfg->env_names,
+                 g_cfg->env_values);
+    g_snprintf(socket_path, sizeof(socket_path), XRDP_X11RDP_STR,
+               login_info->uid, sd->display);
+    LOG_DEVEL_LEAKING_FDS("wayland backend", 3, -1);
+
+    LOG(LOG_LEVEL_INFO, "Starting the Wayland backend: %s -s %s",
+        exe_path, socket_path);
+    const char *argv[] = { exe_path, "-s", socket_path, NULL };
+    g_execvp(exe_path, (char **)argv);
+
+    LOG(LOG_LEVEL_ERROR, "Can't start %s [%s]", exe_path, g_get_strerror());
+}
+
+/******************************************************************************/
+/* Wait for a file to appear, while the process that makes it lives.
+ * Returns 0 once it exists. */
+static int
+wait_for_file(const char *path, pid_t maker, unsigned int timeout_ms)
+{
+    unsigned int start = g_get_elapsed_ms();
+
+    while (!g_file_exist(path))
+    {
+        if (g_get_elapsed_ms() - start >= timeout_ms)
+        {
+            return 1;
+        }
+        if (!g_pid_is_active(maker))
+        {
+            return 1;
+        }
+        g_sleep(100);
+    }
+    return 0;
+}
+
+/******************************************************************************/
+/* A line of the name file: an absolute path of plain characters. Returns
+ * a pointer past it (and its newline), or NULL if it is not one. */
+static char *
+wayland_path_line(char *p)
+{
+    char *start = p;
+
+    for (; *p != '\0' && *p != '\n'; p++)
+    {
+        if (!(isalnum((unsigned char) p[0]) || *p == '/' ||
+                *p == '-' || *p == '_' || *p == '.'))
+        {
+            return NULL;
+        }
+    }
+    if (*p == '\n')
+    {
+        *p++ = '\0';
+    }
+    if (start[0] != '/' || strstr(start, "/..") != NULL)
+    {
+        return NULL;
+    }
+    return p;
+}
+
+/******************************************************************************/
+/* The compositor's socket, as the session script wrote it: an absolute
+ * path into path[], its last component (the display string) into name[].
+ * An optional second line is the compositor's IPC socket (sway's, for
+ * RemoteApp), into ipc[]; "" if there is none. */
+static int
+read_wayland_socket(const char *name_file, char path[], unsigned int path_len,
+                    char name[], unsigned int len,
+                    char ipc[], unsigned int ipc_len)
+{
+    char buff[XRDP_SOCKETS_MAXPATH * 2];
+    const char *base;
+    char *second;
+    int fd;
+    int n;
+
+    ipc[0] = '\0';
+    fd = g_file_open_ro(name_file);
+    if (fd < 0)
+    {
+        return 1;
+    }
+    n = g_file_read(fd, buff, sizeof(buff) - 1);
+    g_file_close(fd);
+    g_file_delete(name_file);
+    if (n <= 0)
+    {
+        return 1;
+    }
+    buff[n] = '\0';
+    second = wayland_path_line(buff);
+    if (second == NULL)
+    {
+        return 1;
+    }
+    if (*second != '\0' &&
+            (wayland_path_line(second) == NULL ||
+             strlcpy(ipc, second, ipc_len) >= ipc_len))
+    {
+        return 1;
+    }
+    base = strrchr(buff, '/') + 1;
+    if (base[0] == '\0' ||
+            strlcpy(name, base, len) >= len ||
+            strlcpy(path, buff, path_len) >= path_len)
+    {
+        return 1;
+    }
+    return 0;
+}
+
+/******************************************************************************/
+/* The backend exited while the compositor lives: start another on the
+ * same socket, at most WAYLAND_BACKEND_RESTARTS times a minute. */
+#define WAYLAND_BACKEND_RESTARTS 5
+
+static void
+wayland_restart_backend(struct session_data *sd)
+{
+    time_t now = time(NULL);
+
+    if (now - sd->backend_restart_window >= 60)
+    {
+        sd->backend_restart_window = now;
+        sd->backend_restarts = 0;
+    }
+    if (g_login_info == NULL)
+    {
+        return; /* no user to start it as: sesexec is ending */
+    }
+    if (++sd->backend_restarts > WAYLAND_BACKEND_RESTARTS)
+    {
+        LOG(LOG_LEVEL_ERROR, "The Wayland backend on display %s keeps "
+            "exiting; not restarting it", sd->display);
+        return;
+    }
+    sd->x_server = fork_child(start_wayland_backend, g_login_info, sd,
+                              sd->win_mgr, NULL);
+    if (sd->x_server > 0)
+    {
+        LOG(LOG_LEVEL_WARNING, "Restarted the Wayland backend on display %s "
+            "(pid %d)", sd->display, sd->x_server);
+    }
+}
+
+/******************************************************************************/
+static enum scp_screate_status
+session_start_wayland(struct login_info *login_info,
+                      struct session_data *sd)
+{
+    char name_file[XRDP_SOCKETS_MAXPATH];
+    char socket_path[XRDP_SOCKETS_MAXPATH];
+    char wayland_socket[XRDP_SOCKETS_MAXPATH];
+    char ipc_socket[XRDP_SOCKETS_MAXPATH];
+    pid_t compositor_pid;
+    pid_t backend_pid;
+    pid_t chansrv_pid;
+
+    g_snprintf(name_file, sizeof(name_file),
+               XRDP_SOCKET_PATH "/xrdp_wayland_name_%d",
+               login_info->uid, g_getpid());
+    g_file_delete(name_file);
+
+    /* The compositor leads the session's process group, as the X server
+     * does for X11 sessions */
+    compositor_pid = fork_child(start_wayland_compositor, login_info, sd,
+                                0, name_file);
+    if (compositor_pid <= 0)
+    {
+        return E_SCP_SCREATE_X_SERVER_FAIL;
+    }
+
+    if (wait_for_file(name_file, compositor_pid, WAYLAND_NAME_WAIT_MS) != 0 ||
+            read_wayland_socket(name_file,
+                                wayland_socket, sizeof(wayland_socket),
+                                sd->display, sizeof(sd->display),
+                                ipc_socket, sizeof(ipc_socket)) != 0)
+    {
+        LOG(LOG_LEVEL_ERROR, "The Wayland compositor did not report its "
+            "display (see the session's startwayland.sh output)");
+        g_file_delete(name_file);
+        g_sigterm(compositor_pid);
+        g_waitpid(compositor_pid);
+        return E_SCP_SCREATE_X_SERVER_FAIL;
+    }
+    LOG(LOG_LEVEL_INFO, "Wayland compositor (pid %d) is running on %s (%s)",
+        compositor_pid, sd->display, wayland_socket);
+
+    /* The rest of the session's processes connect to it; chansrv also to
+       sway's IPC in a RemoteApp session */
+    if (!list_add_strdup(g_cfg->env_names, "WAYLAND_DISPLAY") ||
+            !list_add_strdup(g_cfg->env_values, wayland_socket) ||
+            (ipc_socket[0] != '\0' &&
+             (!list_add_strdup(g_cfg->env_names, "SWAYSOCK") ||
+              !list_add_strdup(g_cfg->env_values, ipc_socket))))
+    {
+        g_sigterm(compositor_pid);
+        g_waitpid(compositor_pid);
+        return E_SCP_SCREATE_NO_MEMORY;
+    }
+    if (sd->params.type == SCP_SESSION_TYPE_WAYLAND_REMOTEAPP &&
+            ipc_socket[0] == '\0')
+    {
+        LOG(LOG_LEVEL_WARNING, "The RemoteApp compositor did not report an "
+            "IPC socket: RemoteApp windows will not be managed");
+    }
+
+    backend_pid = fork_child(start_wayland_backend, login_info, sd,
+                             compositor_pid, NULL);
+    g_snprintf(socket_path, sizeof(socket_path), XRDP_X11RDP_STR,
+               login_info->uid, sd->display);
+    if (backend_pid <= 0 ||
+            wait_for_file(socket_path, backend_pid,
+                          WAYLAND_BACKEND_WAIT_MS) != 0)
+    {
+        LOG(LOG_LEVEL_ERROR, "The Wayland backend did not start");
+        if (backend_pid > 0)
+        {
+            g_sigterm(backend_pid);
+            g_waitpid(backend_pid);
+        }
+        g_sigterm(compositor_pid);
+        g_waitpid(compositor_pid);
+        return E_SCP_SCREATE_X_SERVER_FAIL;
+    }
+
+    utmp_login(compositor_pid, sd->display, login_info);
+    LOG(LOG_LEVEL_INFO, "Starting the xrdp channel server for display %s",
+        sd->display);
+    chansrv_pid = fork_child(start_chansrv, login_info, sd, compositor_pid,
+                             NULL);
+
+    sd->win_mgr = compositor_pid;
+    sd->x_server = backend_pid;
+    sd->chansrv = chansrv_pid;
+    sd->start_time = time(NULL);
+
+    if (process_startup_wait_time(sd) != 0)
+    {
+        LOG(LOG_LEVEL_ERROR, "Session failed during startup wait time");
+        return E_SCP_SCREATE_SESSION_FAIL;
+    }
+    LOG(LOG_LEVEL_INFO, "Wayland session in progress on %s. Waiting until "
+        "the compositor (pid %d) exits to end the session",
+        sd->display, compositor_pid);
+    return E_SCP_SCREATE_OK;
+}
+
+/******************************************************************************/
 static enum scp_screate_status
 session_start_wrapped(struct login_info *login_info,
                       const struct session_parameters *s,
@@ -909,6 +1234,11 @@ session_start_wrapped(struct login_info *login_info,
             sd->display, login_info->username, g_getpid());
     }
 #endif
+
+    if (SCP_SESSION_TYPE_IS_WAYLAND(s->type))
+    {
+        return session_start_wayland(login_info, sd);
+    }
 
     /* start the X server in a new process group.
      *
@@ -1198,7 +1528,14 @@ process_child_exit(struct session_data *sd,
         LOG(LOG_LEVEL_INFO, "X server pid %d on display %s finished",
             sd->x_server, sd->display);
         sd->x_server = -1;
-        // No other action - window manager should be going soon
+        if (SCP_SESSION_TYPE_IS_WAYLAND(sd->params.type) &&
+                sd->win_mgr > 0 && !sd->terminating)
+        {
+            // The compositor (and the desktop) outlived the backend:
+            // without one, the session can't be reached. Start another.
+            wayland_restart_backend(sd);
+        }
+        // Otherwise no other action - window manager should be going soon
     }
     else if (pid == sd->chansrv)
     {
@@ -1326,6 +1663,8 @@ session_send_term(struct session_data *sd, int wait_for_all)
 {
     if (sd != NULL)
     {
+        // Ending: a Wayland backend that exits now is not restarted
+        sd->terminating = 1;
         if (sd->win_mgr > 0)
         {
             // Killing the window manager only is appropriate here.
@@ -1407,8 +1746,17 @@ session_run_reconnect_script(const struct login_info *login_info,
                              const struct session_data *sd,
                              const char *vars[])
 {
+    /* in the session's process group: the X server leads it for X11,
+       the compositor (not the backend, sd->x_server) for Wayland */
+    pid_t group = sd->x_server;
+
+    if (sd->params.type == SCP_SESSION_TYPE_WAYLAND ||
+            sd->params.type == SCP_SESSION_TYPE_WAYLAND_REMOTEAPP)
+    {
+        group = sd->win_mgr;
+    }
     if (fork_child(start_reconnect_script,
-                   login_info, sd, sd->x_server, (void *)vars) < 0)
+                   login_info, sd, group, (void *)vars) < 0)
     {
         LOG(LOG_LEVEL_ERROR, "Failed to fork for session reconnection script");
     }
@@ -1443,6 +1791,8 @@ session_get_display_server_fd(const struct login_info *login_info,
 
             case SCP_SESSION_TYPE_XVNC_UDS:
             case SCP_SESSION_TYPE_XORG:
+            case SCP_SESSION_TYPE_WAYLAND:
+            case SCP_SESSION_TYPE_WAYLAND_REMOTEAPP:
                 socket_mode = TRANS_MODE_UNIX;
                 snprintf(portname, sizeof(portname), XRDP_X11RDP_STR,
                          login_info->uid, sd->display);

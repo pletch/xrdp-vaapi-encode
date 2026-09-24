@@ -35,18 +35,26 @@ enum scp_session_type
 {
     SCP_SESSION_TYPE_XVNC = 0,  ///< Session used Xvnc
     SCP_SESSION_TYPE_XVNC_UDS,  ///< Session used Xvnc with UDS connection
-    SCP_SESSION_TYPE_XORG  ///< Session used Xorg + xorgxrdp
+    SCP_SESSION_TYPE_XORG,  ///< Session used Xorg + xorgxrdp
+    SCP_SESSION_TYPE_WAYLAND,  ///< Wayland compositor + wlxrdp backend
+    SCP_SESSION_TYPE_WAYLAND_REMOTEAPP  ///< The same for RemoteApp (sway)
 };
 
 #define SCP_SESSION_TYPE_TO_STR(t) \
     ((t) == SCP_SESSION_TYPE_XVNC ? "Xvnc" : \
      (t) == SCP_SESSION_TYPE_XVNC_UDS ? "Xvnc-UDS" : \
      (t) == SCP_SESSION_TYPE_XORG ? "Xorg" : \
+     (t) == SCP_SESSION_TYPE_WAYLAND ? "Wayland" : \
+     (t) == SCP_SESSION_TYPE_WAYLAND_REMOTEAPP ? "Wayland-RemoteApp" : \
      "unknown" \
     )
 
 #define SCP_SESSION_TYPE_IS_X11(t) \
     ((t) >= SCP_SESSION_TYPE_XVNC && (t) <= SCP_SESSION_TYPE_XORG)
+
+#define SCP_SESSION_TYPE_IS_WAYLAND(t) \
+    ((t) == SCP_SESSION_TYPE_WAYLAND || \
+     (t) == SCP_SESSION_TYPE_WAYLAND_REMOTEAPP)
 
 /**
  * @brief Information to display about a particular sesman session

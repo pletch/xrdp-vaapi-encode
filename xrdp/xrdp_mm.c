@@ -329,6 +329,14 @@ xrdp_mm_create_session(struct xrdp_mm *self)
             type = SCP_SESSION_TYPE_XORG;
             break;
 
+        case WAYLAND_SESSION_CODE:
+            /* RemoteApp needs a compositor that lets chansrv place and
+               follow windows: its own session type (sway) */
+            type = self->wm->client_info->rail_enable
+                   ? SCP_SESSION_TYPE_WAYLAND_REMOTEAPP
+                   : SCP_SESSION_TYPE_WAYLAND;
+            break;
+
         default:
             xrdp_wm_log_msg(self->wm, LOG_LEVEL_ERROR,
                             "Unrecognised session code %d", self->code);
@@ -5634,7 +5642,8 @@ xrdp_mm_setup_mod2(struct xrdp_mm *self)
             }
         }
         else if (self->code == XORG_SESSION_CODE ||
-                 self->code == XVNC_UDS_SESSION_CODE)
+                 self->code == XVNC_UDS_SESSION_CODE ||
+                 self->code == WAYLAND_SESSION_CODE)
         {
             g_snprintf(text, sizeof(text), XRDP_X11RDP_STR,
                        self->uid, self->display);
