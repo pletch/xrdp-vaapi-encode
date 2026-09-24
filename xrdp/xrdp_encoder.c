@@ -871,6 +871,14 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
     in_uint8(in_s, pixel_format);
     in_uint32_le(in_s, flags);
     mon_index = (flags >> 28) & 0xF;
+    if (ENC_IS_BIT_SET(flags, 0) && enc_gfx_cmd->data_bytes == 0)
+    {
+        /* Pre-encoded, but empty: accel-assist could not encode this frame
+           (and makes the next an IDR). Nothing to draw; the frame's start
+           and end still go out. */
+        g_free(s->data);
+        return NULL;
+    }
     in_uint16_le(in_s, num_rects_d);
     if ((num_rects_d < 1) || (num_rects_d > 16 * 1024) ||
             (!s_check_rem(in_s, num_rects_d * 8)))

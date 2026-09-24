@@ -209,6 +209,13 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
          codec_id, encoder_flags);
     LOG_DEVEL(LOG_LEVEL_INFO, "gfx_wiretosurface1: rv %d cdata_bytes %d",
               rv, cdata_bytes);
+    if (rv == ENCODER_ERROR)
+    {
+        /* Nothing encoded: forward the frame empty, not the whole shared
+           buffer as if it held a picture. xrdp skips an empty pre-encoded
+           frame, and the next is an IDR. */
+        cdata_bytes = 0;
+    }
     if (codec_id == 0x000E || codec_id == 0x000F)
     {
         int alen1 = ((unsigned char *) addr)[0]
@@ -230,7 +237,15 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
 
     g_free(crects);
     g_munmap(addr, GFX_MAP_SIZE);
-    /* do not close xi->shmem_fd_ret here, it will get closed after sent */
+    if (cdata_bytes == 0)
+    {
+        /* the frame's end says no shared memory: send no fd either, or its
+           payload lands in xrdp's message stream */
+        g_file_close(xi->shmem_fd_ret);
+        xi->shmem_fd_ret = -1;
+    }
+    /* otherwise do not close xi->shmem_fd_ret here, it will get closed
+       after sent */
 
     return 0;
 }

@@ -179,6 +179,10 @@ struct mon_info
     unsigned int idr_last_ms;
     /* Bytes sent since the last IDR, excluding it. */
     unsigned int idr_bytes_since;
+    /* A frame failed to encode (e.g. too big for the shared buffer): the
+       client lacks a picture the next ones may refer to, so the next frame
+       is an IDR. */
+    int idr_pending;
     int tex_format;
     GLfloat *(*get_vertices)(GLuint *vertices_bytes,
                              GLuint *vertices_pointes,
@@ -975,6 +979,7 @@ xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
         mi->aux_last_ms = 0;
         mi->idr_last_ms = g_get_elapsed_ms();
         mi->idr_bytes_since = 0;
+        mi->idr_pending = 0;
         mi->avc444 = xrdp_accel_assist_x11_avc444_enabled();
         mi->avc444_v2 = mi->avc444 && xrdp_accel_assist_x11_avc444_v2();
         /* v2 splits the aux plane into U and V halves at half the
@@ -1379,12 +1384,10 @@ save_pixmap_to_file(Pixmap pix, int width, int height)
 #endif
 
 /*****************************************************************************/
-enum encoder_result
-xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
-                                    int mon_id, int num_crects,
-                                    struct xh_rect *crects,
-                                    void *cdata, int *cdata_bytes,
-                                    int codec_id, int flags)
+static enum encoder_result
+encode_pixmap(int left, int top, int width, int height,
+              int mon_id, int num_crects, struct xh_rect *crects,
+              void *cdata, int *cdata_bytes, int codec_id, int flags)
 {
     struct mon_info *mi;
     struct shader_info *si;
@@ -1712,5 +1715,68 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
     /* encode */
     rv = g_enc_funcs[g_enc].encode(mi->ei, mi->enc_texture,
                                    cdata, cdata_bytes, flags);
+    return rv;
+}
+
+/*****************************************************************************/
+enum encoder_result
+xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
+                                    int mon_id, int num_crects,
+                                    struct xh_rect *crects,
+                                    void *cdata, int *cdata_bytes,
+                                    int codec_id, int flags)
+{
+    struct mon_info *mi = g_mons + mon_id % MAX_MON;
+    enum encoder_result rv;
+
+    if (mi->ei == NULL)
+    {
+        /* its re-creation after a failure failed: try again */
+        if (mi->enc_w <= 0 ||
+                g_enc_funcs[g_enc].create_enc(mi->enc_w, mi->pad_h,
+                                              mi->enc_texture,
+                                              mi->enc_texture_aux,
+                                              mi->tex_format, &mi->ei) != 0)
+        {
+            mi->ei = NULL;
+            return ENCODER_ERROR;
+        }
+    }
+    if (mi->idr_pending)
+    {
+        flags |= XH_ENC_FLAGS_FORCEIDR;
+    }
+    rv = encode_pixmap(left, top, width, height, mon_id, num_crects, crects,
+                       cdata, cdata_bytes, codec_id, flags);
+    if (rv == ENCODER_ERROR)
+    {
+        /* The encoder may be left unusable (iHD: a picture too big for the
+           coded buffer fails every later one too), so start a new one. The
+           client lacks the failed picture: the next is an IDR, as a new
+           encoder's first picture is anyway. */
+        if (!mi->idr_pending)
+        {
+            LOG(LOG_LEVEL_WARNING, "monitor %d: a frame did not encode; new "
+                "encoder, the next frame is an IDR", mon_id);
+        }
+        mi->idr_pending = 1;
+        if (mi->ei != NULL)
+        {
+            g_enc_funcs[g_enc].destroy_enc(mi->ei);
+            mi->ei = NULL;
+            if (g_enc_funcs[g_enc].create_enc(mi->enc_w, mi->pad_h,
+                                              mi->enc_texture,
+                                              mi->enc_texture_aux,
+                                              mi->tex_format, &mi->ei) != 0)
+            {
+                LOG(LOG_LEVEL_ERROR, "monitor %d: no new encoder", mon_id);
+                mi->ei = NULL;
+            }
+        }
+    }
+    else if (flags & XH_ENC_FLAGS_FORCEIDR)
+    {
+        mi->idr_pending = 0;
+    }
     return rv;
 }
