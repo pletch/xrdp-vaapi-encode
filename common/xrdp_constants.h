@@ -287,6 +287,9 @@
 #define WM_KEYDOWN     15
 #define WM_KEYUP       16
 #define WM_KEYBRD_SYNC 17
+/* A character with no key on the client's layout (param1: UTF-32, param2:
+   1 down, 0 up), for display servers that type it themselves (wlxrdp) */
+#define WM_KEYBRD_UNICODE 18
 #define WM_MOUSEMOVE   100
 #define WM_LBUTTONUP   101
 #define WM_LBUTTONDOWN 102
