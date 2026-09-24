@@ -52,6 +52,12 @@ else
 ACCELDIR =
 endif
 
+if XRDP_WAYLAND
+WAYLANDDIR = wlxrdp
+else
+WAYLANDDIR =
+endif
+
 # This should not be dictionary order but build order
 SUBDIRS = \
   third_party \
@@ -78,7 +84,8 @@ SUBDIRS = \
   $(XRDPVRDIR) \
   tests \
   tools \
-  $(ACCELDIR)
+  $(ACCELDIR) \
+  $(WAYLANDDIR)
 
 distclean-local:
 	-rm -f xrdp_configure_options.h

@@ -65,3 +65,12 @@ xrdpapi/xrdp-xrdpapi-connectmon
 xrdpapi/xrdp-xrdpapi-simple
 .vscode/*
 xrdp_accel_assist/xrdp-accel-assist
+
+# wayland-scanner output (--enable-wayland-clipboard)
+sesman/chansrv/ext-data-control-v1-client-protocol.h
+sesman/chansrv/ext-data-control-v1-protocol.c
+
+# wlxrdp (--enable-wayland): binary and wayland-scanner output
+wlxrdp/wlxrdp
+wlxrdp/*-protocol.c
+wlxrdp/*-client-protocol.h

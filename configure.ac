@@ -177,6 +177,10 @@ AC_ARG_ENABLE(vaapi, AS_HELP_STRING([--enable-vaapi],
               [Use VA-API hardware encoding in xrdp_accel_assist (default: no)]),
               [], [enable_vaapi=no])
 AM_CONDITIONAL(XRDP_VAAPI, [test x$enable_vaapi = xyes])
+AC_ARG_ENABLE(wayland, AS_HELP_STRING([--enable-wayland],
+              [Wayland sessions: the wlxrdp backend and chansrv's Wayland clipboard (default: no; encoding needs --enable-vaapi)]),
+              [], [enable_wayland=no])
+AM_CONDITIONAL(XRDP_WAYLAND, [test x$enable_wayland = xyes])
 AC_ARG_ENABLE(accel, AS_HELP_STRING([--enable-accel],
               [Build xrdp_accel_assist (default: no, auto set if --enable-nvenc or --enable-vaapi)]),
               [], [enable_accel=no])
@@ -515,6 +519,31 @@ fi
 
 AM_CONDITIONAL(XRDP_ACCEL, [test x$enable_accel = xyes])
 
+if test "x$enable_wayland" = "xyes"
+then
+PKG_CHECK_MODULES(XRDP_WAYLAND, [wayland-client gbm libdrm xkbcommon])
+# ext-image-copy-capture and ext-data-control
+PKG_CHECK_VAR(WAYLAND_PROTOCOLS_DIR, [wayland-protocols >= 1.39], [pkgdatadir],
+              [], [AC_MSG_ERROR([wayland-protocols >= 1.39 not found])])
+AC_PATH_PROG(WAYLAND_SCANNER, [wayland-scanner])
+if test "x$WAYLAND_SCANNER" = "x"
+then
+  AC_MSG_ERROR([wayland-scanner not found])
+fi
+# PNG for the Wayland clipboard's images (without it, BMP only)
+PKG_CHECK_MODULES(XRDP_WAYLAND_PNG, [libpng],
+  [AC_DEFINE([XRDP_WAYLAND_PNG], [1],
+             [chansrv's Wayland clipboard converts PNG])],
+  [AC_MSG_WARN([libpng not found: the Wayland clipboard's images are BMP only])])
+# json-c for RemoteApp in Wayland sessions (sway's IPC)
+PKG_CHECK_MODULES(XRDP_WAYLAND_RAIL, [json-c],
+  [AC_DEFINE([XRDP_WAYLAND_RAIL], [1],
+             [chansrv does RemoteApp in Wayland sessions, over sway's IPC])
+   have_wayland_rail=yes],
+  [AC_MSG_WARN([json-c not found: no RemoteApp in Wayland sessions])])
+fi
+AM_CONDITIONAL(XRDP_WAYLAND_RAIL, [test x$have_wayland_rail = xyes])
+
 # checking for TurboJPEG
 if test "x$enable_tjpeg" = "xyes"
 then
@@ -681,6 +710,7 @@ AC_CONFIG_FILES([
   third_party/Makefile
   third_party/tomlc99/Makefile
   xrdp_accel_assist/Makefile
+  wlxrdp/Makefile
 
 ])
 
