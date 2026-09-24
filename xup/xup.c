@@ -230,6 +230,8 @@ convert_xrdp_client_info_to_xup_client_info(
     dst->normal_frame_interval = src->normal_frame_interval;
 
     dst->gfx_avc444 = src->gfx_avc444;
+    dst->session_desktop_scale_factor =
+        (int) src->session_desktop_scale_factor;
 }
 
 /******************************************************************************/

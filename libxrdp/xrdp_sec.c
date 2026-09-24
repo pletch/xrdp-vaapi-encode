@@ -1635,6 +1635,8 @@ xrdp_sec_process_mcs_data_CS_CORE(struct xrdp_sec *self, struct stream *s)
     /* Clear physical sizes. These are optional and may not be read later */
     client_info->session_physical_width = 0;
     client_info->session_physical_height = 0;
+    client_info->session_desktop_scale_factor = 0;
+    client_info->session_device_scale_factor = 0;
 
     /* TS_UD_CS_CORE required fields */
     if (!s_check_rem_and_log(s, CS_CORE_MIN_LENGTH,
@@ -1890,6 +1892,37 @@ xrdp_sec_process_mcs_data_CS_CORE(struct xrdp_sec *self, struct stream *s)
     in_uint8s(s, 2); /* reserved */
     LOG_DEVEL(LOG_LEVEL_TRACE, "Received [MS-RDPBCGR] TS_UD_CS_CORE "
               "<Optional Field> desktopOrientation (ignored)");
+
+    if (!s_check_rem(s, 8))
+    {
+        return 0;
+    }
+    in_uint32_le(s, client_info->session_desktop_scale_factor);
+    in_uint32_le(s, client_info->session_device_scale_factor);
+    LOG_DEVEL(LOG_LEVEL_TRACE, "Received [MS-RDPBCGR] TS_UD_CS_CORE "
+              "<Optional Field> desktopScaleFactor %u, deviceScaleFactor %u",
+              client_info->session_desktop_scale_factor,
+              client_info->session_device_scale_factor);
+
+    /* MS-RDPBCGR 2.2.1.3.2: both are ignored unless both are valid */
+    if (client_info->session_desktop_scale_factor < 100 ||
+            client_info->session_desktop_scale_factor > 500 ||
+            (client_info->session_device_scale_factor != 100 &&
+             client_info->session_device_scale_factor != 140 &&
+             client_info->session_device_scale_factor != 180))
+    {
+        LOG(LOG_LEVEL_WARNING,
+            "Client display scale (desktop %u%%, device %u%%) is invalid",
+            client_info->session_desktop_scale_factor,
+            client_info->session_device_scale_factor);
+        client_info->session_desktop_scale_factor = 0;
+        client_info->session_device_scale_factor = 0;
+    }
+    else
+    {
+        LOG(LOG_LEVEL_INFO, "Client display scale %u%%",
+            client_info->session_desktop_scale_factor);
+    }
 
     return 0;
 #undef CS_CORE_MIN_LENGTH

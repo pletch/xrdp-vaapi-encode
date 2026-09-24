@@ -278,6 +278,11 @@ struct xrdp_client_info
      * data */
     unsigned int session_physical_width; /* in mm */
     unsigned int session_physical_height; /* in mm */
+    /* [MS-RDPBCGR] TS_UD_CS_CORE desktopScaleFactor (100-500) and
+       deviceScaleFactor (100, 140 or 180): the client's display scale, in
+       percent, for a client without monitor data. 0: not sent. */
+    unsigned int session_desktop_scale_factor;
+    unsigned int session_device_scale_factor;
 
     int large_pointer_support_flags;
     int gfx;

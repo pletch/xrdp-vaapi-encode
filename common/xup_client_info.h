@@ -75,6 +75,13 @@ struct xup_client_info
        pick the codec id and size the helper's encoder. */
     /* 0 none, 1 AVC444 v1 chroma layout, 2 v2 */
     int gfx_avc444;
+
+    /* The client's display scale in percent (100-500) when it sent no
+       monitor data; with monitor data, each monitor's
+       desktop_scale_factor. 0: not sent. Appended without a version
+       change: a module that predates it reads the size it knows, and one
+       that knows it finds 0 in a shorter structure it zero-filled. */
+    int session_desktop_scale_factor;
 };
 
 /* yyyymmdd of last incompatible change to xup_client_info */
