@@ -72,6 +72,10 @@
 /* a new capture session delivers its first frame at once; none by then
    means it is stuck, so start another */
 #define FIRST_FRAME_MS 2000
+/* a capture that does not restart is retried this often, this many times,
+   before the compositor is given up on (wlxrdp ends; sesexec restarts it) */
+#define CAPTURE_RETRY_MS 1000
+#define CAPTURE_RETRIES 5
 
 struct buf
 {
@@ -155,6 +159,8 @@ struct wlr_mon
     uint32_t capture_ms;        /* when this capture session started */
     uint32_t request_ms;        /* when the pending frame was requested */
     int wanted;                 /* the core wants a frame */
+    int retries;                /* failed capture restarts in a row */
+    uint32_t retry_ms;          /* when the last one failed */
     int cur;                    /* buffer the pending frame captures into */
     int last_ready;             /* newest complete buffer, -1 if none */
     struct xh_rect rects[MAX_RECTS];
@@ -194,6 +200,7 @@ struct wlr
     struct gbm_device *gbm;
     int wl_shm;                 /* capture into shm (the CPU path) */
     int cursor_dirty;           /* an image or hotspot came */
+    int capturing;              /* between start and stop */
 };
 
 static int capture_start_all(struct wlr *b);
@@ -788,6 +795,13 @@ session_dmabuf_format(void *data,
     free(m->mods);
     m->mods = malloc(modifiers->size + sizeof(uint64_t));
     m->num_mods = 0;
+    if (m->mods == NULL)
+    {
+        /* no modifiers: nothing allocates, and capture_start says so */
+        LOG(LOG_LEVEL_ERROR, "monitor %d: out of memory for modifiers",
+            m->index);
+        return;
+    }
     wl_array_for_each(mod, modifiers)
     {
         m->mods[m->num_mods++] = *mod;
@@ -980,6 +994,13 @@ alloc_buf(struct wlr_mon *m, struct buf *bf, int index)
     stride = gbm_bo_get_stride_for_plane(bf->bo, 0);
     offset = gbm_bo_get_offset(bf->bo, 0);
     bf->fd = gbm_bo_get_fd_for_plane(bf->bo, 0);
+    if (bf->fd < 0)
+    {
+        /* free_buf() releases the buffer object */
+        LOG(LOG_LEVEL_ERROR, "monitor %d buffer %d: no dma-buf fd for the "
+            "buffer object", m->index, index);
+        return 1;
+    }
     LOG(LOG_LEVEL_INFO, "monitor %d buffer %d: %dx%d modifier 0x%016llx",
         m->index, index, m->width, m->height, (unsigned long long) mod);
 
@@ -1739,6 +1760,7 @@ capture_start_all(struct wlr *b)
 
     for (i = 0; i < b->num_mons; i++)
     {
+        b->mons[i].retries = 0;
         if (b->mons[i].enabled && capture_start(b->mons + i) != 0)
         {
             capture_stop(b->mons + i);
@@ -1768,7 +1790,17 @@ capture_restart(struct wlr_mon *m)
 {
     capture_stop(m);
     wl_display_roundtrip(m->b->display);
-    capture_start(m); /* the core resends the helper's batch */
+    if (capture_start(m) != 0)
+    {
+        /* nothing captured: wlr_capture_dispatch retries it */
+        capture_stop(m);
+        m->retries++;
+        m->retry_ms = now_ms32();
+        LOG(LOG_LEVEL_WARNING, "monitor %d: capture did not restart "
+            "(attempt %d of %d)", m->index, m->retries, CAPTURE_RETRIES);
+        return;
+    }
+    m->retries = 0; /* the core resends the helper's batch */
 }
 
 /*****************************************************************************/
@@ -1800,13 +1832,17 @@ wlr_start(void *a, enum wla_mode mode)
     struct wlr *b = a;
 
     b->wl_shm = mode == WLA_SHM;
+    b->capturing = 1;
     return capture_start_all(b);
 }
 
 static void
 wlr_stop(void *a)
 {
-    capture_stop_all((struct wlr *) a);
+    struct wlr *b = a;
+
+    b->capturing = 0;
+    capture_stop_all(b);
 }
 
 static void
@@ -1849,6 +1885,19 @@ wlr_capture_dispatch(struct wlr *b)
         }
         if (m->session == NULL)
         {
+            if (b->capturing && m->enabled && m->retries > 0 &&
+                    now_ms32() - m->retry_ms >= CAPTURE_RETRY_MS)
+            {
+                if (m->retries >= CAPTURE_RETRIES)
+                {
+                    b->ev->lost(b->core, "a monitor's capture could not be "
+                                "restarted");
+                    return;
+                }
+                capture_restart(m);
+                m->wanted = 1;
+                request_frame(m);
+            }
             continue;
         }
         if (m->stopped)

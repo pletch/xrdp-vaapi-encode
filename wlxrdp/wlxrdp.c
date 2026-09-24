@@ -1385,20 +1385,48 @@ ptr_scroll(struct be *b, enum wla_axis axis, int delta)
 }
 
 /*****************************************************************************/
-/* A new layout: stop capture, apply it, capture again. Non-zero, with the
-   old layout still running, if the layout is unusable. */
+/* A new layout: stop capture, apply it, capture again. 0: done. 1: the
+   layout is unusable or the compositor refused it, and the old layout is
+   running (again). -1: no layout could be captured. */
 static int
 relayout(struct be *b, int count, const struct monitor_info *mi,
          int width, int height)
 {
+    struct wla_monitor prev[MAX_MONS];
+    int prev_active = b->active;
+    int prev_w = b->total_w;
+    int prev_h = b->total_h;
+
+    memcpy(prev, b->lay, sizeof(prev));
     if (b->ops->max_monitors(b->ad) < 1 ||
             layout_set(b, count, mi, width, height) != 0)
     {
         return 1; /* the running layout stays */
     }
     b->ops->stop(b->ad);
-    b->ops->set_layout(b->ad, b->lay, b->active);
-    b->ops->start(b->ad, b->cpu ? WLA_SHM : WLA_DMABUF);
+    if (b->ops->set_layout(b->ad, b->lay, b->active) != 0 ||
+            b->ops->start(b->ad, b->cpu ? WLA_SHM : WLA_DMABUF) != 0)
+    {
+        /* back to the layout that worked, if there was one */
+        LOG(LOG_LEVEL_ERROR, "the compositor did not take the new layout");
+        b->ops->stop(b->ad);
+        memcpy(b->lay, prev, sizeof(prev));
+        b->active = prev_active;
+        b->total_w = prev_w;
+        b->total_h = prev_h;
+        if (prev_active < 1 ||
+                b->ops->set_layout(b->ad, b->lay, b->active) != 0 ||
+                b->ops->start(b->ad, b->cpu ? WLA_SHM : WLA_DMABUF) != 0)
+        {
+            LOG(LOG_LEVEL_ERROR, "no capture: the previous layout did not "
+                "come back either");
+            b->ops->stop(b->ad);
+            return -1;
+        }
+        LOG(LOG_LEVEL_WARNING, "the previous layout is back");
+        core_helper_sync(b);
+        return 1;
+    }
     if (core_helper_sync(b) != 0)
     {
         LOG(LOG_LEVEL_ERROR, "the helper did not take the new buffers");
@@ -1490,7 +1518,7 @@ handle_input(struct be *b, int msg, int p1, int p2, int p3, int p4)
 }
 
 /*****************************************************************************/
-static void
+static int
 handle_client_info(struct be *b, const char *data, int bytes)
 {
     const struct display_size_description *ds;
@@ -1570,7 +1598,12 @@ handle_client_info(struct be *b, const char *data, int bytes)
            there. Something to show rather than nothing. */
         LOG(LOG_LEVEL_ERROR, "unusable connect-time layout; using "
             "1024x768");
-        relayout(b, 0, NULL, 1024, 768);
+        if (relayout(b, 0, NULL, 1024, 768) != 0)
+        {
+            LOG(LOG_LEVEL_ERROR, "no capture on this compositor; ending "
+                "the connection");
+            return 1;
+        }
     }
     /* the helper encodes GFX H.264 only, as for xorgxrdp */
     if (!b->cpu && helper_start(b) == 0)
@@ -1583,10 +1616,7 @@ handle_client_info(struct be *b, const char *data, int bytes)
        outstanding resize until told, as xorgxrdp tells it after client
        info, and holds every later resize (dynamic resolution) behind it. */
     send_resize_done(b);
-    if (cursor_send(b) != 0)
-    {
-        drop_client(b);
-    }
+    return cursor_send(b) != 0;
 }
 
 /*****************************************************************************/
@@ -1626,6 +1656,7 @@ handle_xrdp_msg(struct be *b, const char *data, int len)
                    monitors */
                 struct monitor_info mi[CLIENT_MONITOR_DATA_MAXIMUM_MONITORS];
                 int count = p3;
+                int rv;
 
                 if (count < 0 || count > CLIENT_MONITOR_DATA_MAXIMUM_MONITORS ||
                         !s_check_rem(s, count * (int) sizeof(mi[0])))
@@ -1635,7 +1666,12 @@ handle_xrdp_msg(struct be *b, const char *data, int len)
                 in_uint8a(s, mi, count * sizeof(mi[0]));
                 LOG(LOG_LEVEL_INFO, "monitor update %dx%d, %d monitor(s)",
                     p1, p2, count);
-                if (relayout(b, count, mi, p1, p2) != 0)
+                rv = relayout(b, count, mi, p1, p2);
+                if (rv < 0)
+                {
+                    return 1; /* no capture left: end the connection */
+                }
+                if (rv > 0)
                 {
                     LOG(LOG_LEVEL_ERROR, "unusable monitor update ignored");
                 }
@@ -1647,7 +1683,10 @@ handle_xrdp_msg(struct be *b, const char *data, int len)
             break;
         }
         case 104: /* client info */
-            handle_client_info(b, s->p, (int) (s->end - s->p));
+            if (handle_client_info(b, s->p, (int) (s->end - s->p)) != 0)
+            {
+                return 1;
+            }
             break;
         case 106: /* frame ack: flags, frame_id[, rtt] */
         {
