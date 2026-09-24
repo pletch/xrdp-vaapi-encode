@@ -37,6 +37,8 @@
 #include <ctype.h>
 #include <string.h>
 #include <errno.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 #include "arch.h"
 #include "session.h"
@@ -883,6 +885,8 @@ process_startup_wait_time(struct session_data *sd)
 
 #define WAYLAND_NAME_WAIT_MS 30000
 #define WAYLAND_BACKEND_WAIT_MS 10000
+/* how long a session process has to end on SIGTERM before SIGKILL */
+#define WAYLAND_STOP_WAIT_MS 5000
 
 /******************************************************************************/
 static void
@@ -1069,8 +1073,12 @@ wayland_restart_backend(struct session_data *sd)
     }
     if (++sd->backend_restarts > WAYLAND_BACKEND_RESTARTS)
     {
+        /* Without a backend nothing can connect to the session, and
+           nothing would start one: end it, as an X11 session ends with its
+           X server. */
         LOG(LOG_LEVEL_ERROR, "The Wayland backend on display %s keeps "
-            "exiting; not restarting it", sd->display);
+            "exiting; ending the session", sd->display);
+        g_sigterm(sd->win_mgr);
         return;
     }
     sd->x_server = fork_child(start_wayland_backend, g_login_info, sd,
@@ -1079,6 +1087,40 @@ wayland_restart_backend(struct session_data *sd)
     {
         LOG(LOG_LEVEL_WARNING, "Restarted the Wayland backend on display %s "
             "(pid %d)", sd->display, sd->x_server);
+    }
+    else
+    {
+        LOG(LOG_LEVEL_ERROR, "The Wayland backend on display %s could not be "
+            "restarted; ending the session", sd->display);
+        g_sigterm(sd->win_mgr);
+    }
+}
+
+/******************************************************************************/
+/* A session process started before the session is up: SIGTERM it and reap
+ * it, with SIGKILL if it has not ended within WAYLAND_STOP_WAIT_MS (an
+ * unbounded wait would hang the login with it). pid <= 0: nothing. */
+static void
+wayland_stop_child(pid_t pid)
+{
+    unsigned int start = g_get_elapsed_ms();
+
+    if (pid <= 0)
+    {
+        return;
+    }
+    g_sigterm(pid);
+    while (waitpid(pid, NULL, WNOHANG) == 0)
+    {
+        if (g_get_elapsed_ms() - start >= WAYLAND_STOP_WAIT_MS)
+        {
+            LOG(LOG_LEVEL_WARNING, "pid %d did not end on SIGTERM; killing it",
+                pid);
+            kill(pid, SIGKILL);
+            g_waitpid(pid);
+            return;
+        }
+        g_sleep(100);
     }
 }
 
@@ -1092,8 +1134,9 @@ session_start_wayland(struct login_info *login_info,
     char wayland_socket[XRDP_SOCKETS_MAXPATH];
     char ipc_socket[XRDP_SOCKETS_MAXPATH];
     pid_t compositor_pid;
-    pid_t backend_pid;
+    pid_t backend_pid = -1;
     pid_t chansrv_pid;
+    enum scp_screate_status status = E_SCP_SCREATE_X_SERVER_FAIL;
 
     g_snprintf(name_file, sizeof(name_file),
                XRDP_SOCKET_PATH "/xrdp_wayland_name_%d",
@@ -1117,10 +1160,7 @@ session_start_wayland(struct login_info *login_info,
     {
         LOG(LOG_LEVEL_ERROR, "The Wayland compositor did not report its "
             "display (see the session's startwayland.sh output)");
-        g_file_delete(name_file);
-        g_sigterm(compositor_pid);
-        g_waitpid(compositor_pid);
-        return E_SCP_SCREATE_X_SERVER_FAIL;
+        goto fail;
     }
     LOG(LOG_LEVEL_INFO, "Wayland compositor (pid %d) is running on %s (%s)",
         compositor_pid, sd->display, wayland_socket);
@@ -1133,9 +1173,8 @@ session_start_wayland(struct login_info *login_info,
              (!list_add_strdup(g_cfg->env_names, "SWAYSOCK") ||
               !list_add_strdup(g_cfg->env_values, ipc_socket))))
     {
-        g_sigterm(compositor_pid);
-        g_waitpid(compositor_pid);
-        return E_SCP_SCREATE_NO_MEMORY;
+        status = E_SCP_SCREATE_NO_MEMORY;
+        goto fail;
     }
     if (sd->params.type == SCP_SESSION_TYPE_WAYLAND_REMOTEAPP &&
             ipc_socket[0] == '\0')
@@ -1153,14 +1192,7 @@ session_start_wayland(struct login_info *login_info,
                           WAYLAND_BACKEND_WAIT_MS) != 0)
     {
         LOG(LOG_LEVEL_ERROR, "The Wayland backend did not start");
-        if (backend_pid > 0)
-        {
-            g_sigterm(backend_pid);
-            g_waitpid(backend_pid);
-        }
-        g_sigterm(compositor_pid);
-        g_waitpid(compositor_pid);
-        return E_SCP_SCREATE_X_SERVER_FAIL;
+        goto fail;
     }
 
     utmp_login(compositor_pid, sd->display, login_info);
@@ -1183,6 +1215,14 @@ session_start_wayland(struct login_info *login_info,
         "the compositor (pid %d) exits to end the session",
         sd->display, compositor_pid);
     return E_SCP_SCREATE_OK;
+
+fail:
+    /* Before the session is up, undo what was started, newest first. From
+       here on the session's own teardown (session_send_term) does it. */
+    g_file_delete(name_file);
+    wayland_stop_child(backend_pid);
+    wayland_stop_child(compositor_pid);
+    return status;
 }
 
 /******************************************************************************/
