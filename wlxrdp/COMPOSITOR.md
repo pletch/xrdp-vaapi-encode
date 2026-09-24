@@ -124,6 +124,13 @@ If any required protocol is missing, wlxrdp logs
 - **Sessions.** One `ext_image_copy_capture` session per enabled output,
   created with cursor painting off. The cursor goes to the client
   separately, as an RDP pointer.
+- **Device.** On the GPU path wlxrdp allocates its buffers with GBM on
+  the render node the capture session names (`dmabuf_device`), so the
+  compositor can always write to them. `WLXRDP_DRM` overrides it; a
+  compositor that names none gets the encoder's device
+  (`XRDP_VAAPI_DEVICE`). The encoder imports the same buffers, so it must
+  be on that GPU too. wlxrdp logs a warning naming both devices when it
+  is not. The CPU path opens no device.
 - **Formats.** On the GPU path wlxrdp takes only `DRM_FORMAT_XRGB8888`
   dma-bufs. It allocates them with GBM on the render node, preferring
   Intel Y-tiled, then X-tiled, then linear, then any other modifier the
@@ -236,10 +243,9 @@ set the first output's size.
 
 ## Known gaps
 
-- **Render node.** wlxrdp allocates capture buffers on `WLXRDP_DRM`
-  (default `/dev/dri/renderD128`), which nothing sets from
-  `XRDP_WAYLAND_RENDER_NODE`. On a multi-GPU host, set both, or the
-  compositor and wlxrdp may use different devices.
+- **One GPU.** The compositor, the capture buffers and the encoder must
+  share a GPU on the GPU path: the helper does not import frames across
+  devices. wlxrdp warns when they differ.
 - **Format.** Dma-buf capture is XRGB8888 only. A compositor that offers
   no XRGB8888 dma-buf cannot be captured on the GPU path; there is no
   automatic fallback to shared memory.
