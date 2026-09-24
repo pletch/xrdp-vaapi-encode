@@ -278,6 +278,36 @@ is_window_valid_child_of_root(unsigned int window_id)
     return found;
 }
 
+static int rail_configure_window(XConfigureEvent *config);
+static int g_desktop_arc_sent;
+static int g_handshake_sent;
+/* the server's handshake goes out this long after the channel comes up
+   (the client joins it a little after chansrv hears of it), unless the
+   client's EXEC starts RemoteApp first */
+#define HANDSHAKE_DELAY_MS 1000
+
+/*****************************************************************************/
+/* The Actively Monitored Desktop ([MS-RDPERP] 2.2.1.3.3): hooked, then the
+   arc of initial window orders begins and completes. A Windows host opens
+   a RemoteApp session this way, and FreeRDP 3.31's X11 client waits for
+   ARC_COMPLETED before it starts the application. Rail drawing order 12
+   (xrdp_mm): flags, active window, z-order count. */
+static void
+rail_send_desktop(int flags)
+{
+    struct stream *s;
+
+    make_stream(s);
+    init_stream(s, 64);
+    out_uint32_le(s, 12); /* monitored desktop */
+    out_uint32_le(s, flags);
+    out_uint32_le(s, 0); /* active window: none */
+    out_uint32_le(s, 0); /* no z-order */
+    s_mark_end(s);
+    send_rail_drawing_orders(s->data, (int)(s->end - s->data));
+    free_stream(s);
+}
+
 /*****************************************************************************/
 static int
 rail_send_init(void)
@@ -287,6 +317,11 @@ rail_send_init(void)
     char *size_ptr;
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "chansrv::rail_send_init:");
+    if (g_handshake_sent)
+    {
+        return 0;
+    }
+    g_handshake_sent = 1;
     make_stream(s);
     init_stream(s, 8182);
     out_uint16_le(s, TS_RAIL_ORDER_HANDSHAKE);
@@ -301,6 +336,19 @@ rail_send_init(void)
     send_channel_data(g_rail_chan_id, s->data, bytes);
     free_stream(s);
     return 0;
+}
+
+/*****************************************************************************/
+/* [MS-RDPERP] 3.2.5.1: the server opens with its handshake. mstsc and
+   older FreeRDP send EXEC without waiting for it; FreeRDP 3.31 waits, so
+   send it unprompted once the client can hear it. */
+static void
+rail_handshake_timeout(void *data)
+{
+    if (!g_rail_no_display && g_display != 0)
+    {
+        rail_send_init();
+    }
 }
 
 /******************************************************************************/
@@ -351,6 +399,9 @@ rail_init(void)
         return 1;
     }
     g_rail_no_display = 0;
+    g_handshake_sent = 0;
+    g_desktop_arc_sent = 0;
+    add_timeout(HANDSHAKE_DELAY_MS, rail_handshake_timeout, NULL);
 
     return 0;
 }
@@ -955,6 +1006,13 @@ rail_process_handshake(struct stream *s, int size)
     LOG_DEVEL(LOG_LEVEL_DEBUG, "chansrv::rail_process_handshake:");
     in_uint32_le(s, build_number);
     LOG(LOG_LEVEL_DEBUG, "  build_number 0x%8.8x", build_number);
+    if (!g_desktop_arc_sent)
+    {
+        g_desktop_arc_sent = 1;
+        rail_send_desktop(WINDOW_ORDER_FIELD_DESKTOP_HOOKED |
+                          WINDOW_ORDER_FIELD_DESKTOP_ARC_BEGAN);
+        rail_send_desktop(WINDOW_ORDER_FIELD_DESKTOP_ARC_COMPLETED);
+    }
     return 0;
 }
 
@@ -1000,6 +1058,22 @@ rail_process_window_move(struct stream *s, int size)
     LOG_DEVEL(LOG_LEVEL_DEBUG, "  window_id 0x%8.8x left %d top %d right %d bottom %d width %d height %d",
               window_id, left, top, right, bottom, right - left, bottom - top);
     XMoveResizeWindow(g_display, window_id, left, top, right - left, bottom - top);
+    {
+        /* Tell the client the window's new place ([MS-RDPERP]: the server
+           answers a move with the window's new offsets). The client placed
+           it, but keeps the old visible-region and client-area offsets
+           until told, and FreeRDP draws only where the old and new places
+           overlap. */
+        XConfigureEvent ev;
+
+        g_memset(&ev, 0, sizeof(ev));
+        ev.window = window_id;
+        ev.x = left;
+        ev.y = top;
+        ev.width = right - left;
+        ev.height = bottom - top;
+        rail_configure_window(&ev);
+    }
     rwd = (struct rail_window_data *)
           g_malloc(sizeof(struct rail_window_data), 1);
     rwd->x = left;
@@ -1123,6 +1197,10 @@ rail_data_in(struct stream *s, int chan_id, int chan_flags, int length,
     int size;
 
     LOG_DEVEL(LOG_LEVEL_DEBUG, "chansrv::rail_data_in:");
+    if (g_rail_no_display)
+    {
+        return 0; /* rail_init said why */
+    }
     in_uint8(s, code);
     in_uint8s(s, 1);
     in_uint16_le(s, size);
@@ -1469,8 +1547,12 @@ rail_create_window(Window window_id, Window owner_id)
     }
     LOG_DEVEL(LOG_LEVEL_DEBUG, "  set title info %d", title_size);
     flags |= WINDOW_ORDER_FIELD_TITLE;
-    out_uint32_le(s, 0); /* client_offset_x */
-    out_uint32_le(s, 0); /* client_offset_y */
+    /* in screen coordinates, as the window offset ([MS-RDPERP]
+       2.2.1.3.1.2.1): FreeRDP places the visible region at VisibleOffset -
+       (ClientOffset - WindowClientDelta), so 0 showed only the part of
+       the window beyond twice its offset */
+    out_uint32_le(s, x); /* client_offset_x */
+    out_uint32_le(s, y); /* client_offset_y */
     flags |= WINDOW_ORDER_FIELD_CLIENT_AREA_OFFSET;
     out_uint32_le(s, width); /* client_area_width */
     out_uint32_le(s, height); /* client_area_height */
@@ -1677,8 +1759,8 @@ rail_configure_request_window(XConfigureRequestEvent *config)
     out_uint32_le(s, 10); /* configure_window */
     out_uint32_le(s, window_id); /* window_id */
 
-    out_uint32_le(s, 0); /* client_offset_x */
-    out_uint32_le(s, 0); /* client_offset_y */
+    out_uint32_le(s, config->x); /* client_offset_x */
+    out_uint32_le(s, config->y); /* client_offset_y */
     flags |= WINDOW_ORDER_FIELD_CLIENT_AREA_OFFSET;
     out_uint32_le(s, config->width); /* client_area_width */
     out_uint32_le(s, config->height); /* client_area_height */
@@ -1725,7 +1807,6 @@ rail_configure_request_window(XConfigureRequestEvent *config)
 }
 
 /*****************************************************************************/
-#if 0
 /* returns 0, event handled, 1 unhandled */
 static int
 rail_configure_window(XConfigureEvent *config)
@@ -1762,8 +1843,8 @@ rail_configure_window(XConfigureEvent *config)
     out_uint32_le(s, 10); /* configure_window */
     out_uint32_le(s, window_id); /* window_id */
 
-    out_uint32_le(s, 0); /* client_offset_x */
-    out_uint32_le(s, 0); /* client_offset_y */
+    out_uint32_le(s, config->x); /* client_offset_x */
+    out_uint32_le(s, config->y); /* client_offset_y */
     flags |= WINDOW_ORDER_FIELD_CLIENT_AREA_OFFSET;
     out_uint32_le(s, config->width); /* client_area_width */
     out_uint32_le(s, config->height); /* client_area_height */
@@ -1808,7 +1889,6 @@ rail_configure_window(XConfigureEvent *config)
     free_stream(s);
     return 0;
 }
-#endif
 
 /*****************************************************************************/
 static int

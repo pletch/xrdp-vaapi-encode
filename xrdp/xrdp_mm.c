@@ -622,7 +622,6 @@ xrdp_mm_process_rail_create_window(struct xrdp_mm *self, struct stream *s)
     return rv;
 }
 
-#if 0
 /*****************************************************************************/
 /* returns error
    process rail configure window order */
@@ -695,7 +694,6 @@ xrdp_mm_process_rail_configure_window(struct xrdp_mm *self, struct stream *s)
     g_free(rwso.visibility_rects);
     return rv;
 }
-#endif
 
 /*****************************************************************************/
 /* returns error
@@ -828,6 +826,52 @@ xrdp_mm_egfx_caps_avc444(int version, int flags)
 }
 
 /*****************************************************************************/
+/* chansrv's Monitored Desktop order ([MS-RDPERP] 2.2.1.3.3): flags, active
+   window id, then a z-order of up to 255 window ids */
+static int
+xrdp_mm_process_rail_monitored_desktop(struct xrdp_mm *self, struct stream *s)
+{
+    struct rail_monitored_desktop_order mdo;
+    int ids[255];
+    int flags;
+    int count;
+    int index;
+    int rv;
+
+    if (!s_check_rem(s, 12))
+    {
+        return 1;
+    }
+    in_uint32_le(s, flags);
+    in_uint32_le(s, mdo.active_window_id);
+    in_uint32_le(s, count);
+    if (count < 0 || count > 255 || !s_check_rem(s, count * 4))
+    {
+        LOG(LOG_LEVEL_ERROR, "xrdp_mm_process_rail_monitored_desktop: "
+            "bad z-order count %d", count);
+        return 1;
+    }
+    for (index = 0; index < count; index++)
+    {
+        in_uint32_le(s, ids[index]);
+    }
+    mdo.num_window_ids = count;
+    mdo.window_ids = ids;
+    LOG(LOG_LEVEL_DEBUG, "xrdp_mm_process_rail_monitored_desktop: flags 0x%x",
+        flags);
+    rv = libxrdp_orders_init(self->wm->session);
+    if (rv == 0)
+    {
+        rv = libxrdp_monitored_desktop(self->wm->session, &mdo, flags);
+    }
+    if (rv == 0)
+    {
+        rv = libxrdp_orders_send(self->wm->session);
+    }
+    return rv;
+}
+
+/*****************************************************************************/
 /* returns error
    process alternate secondary drawing orders for rail channel */
 static int
@@ -852,6 +896,13 @@ xrdp_mm_process_rail_drawing_orders(struct xrdp_mm *self, struct stream *s)
             break;
         case 8: /* update title info */
             rv = xrdp_mm_process_rail_update_window_text(self, s);
+            break;
+        case 10: /* configure_window: a window's new place and size (X11
+                    chansrv answers the client's window moves with it) */
+            rv = xrdp_mm_process_rail_configure_window(self, s);
+            break;
+        case 12: /* monitored desktop */
+            rv = xrdp_mm_process_rail_monitored_desktop(self, s);
             break;
         default:
             break;
