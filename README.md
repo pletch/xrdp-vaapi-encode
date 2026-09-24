@@ -113,10 +113,10 @@ the AVC444 and QP settings in **Tuning** below). Wayland adds:
 | `XRDP_WAYLAND_SCALE` | auto | `auto`: the client's scale, else 200% on a monitor over 2000 pixels wide; `client`: the client's, else 100%; or a number for every monitor (`150` or `1.5`) |
 | `XRDP_WAYLAND_MAX_PIXELS` | 40000000 | all monitors together, in pixels; a larger layout is refused (1024x768 at connect, the current layout on a resize). Each pixel costs 12 bytes of capture buffers |
 | `XRDP_WAYLAND_PRIVATE_BUS` | off | `1` gives the desktop its own D-Bus session bus (no keyring); by default it uses the user's, unless another desktop session is already on it |
-| `XRDP_WAYLAND_RENDER_NODE` | `XRDP_VAAPI_DEVICE`, else `/dev/dri/renderD128` | the compositor's GPU |
+| `XRDP_WAYLAND_RENDER_NODE` | `XRDP_VAAPI_DEVICE`, else `/dev/dri/renderD128` | the compositor's GPU. The GPU path needs it to be the encoder's (`XRDP_VAAPI_DEVICE`); wlxrdp warns if they differ |
 | `WLXRDP_ACCEL` | on | `0` takes the CPU path (xrdp encodes) |
 | `WLXRDP_AVC420` | unset | set: AVC420 even for AVC444 clients (half the decode work; see the mstsc known issue) |
-| `WLXRDP_DRM` | `/dev/dri/renderD128` | GBM device for the capture buffers |
+| `WLXRDP_DRM` | the compositor's device | overrides the GBM device for the capture buffers |
 | `WLXRDP_DEBUG` | unset | debug logging |
 
 A user's own desktop command goes in `~/.config/xrdp/waylandsession`

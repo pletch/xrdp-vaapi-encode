@@ -13,7 +13,10 @@
 #   XRDP_WAYLAND_REMOTEAPP  1 for a RemoteApp session: sway, no desktop
 # Optional:
 #   XRDP_WAYLAND_RENDER_NODE  DRM render node (default: XRDP_VAAPI_DEVICE,
-#                             then /dev/dri/renderD128)
+#                             then /dev/dri/renderD128). wlxrdp captures on
+#                             the compositor's device and the encoder
+#                             imports there, so a different GPU from
+#                             XRDP_VAAPI_DEVICE only suits the CPU path
 #   XRDP_WAYLAND_MONITORS     most client monitors the session can show
 #                             (default 4): the compositor's outputs, all
 #                             but the first off until a client uses them
