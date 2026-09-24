@@ -69,6 +69,9 @@ helper, the keyboard); an adapter (`wlxrdp/wla.h`) knows one family of
 compositors. `wla_wlr.c` drives wlroots compositors through standard protocols:
 output management, image copy capture, virtual keyboard and pointer. Other
 families (Mutter, KWin: PipeWire capture, libei input) would be further adapters.
+[`wlxrdp/COMPOSITOR.md`](wlxrdp/COMPOSITOR.md) is the compositor contract: the
+protocols and versions each part needs, the start-up and shutdown handshake with
+sesexec, and what a new adapter must provide.
 
 **RemoteApp.** labwc offers no way for another program to follow and place
 windows, so a RemoteApp login gets a separate session on
