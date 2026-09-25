@@ -1449,7 +1449,8 @@ xrdp_rdp_suppress_output(struct xrdp_rdp *self, int suppress,
                          enum suppress_output_reason reason,
                          int left, int top, int right, int bottom)
 {
-    int old_suppress = self->client_info.suppress_output_mask != 0;
+    unsigned int old_mask = self->client_info.suppress_output_mask;
+    int old_suppress = old_mask != 0;
     if (suppress)
     {
         self->client_info.suppress_output_mask |= (unsigned int)reason;
@@ -1460,6 +1461,19 @@ xrdp_rdp_suppress_output(struct xrdp_rdp *self, int suppress,
     }
 
     int current_suppress =  self->client_info.suppress_output_mask != 0;
+    /* Rare (minimise/restore, resizes), and the only trace of a session
+       whose output stays suppressed */
+    if (old_mask != self->client_info.suppress_output_mask)
+    {
+        LOG(LOG_LEVEL_INFO, "Output suppression: %s %s (mask 0x%x): %s",
+            reason == XSO_REASON_CLIENT_REQUEST ? "client request" :
+            reason == XSO_REASON_DEACTIVATE_REACTIVATE ?
+            "deactivate/reactivate" :
+            reason == XSO_REASON_DYNAMIC_RESIZE ? "dynamic resize" : "other",
+            suppress ? "set" : "cleared",
+            self->client_info.suppress_output_mask,
+            current_suppress ? "output suppressed" : "output resumed");
+    }
     if (current_suppress != old_suppress && self->session->callback != 0)
     {
         self->session->callback(self->session->id, 0x5559, suppress,
