@@ -32,6 +32,7 @@
 
 #include "session_base.h"
 #include "session_x11.h"
+#include "session_wayland.h"
 #include "session_parameters.h"
 
 #include "sesman_config.h"
@@ -73,6 +74,22 @@ session_base_new(const struct session_parameters *sp)
                 else
                 {
                     self = &self_x11->base;
+                }
+            }
+            break;
+
+            case SCP_SESSION_TYPE_WAYLAND:
+            case SCP_SESSION_TYPE_WAYLAND_REMOTEAPP:
+            {
+                struct session_data_wayland *self_wl = session_wayland_new();
+                if (self_wl == NULL)
+                {
+                    LOG(LOG_LEVEL_ERROR,
+                        "Out of memory allocating Wayland session object");
+                }
+                else
+                {
+                    self = &self_wl->base;
                 }
             }
             break;

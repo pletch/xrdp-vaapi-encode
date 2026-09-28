@@ -266,6 +266,16 @@ h264_frame_interval=16
 rfx_frame_interval=32
 normal_frame_interval=40
 
+; A Wayland session: a wlroots compositor (labwc) with the wlxrdp backend.
+; Needs xrdp built with --enable-wayland. H.264 (GFX) clients only.
+;[Wayland]
+;name=Wayland
+;lib=libxup.@lib_extension@
+;username=ask
+;password=ask
+;port=-1
+;code=1000
+
 [Xvnc]
 name=Xvnc
 lib=libvnc.@lib_extension@
