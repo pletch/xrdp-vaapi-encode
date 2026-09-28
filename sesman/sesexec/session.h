@@ -30,28 +30,11 @@
 
 #include <time.h>
 
-#include "guid.h"
 #include "scp_application_types.h"
+#include "session_parameters.h"
 
 struct login_info;
 struct proc_exit_status;
-
-/**
- * Information used to start a session
- */
-struct session_parameters
-{
-    int x11_display;   // >= 0 for X11 only
-    enum scp_session_type type;
-    unsigned short width;
-    unsigned short height;
-    unsigned char  bpp;
-    struct guid guid;
-    const char *shell;  // Must not be NULL
-    const char *directory;  // Must not be NULL
-    const char *instance_name;  //Must not be NULL
-};
-
 
 /**
  * Data involved in running a session (opaque type)

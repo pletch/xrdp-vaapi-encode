@@ -21,6 +21,12 @@ xrdp_sesexec_SOURCES = \
   sesexec.h \
   session.c \
   session.h \
+  session_base.c \
+  session_base.h \
+  session_parameters.c \
+  session_parameters.h \
+  session_x11.c \
+  session_x11.h \
   ccp_server.c \
   ccp_server.h \
   eicp_server.c \
