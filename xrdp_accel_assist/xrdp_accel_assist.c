@@ -38,7 +38,11 @@
 #include "xrdp_accel_assist_egl.h"
 
 #if defined(XRDP_VAAPI)
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <unistd.h>
 #include <gbm.h>
+#include "xrdp_accel_assist_vaapi.h"
 #endif
 
 #define ARRAYSIZE(x) (sizeof(x)/sizeof(*(x)))
@@ -1060,6 +1064,83 @@ xrdp_accel_assist_setup_log(void)
 }
 
 /*****************************************************************************/
+/* The backend waits for this before it hands us the xrdp connection: a
+   helper whose encoder cannot start exits without writing it, and the
+   backend carries on without accel-assist (software encoding) instead of
+   losing the client with us */
+static void
+signal_ready(void)
+{
+    int ready_fd;
+
+    if (g_getenv("XRDP_ACCEL_ASSIST_READY_FD") == NULL)
+    {
+        return;
+    }
+    ready_fd = g_atoi(g_getenv("XRDP_ACCEL_ASSIST_READY_FD"));
+    if (ready_fd > 2)
+    {
+        if (g_file_write(ready_fd, "R", 1) != 1)
+        {
+            LOG(LOG_LEVEL_WARNING, "could not signal readiness");
+        }
+        g_file_close(ready_fd);
+    }
+}
+
+#if defined(XRDP_VAAPI)
+/*****************************************************************************/
+/* Is the encoder's render node driven by NVIDIA's driver (NVENC, not VA-API)?
+   Asked of sysfs, not of the X server: xorgxrdp, which is the X server,
+   waits for signal_ready() before it serves us */
+static int
+render_node_is_nvidia(void)
+{
+    const char *dev = g_getenv("XRDP_VAAPI_DEVICE");
+    char path[128];
+    char link[256];
+    struct stat st;
+    ssize_t n;
+
+    if (stat(dev != NULL ? dev : "/dev/dri/renderD128", &st) != 0)
+    {
+        return 0;
+    }
+    g_snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/device/driver",
+               major(st.st_rdev), minor(st.st_rdev));
+    n = readlink(path, link, sizeof(link) - 1);
+    if (n <= 0)
+    {
+        return 0;
+    }
+    link[n] = '\0';
+    return g_strcmp(g_strrchr(link, '/') != NULL ? g_strrchr(link, '/') + 1
+                    : link, "nvidia") == 0;
+}
+
+/*****************************************************************************/
+/* Start the VA-API encoder without the X server. With DISPLAY set, libva or
+   its driver may contact the X server, and on X11 that is xorgxrdp, which
+   waits for signal_ready() before it answers: hide DISPLAY until the encoder
+   is up. It needs only the render node. */
+static int
+vaapi_init_without_x(void)
+{
+    char *display = g_strdup(g_getenv("DISPLAY"));
+    int rv;
+
+    unsetenv("DISPLAY");
+    rv = xrdp_accel_assist_vaapi_init();
+    if (display != NULL)
+    {
+        g_setenv("DISPLAY", display, 1);
+        g_free(display);
+    }
+    return rv;
+}
+#endif
+
+/*****************************************************************************/
 int
 main(int argc, char **argv)
 {
@@ -1108,12 +1189,27 @@ main(int argc, char **argv)
             return 1;
         }
         LOG(LOG_LEVEL_INFO, "headless: frames arrive as dma-bufs");
+        signal_ready();
 #else
         LOG(LOG_LEVEL_ERROR, "-w needs a build with --enable-vaapi");
         return 1;
 #endif
     }
-    else if (xrdp_accel_assist_x11_init() != 0)
+    else
+    {
+#if defined(XRDP_VAAPI)
+        /* The encoder before X: it needs only the render node, and X waits
+           for signal_ready() before it answers us. NVIDIA (NVENC) is set up
+           with X, after the signal, as before. */
+        if (!render_node_is_nvidia() && vaapi_init_without_x() != 0)
+        {
+            LOG(LOG_LEVEL_ERROR, "VA-API encoder init failed");
+            return 1;
+        }
+#endif
+        signal_ready();
+    }
+    if (!g_headless && xrdp_accel_assist_x11_init() != 0)
     {
         LOG(LOG_LEVEL_ERROR, "xrdp_accel_assist_x11_init failed");
         return 1;
