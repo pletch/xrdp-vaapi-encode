@@ -630,6 +630,10 @@ xrdp_accel_assist_vaapi_init(void)
     int attribs_ok;
     VAStatus va_status;
 
+    if (g_va_dpy != NULL)
+    {
+        return 0; /* already up: the helper probes it before connecting to X */
+    }
     dev = g_getenv("XRDP_VAAPI_DEVICE");
     if (dev == NULL)
     {
