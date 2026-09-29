@@ -140,7 +140,6 @@ struct be
     int cpu_code;               /* its capture code */
     enum wlxrdp_cpu_layout cpu_layout;
     int accel_failed;           /* the helper died at start: no VA-API */
-    uint32_t helper_start_ms;
     pid_t helper_pid;           /* xrdp_accel_assist, 0 if not running */
     int helper_ready;           /* it has this capture's buffers */
     int buffers_changed;        /* the helper's batch is out of date */
@@ -745,12 +744,43 @@ send_frame(struct mon *m, int index, struct xh_rect *rects, int num_rects)
 }
 
 /*****************************************************************************/
+/* Wait for the helper's readiness byte, written once its encoder is up.
+   0: ready, or still alive after HELPER_READY_MS (a helper that predates
+   the handshake never writes it). 1: it exited first, closing the pipe. */
+#define HELPER_READY_MS 3000
+
+static int
+helper_wait_ready(int fd, pid_t pid)
+{
+    struct pollfd p;
+    char c;
+    int n;
+
+    p.fd = fd;
+    p.events = POLLIN;
+    p.revents = 0;
+    do
+    {
+        n = poll(&p, 1, HELPER_READY_MS);
+    }
+    while (n < 0 && errno == EINTR);
+    if (n <= 0)
+    {
+        LOG(LOG_LEVEL_INFO, "no readiness from the accel-assist helper "
+            "(pid %d); assuming it is running", (int) pid);
+        return 0;
+    }
+    return g_file_read(fd, &c, 1) == 1 ? 0 : 1;
+}
+
+/*****************************************************************************/
 /* Start the helper between us and xrdp, as xorgxrdp does: it gets the xrdp
    socket and one end of a socketpair; we talk to xrdp through the other. */
 static int
 helper_start(struct be *b)
 {
     int spair[2];
+    int ready[2];
     const char *path = g_getenv("WLXRDP_ACCEL_ASSIST");
     char exe[256];
     pid_t pid;
@@ -765,11 +795,19 @@ helper_start(struct be *b)
     {
         return 1;
     }
+    if (pipe2(ready, O_CLOEXEC) != 0)
+    {
+        g_file_close(spair[0]);
+        g_file_close(spair[1]);
+        return 1;
+    }
     pid = g_fork();
     if (pid < 0)
     {
         g_file_close(spair[0]);
         g_file_close(spair[1]);
+        g_file_close(ready[0]);
+        g_file_close(ready[1]);
         return 1;
     }
     if (pid == 0)
@@ -777,16 +815,18 @@ helper_start(struct be *b)
         char text[32];
         int fd;
 
-        /* the two sockets, stdio on /dev/null, nothing else */
+        /* the two sockets and the readiness pipe, stdio on /dev/null,
+           nothing else */
         for (fd = 3; fd < 1024; fd++)
         {
-            if (fd != b->client_fd && fd != spair[0])
+            if (fd != b->client_fd && fd != spair[0] && fd != ready[1])
             {
                 g_file_close(fd);
             }
         }
         fcntl(b->client_fd, F_SETFD, 0);
         fcntl(spair[0], F_SETFD, 0);
+        fcntl(ready[1], F_SETFD, 0);
         fd = g_file_open_ex("/dev/null", 1, 1, 0, 0);
         dup2(fd, 0);
         dup2(fd, 1);
@@ -794,11 +834,27 @@ helper_start(struct be *b)
         g_setenv("XORGXRDP_XORG_FD", text, 1);
         g_snprintf(text, sizeof(text), "%d", b->client_fd);
         g_setenv("XORGXRDP_XRDP_FD", text, 1);
+        g_snprintf(text, sizeof(text), "%d", ready[1]);
+        g_setenv("XRDP_ACCEL_ASSIST_READY_FD", text, 1);
         execl(exe, exe, "-w", (char *) NULL);
         _exit(127);
     }
     LOG(LOG_LEVEL_INFO, "started %s -w, pid %d", exe, (int) pid);
     g_file_close(spair[0]);
+    g_file_close(ready[1]);
+    if (helper_wait_ready(ready[0], pid) != 0)
+    {
+        /* The helper holds a copy of the xrdp socket, but ours is still
+           open: the connection survives it */
+        g_file_close(ready[0]);
+        g_file_close(spair[1]);
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+        LOG(LOG_LEVEL_WARNING, "the accel-assist helper could not start "
+            "its encoder; using the CPU path (xrdp encodes)");
+        return 1;
+    }
+    g_file_close(ready[0]);
     g_file_close(b->client_fd);
     b->client_fd = spair[1];
     b->helper_pid = pid;
@@ -1568,26 +1624,10 @@ handle_input(struct be *b, int msg, int p1, int p2, int p3, int p4)
 }
 
 /*****************************************************************************/
-static int
-handle_client_info(struct be *b, const char *data, int bytes)
+/* GPU or CPU path for this connection, and the codec id */
+static void
+choose_path(struct be *b)
 {
-    const struct display_size_description *ds;
-
-    memset(&b->ci, 0, sizeof(b->ci));
-    memcpy(&b->ci, data, bytes < (int) sizeof(b->ci) ? bytes
-           : (int) sizeof(b->ci));
-    /* the keymap names are C strings to us: make sure they end */
-    b->ci.xkb_rules[sizeof(b->ci.xkb_rules) - 1] = '\0';
-    b->ci.model[sizeof(b->ci.model) - 1] = '\0';
-    b->ci.layout[sizeof(b->ci.layout) - 1] = '\0';
-    b->ci.variant[sizeof(b->ci.variant) - 1] = '\0';
-    b->ci.options[sizeof(b->ci.options) - 1] = '\0';
-    b->have_ci = 1;
-    ds = &b->ci.display_sizes;
-    LOG(LOG_LEVEL_INFO, "client info: version %d, %dx%d, %d monitor(s), "
-        "capture_code %d, avc444 level %d", b->ci.version, ds->session_width,
-        ds->session_height, ds->monitorCount, b->ci.capture_code,
-        b->ci.gfx_avc444);
     b->codec_id = 0x000B;
     if (b->ci.gfx_avc444 > 0 && g_getenv("WLXRDP_AVC420") == NULL)
     {
@@ -1632,6 +1672,47 @@ handle_client_info(struct be *b, const char *data, int bytes)
     {
         LOG(LOG_LEVEL_INFO, "GPU path: codec id 0x%4.4x", b->codec_id);
     }
+}
+
+/*****************************************************************************/
+static int
+handle_client_info(struct be *b, const char *data, int bytes)
+{
+    const struct display_size_description *ds;
+    int helper_started;
+
+    memset(&b->ci, 0, sizeof(b->ci));
+    memcpy(&b->ci, data, bytes < (int) sizeof(b->ci) ? bytes
+           : (int) sizeof(b->ci));
+    /* the keymap names are C strings to us: make sure they end */
+    b->ci.xkb_rules[sizeof(b->ci.xkb_rules) - 1] = '\0';
+    b->ci.model[sizeof(b->ci.model) - 1] = '\0';
+    b->ci.layout[sizeof(b->ci.layout) - 1] = '\0';
+    b->ci.variant[sizeof(b->ci.variant) - 1] = '\0';
+    b->ci.options[sizeof(b->ci.options) - 1] = '\0';
+    b->have_ci = 1;
+    ds = &b->ci.display_sizes;
+    LOG(LOG_LEVEL_INFO, "client info: version %d, %dx%d, %d monitor(s), "
+        "capture_code %d, avc444 level %d", b->ci.version, ds->session_width,
+        ds->session_height, ds->monitorCount, b->ci.capture_code,
+        b->ci.gfx_avc444);
+    choose_path(b);
+    /* The helper before capture starts, as xorgxrdp does: capture's buffers
+       depend on the path, and a helper that cannot encode here leaves us on
+       the CPU path rather than losing the client */
+    helper_started = 0;
+    if (!b->cpu)
+    {
+        if (helper_start(b) == 0)
+        {
+            helper_started = 1;
+        }
+        else
+        {
+            b->accel_failed = 1;
+            choose_path(b);
+        }
+    }
 
     kbd_load_keymap(b);
     b->sent_visible = -1; /* replay the current cursor to this client */
@@ -1656,9 +1737,8 @@ handle_client_info(struct be *b, const char *data, int bytes)
         }
     }
     /* the helper encodes GFX H.264 only, as for xorgxrdp */
-    if (!b->cpu && helper_start(b) == 0)
+    if (helper_started)
     {
-        b->helper_start_ms = now_ms32();
         b->buffers_changed = 1;
         core_helper_sync(b);
     }
@@ -2079,16 +2159,9 @@ drop_client(struct be *b)
     LOG(LOG_LEVEL_INFO, "xrdp disconnected after %d frames", b->frames_sent);
     b->ops->stop(b->ad);
     g_file_close(b->client_fd);
-    if (b->helper_pid > 0 && waitpid(b->helper_pid, NULL, WNOHANG) > 0 &&
-            now_ms32() - b->helper_start_ms < 10000)
-    {
-        /* the helper exited soon after starting: its GPU encoder is not
-           usable here. Later connections take the CPU path. */
-        LOG(LOG_LEVEL_WARNING, "the accel-assist helper exited at start; "
-            "using the CPU path from now on");
-        b->accel_failed = 1;
-        b->helper_pid = 0;
-    }
+    /* A helper that could not start its encoder was caught by its
+       readiness handshake (accel_failed); one ending with the connection
+       is no sign of that */
     helper_stop(b);
     b->client_fd = -1;
     b->in_len = 0;
