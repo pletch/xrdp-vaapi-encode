@@ -1214,6 +1214,7 @@ main(int argc, char **argv)
         LOG(LOG_LEVEL_ERROR, "xrdp_accel_assist_x11_init failed");
         return 1;
     }
+
     xorg_fd = g_atoi(g_getenv("XORGXRDP_XORG_FD"));
     LOG(LOG_LEVEL_INFO, "xorg_fd: %d", xorg_fd);
     xrdp_fd = g_atoi(g_getenv("XORGXRDP_XRDP_FD"));
