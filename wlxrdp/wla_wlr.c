@@ -209,6 +209,7 @@ struct wlr
     struct gbm_device *gbm;
     int wl_shm;                 /* capture into shm (the CPU path) */
     int cursor_dirty;           /* an image or hotspot came */
+    int paint_cursors;          /* no cursor capture: frames carry it */
     int capturing;              /* between start and stop */
 };
 
@@ -1442,8 +1443,9 @@ cursor_frame_done(struct wlr_mon *m)
 }
 
 /*****************************************************************************/
-/* this output's cursor session, following the virtual pointer */
-static void
+/* this output's cursor session, following the virtual pointer; returns 1
+   when the compositor can't give the cursor as an image */
+static int
 cursor_start(struct wlr_mon *m)
 {
     struct wlr *b = m->b;
@@ -1452,7 +1454,7 @@ cursor_start(struct wlr_mon *m)
 
     if (b->pointer == NULL || b->shm == NULL)
     {
-        return;
+        return 1;
     }
     memset(c, 0, sizeof(*c));
     source = ext_output_image_capture_source_manager_v1_create_source(
@@ -1470,15 +1472,15 @@ cursor_start(struct wlr_mon *m)
     {
         if (wl_display_dispatch(b->display) < 0)
         {
-            return;
+            return 1;
         }
     }
     if (c->stopped || !c->have_argb)
     {
-        LOG(LOG_LEVEL_WARNING, "monitor %d: no cursor capture", m->index);
-        return;
+        return 1;
     }
     cursor_request(m);
+    return 0;
 }
 
 /*****************************************************************************/
@@ -1876,10 +1878,24 @@ capture_start(struct wlr_mon *m)
     m->shm_format = 0;
     m->num_shm_offered = 0;
     m->have_dev = 0;
+    /* The cursor goes to the client as the RDP pointer, from its own
+       capture. A compositor that can't give it as ARGB8888 (wlroots' GLES2
+       renderer on NVIDIA reads back BGR888 only) paints it into the frames
+       instead, and the client's pointer is hidden: it moves at the frame
+       rate, but has the session's size and shape. */
+    if (!b->paint_cursors && cursor_start(m) != 0)
+    {
+        LOG(LOG_LEVEL_WARNING, "monitor %d: no cursor capture; the "
+            "compositor paints the cursor into the frames", m->index);
+        cursor_stop(m);
+        b->paint_cursors = 1;
+    }
     source = ext_output_image_capture_source_manager_v1_create_source(
                  b->source_mgr, m->output);
     m->session = ext_image_copy_capture_manager_v1_create_session(
-                     b->copy_mgr, source, 0 /* cursor not painted */);
+                     b->copy_mgr, source, b->paint_cursors ?
+                     EXT_IMAGE_COPY_CAPTURE_MANAGER_V1_OPTIONS_PAINT_CURSORS :
+                     0);
     ext_image_capture_source_v1_destroy(source);
     ext_image_copy_capture_session_v1_add_listener(m->session,
             &g_session_listener, m);
@@ -1956,7 +1972,6 @@ capture_start(struct wlr_mon *m)
     m->constraints_changed = 0;
     m->capture_ms = now_ms32();
     m->wanted = 0;
-    cursor_start(m);
     return 0;
 }
 
