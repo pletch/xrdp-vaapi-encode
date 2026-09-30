@@ -62,6 +62,7 @@ struct enc_info
     int frameCount;
     int avc444;                 /* both views, one H.264 sequence */
     int ltr_valid[2];           /* the view's long-term reference exists */
+    int idr_count;              /* IDRs this encoder has produced */
     int qp_map_bytes;
     void *enc;
     NV_ENC_OUTPUT_PTR bitstreamBuffer;
@@ -522,15 +523,66 @@ nvenc_dump_stream(int view, int idr, const void *data, int bytes)
 }
 
 /*****************************************************************************/
+/* Encode one picture. cdata NULL: encode it and discard the output. */
+static enum encoder_result
+nvenc_submit(struct enc_info *ei, NV_ENC_PIC_PARAMS *picParams,
+             void *cdata, int *cdata_bytes)
+{
+    NV_ENC_LOCK_BITSTREAM lockBitstream;
+    NVENCSTATUS nv_error;
+    enum encoder_result rv;
+
+    nv_error = g_enc_funcs.nvEncEncodePicture(ei->enc, picParams);
+    if (nv_error != NV_ENC_SUCCESS)
+    {
+        LOG(LOG_LEVEL_ERROR, "error nvEncEncodePicture %d", nv_error);
+        return ENCODER_ERROR;
+    }
+    ei->frameCount++;
+    rv = ENCODER_ERROR;
+    g_memset(&lockBitstream, 0, sizeof(lockBitstream));
+    lockBitstream.version = NV_ENC_LOCK_BITSTREAM_VER;
+    lockBitstream.outputBitstream = ei->bitstreamBuffer;
+    lockBitstream.doNotWait = 0;
+    nv_error = g_enc_funcs.nvEncLockBitstream(ei->enc, &lockBitstream);
+    if (nv_error != NV_ENC_SUCCESS)
+    {
+        LOG(LOG_LEVEL_ERROR, "error nvEncLockBitstream %d", nv_error);
+        return ENCODER_ERROR;
+    }
+    if (cdata == NULL)
+    {
+        rv = INCREMENTAL_FRAME_ENCODED;
+    }
+    else if (*cdata_bytes >= ((int) (lockBitstream.bitstreamSizeInBytes)))
+    {
+        g_memcpy(cdata, lockBitstream.bitstreamBufferPtr,
+                 lockBitstream.bitstreamSizeInBytes);
+        *cdata_bytes = lockBitstream.bitstreamSizeInBytes;
+        rv = INCREMENTAL_FRAME_ENCODED;
+    }
+    else
+    {
+        LOG(LOG_LEVEL_ERROR, "error not enough room %d %d",
+            *cdata_bytes, (int) (lockBitstream.bitstreamSizeInBytes));
+    }
+    g_enc_funcs.nvEncUnlockBitstream(ei->enc, lockBitstream.outputBitstream);
+    if ((rv != ENCODER_ERROR) &&
+            (picParams->encodePicFlags & NV_ENC_PIC_FLAG_FORCEIDR))
+    {
+        ei->idr_count++;
+    }
+    return rv;
+}
+
+/*****************************************************************************/
 enum encoder_result
 xrdp_accel_assist_nvenc_encode(struct enc_info *ei, int tex,
                                void *cdata, int *cdata_bytes,
-                               int flags)
+                               int flags, int idr_pic_id)
 {
     NV_ENC_PIC_PARAMS picParams;
     NV_ENC_PIC_PARAMS_H264 *h264;
-    NV_ENC_LOCK_BITSTREAM lockBitstream;
-    NVENCSTATUS nv_error;
     enum encoder_result rv;
     int view;
     int idr;
@@ -569,7 +621,6 @@ xrdp_accel_assist_nvenc_encode(struct enc_info *ei, int tex,
     picParams.inputWidth = ei->width;
     picParams.inputHeight = ei->height;
     picParams.outputBitstream = ei->bitstreamBuffer;
-    picParams.inputTimeStamp = ei->frameCount;
     picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
     if (idr)
     {
@@ -579,7 +630,20 @@ xrdp_accel_assist_nvenc_encode(struct enc_info *ei, int tex,
         /* An IDR empties the DPB. */
         ei->ltr_valid[0] = 0;
         ei->ltr_valid[1] = 0;
+        /* NVENC numbers IDRs itself, 0, 1, 0, ... from 0 in each session,
+           and can't be told which. When that parity isn't the stream's,
+           spend one IDR unsent: across an encoder rebuild, consecutive IDRs
+           must still differ. */
+        if ((idr_pic_id >= 0) && (((idr_pic_id ^ ei->idr_count) & 1) != 0))
+        {
+            picParams.inputTimeStamp = ei->frameCount;
+            if (nvenc_submit(ei, &picParams, NULL, NULL) == ENCODER_ERROR)
+            {
+                return ENCODER_ERROR;
+            }
+        }
     }
+    picParams.inputTimeStamp = ei->frameCount;
     if (ei->avc444)
     {
         /* Mark this picture long-term in its view's slot and predict only
@@ -601,52 +665,15 @@ xrdp_accel_assist_nvenc_encode(struct enc_info *ei, int tex,
             }
         }
     }
-    nv_error = g_enc_funcs.nvEncEncodePicture(ei->enc, &picParams);
-    rv = ENCODER_ERROR;
-    if (nv_error == NV_ENC_SUCCESS)
+    rv = nvenc_submit(ei, &picParams, cdata, cdata_bytes);
+    if (rv == ENCODER_ERROR)
     {
-        g_memset(&lockBitstream, 0, sizeof(lockBitstream));
-        lockBitstream.version = NV_ENC_LOCK_BITSTREAM_VER;
-        lockBitstream.outputBitstream = ei->bitstreamBuffer;
-        lockBitstream.doNotWait = 0;
-        nv_error = g_enc_funcs.nvEncLockBitstream(ei->enc, &lockBitstream);
-        if (nv_error == NV_ENC_SUCCESS)
-        {
-            if (*cdata_bytes >= ((int) (lockBitstream.bitstreamSizeInBytes)))
-            {
-                g_memcpy(cdata, lockBitstream.bitstreamBufferPtr,
-                         lockBitstream.bitstreamSizeInBytes);
-                *cdata_bytes = lockBitstream.bitstreamSizeInBytes;
-                rv = INCREMENTAL_FRAME_ENCODED;
-                nvenc_dump_stream(view, idr, cdata, *cdata_bytes);
-                if (ei->avc444)
-                {
-                    ei->ltr_valid[view] = 1;
-                }
-            }
-            else
-            {
-                LOG(LOG_LEVEL_ERROR, "error not enough room %d %d",
-                    *cdata_bytes,
-                    (int) (lockBitstream.bitstreamSizeInBytes));
-            }
-            g_enc_funcs.nvEncUnlockBitstream(ei->enc,
-                                             lockBitstream.outputBitstream);
-        }
-        else
-        {
-            LOG(LOG_LEVEL_ERROR, "error nvEncLockBitstream %d",
-                nv_error);
-        }
-        ei->frameCount++;
+        return ENCODER_ERROR;
     }
-    else
+    nvenc_dump_stream(view, idr, cdata, *cdata_bytes);
+    if (ei->avc444)
     {
-        LOG(LOG_LEVEL_ERROR, "error nvEncEncodePicture %d", nv_error);
+        ei->ltr_valid[view] = 1;
     }
-    if (rv == INCREMENTAL_FRAME_ENCODED && idr)
-    {
-        return KEY_FRAME_ENCODED;
-    }
-    return rv;
+    return idr ? KEY_FRAME_ENCODED : INCREMENTAL_FRAME_ENCODED;
 }

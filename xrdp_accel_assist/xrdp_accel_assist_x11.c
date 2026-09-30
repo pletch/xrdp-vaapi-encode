@@ -80,15 +80,17 @@ struct enc_funcs
     int (*create_enc)(int width, int height, int tex, int tex_aux,
                       int tex_format, struct enc_info **ei);
     int (*destroy_enc)(struct enc_info *ei);
+    /* idr_pic_id: the stream's id for the picture if it is an IDR. The
+       count lives here, per monitor, so it survives an encoder rebuild. */
     enum encoder_result (*encode)(struct enc_info *ei, int tex,
                                   void *cdata, int *cdata_bytes,
-                                  int flags);
+                                  int flags, int idr_pic_id);
     /* Optional: encode both AVC444 views, submitting each before waiting
        on either. NULL falls back to two encode() calls. */
     enum encoder_result (*encode_dual)(struct enc_info *ei,
                                        void *cdata1, int *cdata1_bytes,
                                        void *cdata2, int *cdata2_bytes,
-                                       int flags);
+                                       int flags, int idr_pic_id);
 };
 
 static struct enc_funcs g_enc_funcs[] =
@@ -183,6 +185,7 @@ struct mon_info
        client lacks a picture the next ones may refer to, so the next frame
        is an IDR. */
     int idr_pending;
+    int idr_seq;                  /* next idr_pic_id; outlives encoders */
     int tex_format;
     GLfloat *(*get_vertices)(GLuint *vertices_bytes,
                              GLuint *vertices_pointes,
@@ -1616,7 +1619,8 @@ encode_pixmap(int left, int top, int width, int height,
         {
             len1 = avail - 8;
             rv = g_enc_funcs[g_enc].encode(mi->ei, mi->enc_texture,
-                                           p + 4, &len1, flags);
+                                           p + 4, &len1, flags,
+                                           mi->idr_seq);
             if (rv == ENCODER_ERROR)
             {
                 return ENCODER_ERROR;
@@ -1632,7 +1636,7 @@ encode_pixmap(int left, int top, int width, int height,
             rv = g_enc_funcs[g_enc].encode_dual(mi->ei,
                                                 p + 4, &len1,
                                                 p + aux_stage, &len2,
-                                                flags);
+                                                flags, mi->idr_seq);
             if (rv == ENCODER_ERROR)
             {
                 return ENCODER_ERROR;
@@ -1643,7 +1647,8 @@ encode_pixmap(int left, int top, int width, int height,
         {
             len1 = avail - 8;
             rv = g_enc_funcs[g_enc].encode(mi->ei, mi->enc_texture,
-                                           p + 4, &len1, flags);
+                                           p + 4, &len1, flags,
+                                           mi->idr_seq);
             if (rv == ENCODER_ERROR)
             {
                 return ENCODER_ERROR;
@@ -1654,7 +1659,8 @@ encode_pixmap(int left, int top, int width, int height,
             rv2 = g_enc_funcs[g_enc].encode(mi->ei, mi->enc_texture_aux,
                                             p + 4 + len1 + 4, &len2,
                                             (flags & ~XH_ENC_FLAGS_FORCEIDR) |
-                                            XH_ENC_FLAGS_AUXVIEW);
+                                            XH_ENC_FLAGS_AUXVIEW,
+                                            mi->idr_seq);
             if (rv2 == ENCODER_ERROR)
             {
                 return ENCODER_ERROR;
@@ -1714,7 +1720,7 @@ encode_pixmap(int left, int top, int width, int height,
     XFlush(g_display);
     /* encode */
     rv = g_enc_funcs[g_enc].encode(mi->ei, mi->enc_texture,
-                                   cdata, cdata_bytes, flags);
+                                   cdata, cdata_bytes, flags, mi->idr_seq);
     return rv;
 }
 
@@ -1777,6 +1783,11 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
     else if (flags & XH_ENC_FLAGS_FORCEIDR)
     {
         mi->idr_pending = 0;
+    }
+    if (rv == KEY_FRAME_ENCODED)
+    {
+        /* Consecutive IDRs must differ in idr_pic_id (7.4.3). */
+        mi->idr_seq = (mi->idr_seq + 1) & 0xffff;
     }
     return rv;
 }

@@ -1759,9 +1759,15 @@ cleanup_err:
 enum encoder_result
 xrdp_accel_assist_vaapi_encode(struct enc_info *ei, int tex,
                                void *cdata, int *cdata_bytes,
-                               int flags)
+                               int flags, int idr_pic_id)
 {
     (void) tex;
+    /* The caller's count outlives this encoder, so an IDR after a rebuild
+       differs from the last one before it. */
+    if (idr_pic_id >= 0)
+    {
+        ei->idr_pic_id = idr_pic_id & 0xffff;
+    }
     return vaapi_submit(ei, cdata, cdata_bytes, flags, 0);
 }
 
@@ -1772,10 +1778,15 @@ enum encoder_result
 xrdp_accel_assist_vaapi_encode_dual(struct enc_info *ei,
                                     void *cdata1, int *cdata1_bytes,
                                     void *cdata2, int *cdata2_bytes,
-                                    int flags)
+                                    int flags, int idr_pic_id)
 {
     enum encoder_result rv;
     int aux_flags = (flags & ~XH_ENC_FLAGS_FORCEIDR) | XH_ENC_FLAGS_AUXVIEW;
+
+    if (idr_pic_id >= 0)
+    {
+        ei->idr_pic_id = idr_pic_id & 0xffff;
+    }
 
     rv = vaapi_submit(ei, cdata1, cdata1_bytes,
                       flags & ~XH_ENC_FLAGS_AUXVIEW, 1);
