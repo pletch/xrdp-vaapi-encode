@@ -91,6 +91,127 @@ carries the xorgxrdp side of the AVC444 negotiation, which has to match this bra
 FlyGoat's glamor/DRI3 fixes that make glamor work on the Intel `xe` kernel driver
 ([neutrinolabs/xorgxrdp#423](https://github.com/neutrinolabs/xorgxrdp/pull/423)).
 
+### Installing from source: layout and common snags
+
+These notes come from bringing the fork up on a fresh Xubuntu machine. Package
+names are Debian/Ubuntu; Fedora has the same libraries as `-devel` packages.
+
+**Remove the distro packages first** (`sudo apt remove xrdp xorgxrdp`). Their
+binaries, service files and config would otherwise shadow or clash with the
+source build.
+
+**Dependencies**, for both xrdp and the xorgxrdp fork:
+
+```
+sudo apt install build-essential git autoconf automake libtool pkg-config nasm \
+  libssl-dev libpam0g-dev libx11-dev libxfixes-dev libxrandr-dev libjpeg-dev \
+  libfuse3-dev libx264-dev libopus-dev libpixman-1-dev systemd-dev \
+  xserver-xorg-dev libdrm-dev libgbm-dev libepoxy-dev libegl-dev libva-dev
+```
+
+`systemd-dev` is easy to miss: without it configure silently skips the unit
+files, and `systemctl enable xrdp` then fails with *Unit xrdp.service does not
+exist*. On older releases, where `systemd.pc` is in `libsystemd-dev`, or to be
+explicit, pass `--with-systemdsystemunitdir=/usr/lib/systemd/system`.
+
+**Where things install.** Programs go under the prefix, `/usr/local` by
+default; configuration does not:
+
+| what | where |
+| ---- | ----- |
+| `xrdp`, `xrdp-sesman` | `/usr/local/sbin` |
+| `xrdp-accel-assist`, `xrdp-sesexec`, ... | `/usr/local/libexec/xrdp` |
+| `xrdp.ini`, `sesman.ini`, `startwm.sh` | `/etc/xrdp` (configure always uses `/etc`) |
+| xorgxrdp modules | the Xorg module directory, e.g. `/usr/lib/xorg/modules` |
+| `xorg.conf`, `xorg_nvidia.conf` | `/etc/X11/xrdp` |
+
+**`make install` overwrites the configuration.** Every xrdp install replaces
+`/etc/xrdp/*.ini` and `startwm.sh`, and every xorgxrdp install replaces the
+files in `/etc/X11/xrdp`. Keep your edits somewhere else and reapply them, or
+put them in a script:
+
+* copy the Xorg config to a name the install doesn't know (for example
+  `xorg_nvidia_local.conf`) and point `sesman.ini` at the copy;
+* when only the helper changed, install only the helper, which leaves
+  `/etc/xrdp` alone: `sudo make -C xrdp_accel_assist install`.
+
+**`sesman.ini` changes needed on Debian/Ubuntu:**
+
+* `[Xorg]` `param=Xorg` runs the `Xorg.wrap` wrapper, which refuses users who
+  are not at the console (*Only console users are allowed to run the X
+  server*). Point it at the server itself: `param=/usr/lib/xorg/Xorg`.
+* The GPU path is opt-in: add `XRDP_USE_ACCEL_ASSIST=1` under
+  `[SessionVariables]`. xrdp must also be built with x264 or OpenH264, or it
+  never selects H.264 and the GPU encoder goes unused (fork issue #3).
+* `sesman.ini` is read when a session starts. After a change, **log out** of
+  the session; a disconnect and reconnect keeps the old settings.
+
+**Same user logged in at the console.** If you also use the machine locally,
+the xrdp session shares the user's D-Bus session bus. `xfce4-session` then finds
+a session manager already running and exits at once (*Session failed
+immediately*, *window manager exited quickly*). Give the xrdp session its own
+bus with a `~/startwm.sh`, which sesman runs in place of `/etc/xrdp/startwm.sh`:
+
+```sh
+#!/bin/sh
+unset DBUS_SESSION_BUS_ADDRESS
+exec dbus-run-session -- startxfce4
+```
+
+**Which setup for which GPU:**
+
+| | Intel / AMD (VA-API) | NVIDIA (NVENC) |
+| --- | --- | --- |
+| xrdp configure | `--enable-vaapi` | `--enable-nvenc` (the SDK header is bundled; `libnvidia-encode` is loaded at run time) |
+| xorgxrdp configure | `--enable-glamor` | `--enable-glamor --enable-lrandr` |
+| Xorg config | `xrdp/xorg.conf` (xrdpdev) | a copy of `xrdp/xorg_nvidia.conf` with your `BusID` |
+| Wayland sessions (`feature/wayland`) | GPU encoding | CPU encoding (the Wayland helper needs VA-API) |
+
+For NVIDIA:
+
+* The default `xorg.conf` does not work: its `DRMAllowList` leaves out
+  `nvidia-drm`, so xrdpdev falls back to software rendering and the GPU path
+  never starts.
+* `xorg_nvidia.conf` ships with `BusID "PCI:3:0:0"`. Take yours from
+  `nvidia-smi` (Bus-Id `00000000:01:00.0` is `PCI:1:0:0`; the fields are
+  decimal). A wrong one gives *No devices detected*, then a fatal error about
+  `/dev/tty0`.
+* Without `--enable-lrandr`, the NVIDIA driver exposes no RandR outputs and the
+  session fails with *waitforx: Unable to find any RandR outputs*.
+* The X screen starts at 640x480 and is resized when the client connects. The
+  desktop can start first, leaving the wallpaper in a 640x480 corner with
+  window trails across the rest. Until xorgxrdp applies the start size on this
+  path, wait for the resize in `~/startwm.sh`, before the `exec`:
+
+  ```sh
+  i=0
+  while [ $i -lt 50 ] && xdpyinfo 2>/dev/null | grep -q "dimensions: *640x480"; do
+      sleep 0.1; i=$((i+1))
+  done
+  ```
+
+**Checking that the GPU is doing the work:**
+
+* `sudo grep "hardware encoding active" /var/log/xrdp.log` (the log needs
+  root). The line appears on the first GPU-encoded frame.
+* The helper's own log: `~/.local/share/xrdp/xrdp-accel-assist.<display>.log`.
+* `intel_gpu_top` (the Video engine) or `nvidia-smi dmon -s u` (the `enc`
+  column) while something on screen is moving.
+
+**Error messages and their usual causes:**
+
+| message | cause |
+| ------- | ----- |
+| *Unit xrdp-sesman.service does not exist* | `systemd-dev` missing at configure time |
+| *Only console users are allowed to run the X server* | `param=Xorg` in `sesman.ini`; use `/usr/lib/xorg/Xorg` |
+| *X server could not be started*, no `~/.xorgxrdp.*.log` | as above, or a `make install` reset `sesman.ini` |
+| *Session failed immediately* / *window manager exited quickly* | the same user logged in locally: separate D-Bus bus |
+| *waitforx: Unable to find any RandR outputs* | NVIDIA driver without xorgxrdp `--enable-lrandr` |
+| *No devices detected*, then `/dev/tty0` fatal | wrong `BusID` in the NVIDIA Xorg config |
+| wallpaper only in a 640x480 corner | NVIDIA start-size race: wait in `startwm.sh` |
+| no *hardware encoding active* line | `XRDP_USE_ACCEL_ASSIST` unset, no x264/OpenH264 in the build, or (NVIDIA) the xrdpdev `xorg.conf` |
+| bash: *!dev: event not found* when pasting a command | history expansion on `!` inside double quotes; use single quotes |
+
 ### AVC444: true 4:4:4 chroma
 
 The encoder also implements **AVC444** (MS-RDPEGFX `RDPGFX_CODECID_AVC444` /
