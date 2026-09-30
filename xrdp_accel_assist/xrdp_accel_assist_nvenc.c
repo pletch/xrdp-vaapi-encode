@@ -334,6 +334,10 @@ xrdp_accel_assist_nvenc_create_encoder(int width, int height, int tex,
     vui->colourPrimaries = 1;           /* BT.709 */
     vui->transferCharacteristics = 1;   /* BT.709 */
     vui->colourMatrix = 1;              /* BT.709 */
+    /* No B-frames, so no reordering; say so. Without it a decoder may
+       assume the worst and hold pictures back (Chromium's holds as many
+       as the level's DPB). */
+    vui->bitstreamRestrictionFlag = 1;
     aux_delta = 0;
     if (lei->avc444)
     {
