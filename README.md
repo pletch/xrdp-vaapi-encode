@@ -296,6 +296,7 @@ exec dbus-run-session -- startxfce4
 | xrdp configure | `--enable-vaapi` | `--enable-nvenc` (the SDK header is bundled; `libnvidia-encode` is loaded at run time) |
 | xorgxrdp configure | `--enable-glamor` | `--enable-glamor --enable-lrandr` |
 | Xorg config | `xrdp/xorg.conf` (xrdpdev) | a copy of `xrdp/xorg_nvidia.conf` with your `BusID` |
+| AVC420 / AVC444 | both | both (AVC444 needs two long-term reference frames, which the helper checks for) |
 | Wayland sessions (`feature/wayland`) | GPU encoding | CPU encoding (the Wayland helper needs VA-API) |
 
 For NVIDIA:
@@ -309,12 +310,17 @@ For NVIDIA:
   `/dev/tty0`.
 * Without `--enable-lrandr`, the NVIDIA driver exposes no RandR outputs and the
   session fails with *waitforx: Unable to find any RandR outputs*.
-* The NVIDIA driver starts the X screen at 640x480. Upstream xorgxrdp resizes
-  it only when the client connects, and the desktop can start first, leaving
-  the wallpaper in a 640x480 corner with window trails across the rest. The
-  xorgxrdp fork applies the client's size (`XRDP_START_WIDTH`/`HEIGHT`) at
-  startup, as xrdpdev does, so the session starts at the right size. With
-  upstream xorgxrdp, wait for the resize in `~/startwm.sh` before the `exec`:
+* The screen starts at 640x480 and is resized to the client, and resized
+  again when a client of another size reconnects. Two fixes in the xorgxrdp
+  fork keep the desktop in step: the client's size
+  (`XRDP_START_WIDTH`/`HEIGHT`) is applied at startup, as xrdpdev does, and
+  the local RandR (`--enable-lrandr`) implements RandR 1.5.
+  libxfce4windowing, which xfdesktop 4.20 uses, needs 1.5; below it,
+  xfdesktop takes the screen size once and never follows a resize. With
+  upstream xorgxrdp the wallpaper stays in a 640x480 corner, or at the first
+  client's size, with window trails across the rest. The workaround there is
+  to restart xfdesktop from the reconnect script, and to wait for the
+  resize in `~/startwm.sh` before the `exec`:
 
   ```sh
   i=0
@@ -341,7 +347,7 @@ For NVIDIA:
 | *Session failed immediately* / *window manager exited quickly* | the same user logged in locally: separate D-Bus bus |
 | *waitforx: Unable to find any RandR outputs* | NVIDIA driver without xorgxrdp `--enable-lrandr` |
 | *No devices detected*, then `/dev/tty0` fatal | wrong `BusID` in the NVIDIA Xorg config |
-| wallpaper only in a 640x480 corner | NVIDIA start-size race: update the xorgxrdp fork, or wait in `startwm.sh` |
+| wallpaper only in a 640x480 corner, or doesn't follow a reconnect at another size | NVIDIA path with upstream xorgxrdp (RandR 1.3): update the xorgxrdp fork, or restart xfdesktop |
 | no *hardware encoding active* line | `XRDP_USE_ACCEL_ASSIST` unset, no x264/OpenH264 in the build, or (NVIDIA) the xrdpdev `xorg.conf` |
 | bash: *!dev: event not found* when pasting a command | history expansion on `!` inside double quotes; use single quotes |
 
@@ -541,6 +547,8 @@ All of these are `[SessionVariables]` in `sesman.ini`, documented there as well:
 | `XRDP_AVC444_IDR_PERIOD` | unset | overrides the two above with an IDR every Nth frame, ungated (A/B testing) |
 | `XRDP_VAAPI_QP` / `_AUX_QP` | 28 / 18 | constant quantiser, 1-51; 26 is a reasonable desktop value for main |
 | `XRDP_VAAPI_BITRATE` | 0 (CQP) | kbit/s; switches to VBR |
+| `XRDP_NVENC_QP` / `XRDP_NVENC_AUX_QP` | 28 / 18 | NVENC constant quantiser (with `XRDP_NVENC_RATE_CONTROL_MODE=NV_ENC_PARAMS_RC_CONSTQP`); the aux QP applies to AVC444's chroma view |
+| `XRDP_NVENC_DUMP_STREAM` | unset | `<prefix>`: write the NVENC stream to `<prefix>.h264` and a per-picture index, for offline checks |
 | `XRDP_SOUND_MAX_LATENCY_MS` | 0 | drop audio above this measured latency |
 
 These are read by the **xrdp process itself**, so they go in an
