@@ -309,10 +309,12 @@ For NVIDIA:
   `/dev/tty0`.
 * Without `--enable-lrandr`, the NVIDIA driver exposes no RandR outputs and the
   session fails with *waitforx: Unable to find any RandR outputs*.
-* The X screen starts at 640x480 and is resized when the client connects. The
-  desktop can start first, leaving the wallpaper in a 640x480 corner with
-  window trails across the rest. Until xorgxrdp applies the start size on this
-  path, wait for the resize in `~/startwm.sh`, before the `exec`:
+* The NVIDIA driver starts the X screen at 640x480. Upstream xorgxrdp resizes
+  it only when the client connects, and the desktop can start first, leaving
+  the wallpaper in a 640x480 corner with window trails across the rest. The
+  xorgxrdp fork applies the client's size (`XRDP_START_WIDTH`/`HEIGHT`) at
+  startup, as xrdpdev does, so the session starts at the right size. With
+  upstream xorgxrdp, wait for the resize in `~/startwm.sh` before the `exec`:
 
   ```sh
   i=0
@@ -339,7 +341,7 @@ For NVIDIA:
 | *Session failed immediately* / *window manager exited quickly* | the same user logged in locally: separate D-Bus bus |
 | *waitforx: Unable to find any RandR outputs* | NVIDIA driver without xorgxrdp `--enable-lrandr` |
 | *No devices detected*, then `/dev/tty0` fatal | wrong `BusID` in the NVIDIA Xorg config |
-| wallpaper only in a 640x480 corner | NVIDIA start-size race: wait in `startwm.sh` |
+| wallpaper only in a 640x480 corner | NVIDIA start-size race: update the xorgxrdp fork, or wait in `startwm.sh` |
 | no *hardware encoding active* line | `XRDP_USE_ACCEL_ASSIST` unset, no x264/OpenH264 in the build, or (NVIDIA) the xrdpdev `xorg.conf` |
 | bash: *!dev: event not found* when pasting a command | history expansion on `!` inside double quotes; use single quotes |
 
