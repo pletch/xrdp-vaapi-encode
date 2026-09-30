@@ -431,6 +431,11 @@ xrdp_wm_load_pointer(struct xrdp_wm *self, char *file_name, char *data,
 int
 xrdp_wm_send_pointer_system(struct xrdp_wm *self, int pointer_type)
 {
+    /* The module now owns the pointer: count the screen's as set, or the
+       next mouse move over the screen sends the cached one back when the
+       two differ (as after the login window), and a hidden pointer comes
+       back as an arrow. */
+    self->current_pointer = self->screen->pointer;
     return libxrdp_send_pointer_system(self->session, pointer_type);
 }
 
