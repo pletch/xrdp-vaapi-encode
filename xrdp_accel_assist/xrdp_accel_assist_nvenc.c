@@ -66,6 +66,7 @@ struct enc_info
     int qp_map_bytes;
     void *enc;
     NV_ENC_OUTPUT_PTR bitstreamBuffer;
+    NV_ENC_OUTPUT_PTR bitstreamBufferAux; /* AVC444: aux view in flight */
     NV_ENC_INPUT_PTR mappedResource;
     NV_ENC_BUFFER_FORMAT mappedBufferFmt;
     NV_ENC_REGISTERED_PTR registeredResource;
@@ -441,6 +442,21 @@ xrdp_accel_assist_nvenc_create_encoder(int width, int height, int tex,
     }
 
     lei->bitstreamBuffer = bitstreamParams.bitstreamBuffer;
+    if (lei->avc444)
+    {
+        /* encode_dual() has both views in flight at once. */
+        g_memset(&bitstreamParams, 0, sizeof(bitstreamParams));
+        bitstreamParams.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+        nv_error = g_enc_funcs.nvEncCreateBitstreamBuffer(lei->enc,
+                   &bitstreamParams);
+        LOG(LOG_LEVEL_INFO, "nvEncCreateBitstreamBuffer aux rv %d", nv_error);
+        if (nv_error != NV_ENC_SUCCESS)
+        {
+            xrdp_accel_assist_nvenc_delete_encoder(lei);
+            return 1;
+        }
+        lei->bitstreamBufferAux = bitstreamParams.bitstreamBuffer;
+    }
     lei->width = width;
     lei->height = height;
 
@@ -464,6 +480,11 @@ xrdp_accel_assist_nvenc_delete_encoder(struct enc_info *ei)
     g_free(ei->qp_map_aux);
     g_free(ei->qp_map_main);
     g_enc_funcs.nvEncDestroyBitstreamBuffer(ei->enc, ei->bitstreamBuffer);
+    if (ei->bitstreamBufferAux != NULL)
+    {
+        g_enc_funcs.nvEncDestroyBitstreamBuffer(ei->enc,
+                                                ei->bitstreamBufferAux);
+    }
     g_enc_funcs.nvEncDestroyEncoder(ei->enc);
     g_free(ei);
     return 0;
@@ -523,26 +544,42 @@ nvenc_dump_stream(int view, int idr, const void *data, int bytes)
 }
 
 /*****************************************************************************/
-/* Encode one picture. cdata NULL: encode it and discard the output. */
+/* Queue one picture. In synchronous mode (asynchronous is Windows only) the
+   encode is queued here and waited on in nvenc_collect(), so a second
+   picture can be queued in between. */
+static int
+nvenc_queue(struct enc_info *ei, NV_ENC_PIC_PARAMS *picParams)
+{
+    NVENCSTATUS nv_error;
+
+    picParams->inputTimeStamp = ei->frameCount;
+    nv_error = g_enc_funcs.nvEncEncodePicture(ei->enc, picParams);
+    if (nv_error != NV_ENC_SUCCESS)
+    {
+        LOG(LOG_LEVEL_ERROR, "error nvEncEncodePicture %d", nv_error);
+        return 1;
+    }
+    ei->frameCount++;
+    if (picParams->encodePicFlags & NV_ENC_PIC_FLAG_FORCEIDR)
+    {
+        ei->idr_count++;
+    }
+    return 0;
+}
+
+/*****************************************************************************/
+/* Wait for a queued picture and copy it out. cdata NULL: discard it. */
 static enum encoder_result
-nvenc_submit(struct enc_info *ei, NV_ENC_PIC_PARAMS *picParams,
-             void *cdata, int *cdata_bytes)
+nvenc_collect(struct enc_info *ei, NV_ENC_OUTPUT_PTR bitstream,
+              void *cdata, int *cdata_bytes)
 {
     NV_ENC_LOCK_BITSTREAM lockBitstream;
     NVENCSTATUS nv_error;
     enum encoder_result rv;
 
-    nv_error = g_enc_funcs.nvEncEncodePicture(ei->enc, picParams);
-    if (nv_error != NV_ENC_SUCCESS)
-    {
-        LOG(LOG_LEVEL_ERROR, "error nvEncEncodePicture %d", nv_error);
-        return ENCODER_ERROR;
-    }
-    ei->frameCount++;
-    rv = ENCODER_ERROR;
     g_memset(&lockBitstream, 0, sizeof(lockBitstream));
     lockBitstream.version = NV_ENC_LOCK_BITSTREAM_VER;
-    lockBitstream.outputBitstream = ei->bitstreamBuffer;
+    lockBitstream.outputBitstream = bitstream;
     lockBitstream.doNotWait = 0;
     nv_error = g_enc_funcs.nvEncLockBitstream(ei->enc, &lockBitstream);
     if (nv_error != NV_ENC_SUCCESS)
@@ -550,6 +587,7 @@ nvenc_submit(struct enc_info *ei, NV_ENC_PIC_PARAMS *picParams,
         LOG(LOG_LEVEL_ERROR, "error nvEncLockBitstream %d", nv_error);
         return ENCODER_ERROR;
     }
+    rv = ENCODER_ERROR;
     if (cdata == NULL)
     {
         rv = INCREMENTAL_FRAME_ENCODED;
@@ -566,65 +604,56 @@ nvenc_submit(struct enc_info *ei, NV_ENC_PIC_PARAMS *picParams,
         LOG(LOG_LEVEL_ERROR, "error not enough room %d %d",
             *cdata_bytes, (int) (lockBitstream.bitstreamSizeInBytes));
     }
-    g_enc_funcs.nvEncUnlockBitstream(ei->enc, lockBitstream.outputBitstream);
-    if ((rv != ENCODER_ERROR) &&
-            (picParams->encodePicFlags & NV_ENC_PIC_FLAG_FORCEIDR))
-    {
-        ei->idr_count++;
-    }
+    g_enc_funcs.nvEncUnlockBitstream(ei->enc, bitstream);
     return rv;
 }
 
 /*****************************************************************************/
-enum encoder_result
-xrdp_accel_assist_nvenc_encode(struct enc_info *ei, int tex,
-                               void *cdata, int *cdata_bytes,
-                               int flags, int idr_pic_id)
+/* Set up one view's picture: its input, QP map and long-term reference. An
+   IDR may first spend one picture to get the stream's idr_pic_id parity.
+   Returns 1 on error. */
+static int
+nvenc_prepare(struct enc_info *ei, int view, int flags, int idr_pic_id,
+              NV_ENC_PIC_PARAMS *picParams, int *is_idr)
 {
-    NV_ENC_PIC_PARAMS picParams;
     NV_ENC_PIC_PARAMS_H264 *h264;
-    enum encoder_result rv;
-    int view;
     int idr;
 
-    /* sync before encoding */
-    glFinish();
-
-    view = (ei->avc444 && (flags & XH_ENC_FLAGS_AUXVIEW)) ? 1 : 0;
     /* Only the main view may be an IDR. */
     idr = (view == 0) &&
-    ((flags & XH_ENC_FLAGS_FORCEIDR) || (ei->frameCount < 1));
+          ((flags & XH_ENC_FLAGS_FORCEIDR) || (ei->frameCount < 1));
+    *is_idr = idr;
 
-    g_memset(&picParams, 0, sizeof(picParams));
-    picParams.version = NV_ENC_PIC_PARAMS_VER;
+    g_memset(picParams, 0, sizeof(*picParams));
+    picParams->version = NV_ENC_PIC_PARAMS_VER;
     if (view == 0)
     {
-        picParams.inputBuffer = ei->mappedResource;
-        picParams.bufferFmt = ei->mappedBufferFmt;
-        picParams.encodePicFlags = NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+        picParams->inputBuffer = ei->mappedResource;
+        picParams->bufferFmt = ei->mappedBufferFmt;
+        picParams->encodePicFlags = NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
         if (ei->qp_map_main != NULL)
         {
-            picParams.qpDeltaMap = ei->qp_map_main;
-            picParams.qpDeltaMapSize = ei->qp_map_bytes;
+            picParams->qpDeltaMap = ei->qp_map_main;
+            picParams->qpDeltaMapSize = ei->qp_map_bytes;
         }
     }
     else
     {
-        picParams.inputBuffer = ei->mappedResourceAux;
-        picParams.bufferFmt = ei->mappedBufferFmtAux;
+        picParams->inputBuffer = ei->mappedResourceAux;
+        picParams->bufferFmt = ei->mappedBufferFmtAux;
         if (ei->qp_map_aux != NULL)
         {
-            picParams.qpDeltaMap = ei->qp_map_aux;
-            picParams.qpDeltaMapSize = ei->qp_map_bytes;
+            picParams->qpDeltaMap = ei->qp_map_aux;
+            picParams->qpDeltaMapSize = ei->qp_map_bytes;
         }
     }
-    picParams.inputWidth = ei->width;
-    picParams.inputHeight = ei->height;
-    picParams.outputBitstream = ei->bitstreamBuffer;
-    picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+    picParams->inputWidth = ei->width;
+    picParams->inputHeight = ei->height;
+    picParams->outputBitstream = ei->bitstreamBuffer;
+    picParams->pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
     if (idr)
     {
-        picParams.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
+        picParams->encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
         LOG(LOG_LEVEL_INFO, "Forcing NVENC H264 IDR SPSPPS for frame id: %d",
             ei->frameCount);
         /* An IDR empties the DPB. */
@@ -636,20 +665,20 @@ xrdp_accel_assist_nvenc_encode(struct enc_info *ei, int tex,
            must still differ. */
         if ((idr_pic_id >= 0) && (((idr_pic_id ^ ei->idr_count) & 1) != 0))
         {
-            picParams.inputTimeStamp = ei->frameCount;
-            if (nvenc_submit(ei, &picParams, NULL, NULL) == ENCODER_ERROR)
+            if (nvenc_queue(ei, picParams) != 0 ||
+                    nvenc_collect(ei, ei->bitstreamBuffer, NULL, NULL) ==
+                    ENCODER_ERROR)
             {
-                return ENCODER_ERROR;
+                return 1;
             }
         }
     }
-    picParams.inputTimeStamp = ei->frameCount;
     if (ei->avc444)
     {
         /* Mark this picture long-term in its view's slot and predict only
            from that slot. A view with no reference yet (the aux after an
            IDR) is coded intra. */
-        h264 = &(picParams.codecPicParams.h264PicParams);
+        h264 = &(picParams->codecPicParams.h264PicParams);
         h264->ltrMarkFrame = 1;
         h264->ltrMarkFrameIdx = view;
         if (!idr)
@@ -661,12 +690,31 @@ xrdp_accel_assist_nvenc_encode(struct enc_info *ei, int tex,
             }
             else
             {
-                picParams.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEINTRA;
+                picParams->encodePicFlags |= NV_ENC_PIC_FLAG_FORCEINTRA;
             }
         }
     }
-    rv = nvenc_submit(ei, &picParams, cdata, cdata_bytes);
-    if (rv == ENCODER_ERROR)
+    return 0;
+}
+
+/*****************************************************************************/
+enum encoder_result
+xrdp_accel_assist_nvenc_encode(struct enc_info *ei, int tex,
+                               void *cdata, int *cdata_bytes,
+                               int flags, int idr_pic_id)
+{
+    NV_ENC_PIC_PARAMS picParams;
+    int view;
+    int idr;
+
+    /* sync before encoding */
+    glFinish();
+
+    view = (ei->avc444 && (flags & XH_ENC_FLAGS_AUXVIEW)) ? 1 : 0;
+    if (nvenc_prepare(ei, view, flags, idr_pic_id, &picParams, &idr) != 0 ||
+            nvenc_queue(ei, &picParams) != 0 ||
+            nvenc_collect(ei, ei->bitstreamBuffer, cdata, cdata_bytes) ==
+            ENCODER_ERROR)
     {
         return ENCODER_ERROR;
     }
@@ -675,5 +723,65 @@ xrdp_accel_assist_nvenc_encode(struct enc_info *ei, int tex,
     {
         ei->ltr_valid[view] = 1;
     }
+    return idr ? KEY_FRAME_ENCODED : INCREMENTAL_FRAME_ENCODED;
+}
+
+/*****************************************************************************/
+/* Both AVC444 views: one GL sync, queue both, then collect both, so the
+   encoder is never idle waiting on the CPU between them. */
+enum encoder_result
+xrdp_accel_assist_nvenc_encode_dual(struct enc_info *ei,
+                                    void *cdata1, int *cdata1_bytes,
+                                    void *cdata2, int *cdata2_bytes,
+                                    int flags, int idr_pic_id)
+{
+    NV_ENC_PIC_PARAMS picMain;
+    NV_ENC_PIC_PARAMS picAux;
+    int aux_flags;
+    int idr;
+    int idr_aux;
+
+    if (!ei->avc444)
+    {
+        return ENCODER_ERROR;
+    }
+    /* Both views were rendered before this call. */
+    glFinish();
+
+    aux_flags = (flags & ~XH_ENC_FLAGS_FORCEIDR) | XH_ENC_FLAGS_AUXVIEW;
+    if (nvenc_prepare(ei, 0, flags & ~XH_ENC_FLAGS_AUXVIEW, idr_pic_id,
+                      &picMain, &idr) != 0 ||
+            nvenc_queue(ei, &picMain) != 0)
+    {
+        return ENCODER_ERROR;
+    }
+    if (nvenc_prepare(ei, 1, aux_flags, idr_pic_id, &picAux,
+                      &idr_aux) != 0)
+    {
+        nvenc_collect(ei, ei->bitstreamBuffer, NULL, NULL);
+        return ENCODER_ERROR;
+    }
+    picAux.outputBitstream = ei->bitstreamBufferAux;
+    if (nvenc_queue(ei, &picAux) != 0)
+    {
+        /* Drain the queued main view, then fail the frame. */
+        nvenc_collect(ei, ei->bitstreamBuffer, NULL, NULL);
+        return ENCODER_ERROR;
+    }
+    if (nvenc_collect(ei, ei->bitstreamBuffer, cdata1, cdata1_bytes) ==
+            ENCODER_ERROR)
+    {
+        nvenc_collect(ei, ei->bitstreamBufferAux, NULL, NULL);
+        return ENCODER_ERROR;
+    }
+    if (nvenc_collect(ei, ei->bitstreamBufferAux, cdata2, cdata2_bytes) ==
+            ENCODER_ERROR)
+    {
+        return ENCODER_ERROR;
+    }
+    nvenc_dump_stream(0, idr, cdata1, *cdata1_bytes);
+    nvenc_dump_stream(1, 0, cdata2, *cdata2_bytes);
+    ei->ltr_valid[0] = 1;
+    ei->ltr_valid[1] = 1;
     return idr ? KEY_FRAME_ENCODED : INCREMENTAL_FRAME_ENCODED;
 }

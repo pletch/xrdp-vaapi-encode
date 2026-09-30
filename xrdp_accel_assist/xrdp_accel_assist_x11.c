@@ -112,7 +112,7 @@ static struct enc_funcs g_enc_funcs[] =
         xrdp_accel_assist_nvenc_create_encoder,
         xrdp_accel_assist_nvenc_delete_encoder,
         xrdp_accel_assist_nvenc_encode,
-        NULL
+        xrdp_accel_assist_nvenc_encode_dual
 #else
         NULL, NULL, NULL, NULL, NULL
 #endif
