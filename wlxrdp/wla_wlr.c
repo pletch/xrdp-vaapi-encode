@@ -152,6 +152,8 @@ struct wlr_mon
     int height;
     int have_xrgb;
     uint32_t shm_format;        /* CPU path: XRGB8888, else XBGR8888; 0 none */
+    uint32_t shm_offered[4];    /* what the compositor offered, for the log */
+    int num_shm_offered;
     uint64_t *mods;
     int num_mods;
     dev_t dev;                  /* the compositor's buffer device */
@@ -805,6 +807,11 @@ session_shm_format(void *data,
 {
     struct wlr_mon *m = data;
 
+    LOG(LOG_LEVEL_DEBUG, "monitor %d: shm format 0x%08x", m->index, format);
+    if (m->num_shm_offered < 4)
+    {
+        m->shm_offered[m->num_shm_offered++] = format;
+    }
     /* either byte order; GLES2 renderers read back XBGR8888 only */
     if (format == WL_SHM_FORMAT_XRGB8888 ||
             (format == WL_SHM_FORMAT_XBGR8888 && m->shm_format == 0))
@@ -837,6 +844,8 @@ session_dmabuf_format(void *data,
     struct wlr_mon *m = data;
     uint64_t *mod;
 
+    LOG(LOG_LEVEL_DEBUG, "monitor %d: dma-buf format 0x%08x, %d modifier(s)",
+        m->index, format, (int) (modifiers->size / sizeof(uint64_t)));
     if (format != DRM_FORMAT_XRGB8888)
     {
         return;
@@ -1855,6 +1864,7 @@ capture_start(struct wlr_mon *m)
     m->stopped = 0;
     m->have_xrgb = 0;
     m->shm_format = 0;
+    m->num_shm_offered = 0;
     m->have_dev = 0;
     source = ext_output_image_capture_source_manager_v1_create_source(
                  b->source_mgr, m->output);
@@ -1872,8 +1882,24 @@ capture_start(struct wlr_mon *m)
     }
     if (m->stopped || (b->wl_shm ? m->shm_format == 0 : !m->have_xrgb))
     {
-        LOG(LOG_LEVEL_ERROR, "monitor %d: capture session unusable",
-            m->index);
+        if (m->stopped)
+        {
+            LOG(LOG_LEVEL_ERROR, "monitor %d: capture session unusable: "
+                "the compositor stopped it", m->index);
+        }
+        else if (b->wl_shm)
+        {
+            LOG(LOG_LEVEL_ERROR, "monitor %d: capture session unusable: no "
+                "XRGB8888 or XBGR8888 shm format; offered %d: 0x%08x 0x%08x "
+                "0x%08x 0x%08x", m->index, m->num_shm_offered,
+                m->shm_offered[0], m->shm_offered[1], m->shm_offered[2],
+                m->shm_offered[3]);
+        }
+        else
+        {
+            LOG(LOG_LEVEL_ERROR, "monitor %d: capture session unusable: no "
+                "XRGB8888 dma-buf format", m->index);
+        }
         return 1;
     }
     if (!b->wl_shm && open_gbm(b, m) != 0)
