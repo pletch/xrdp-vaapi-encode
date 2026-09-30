@@ -195,6 +195,7 @@ struct be
     int sent_hx;
     int sent_hy;
     int sent_visible;           /* -1: nothing sent to this client yet */
+    int cursor_replay;          /* resend the pointer after the next frame */
 
     /* stats */
     int frames_sent;
@@ -508,6 +509,28 @@ out_rects(struct stream *s, const struct xh_rect *rects, int num_rects)
 }
 
 /*****************************************************************************/
+static int
+cursor_send(struct be *b);
+
+/*****************************************************************************/
+/* A frame went out. The first after a connect or a resize also replays the
+   pointer: the client has reset its own by then, and a hidden one (the
+   compositor paints the cursor into the frames) is not sent again
+   otherwise. */
+static int
+frame_sent(struct be *b)
+{
+    b->frames_sent++;
+    if (b->cursor_replay)
+    {
+        b->cursor_replay = 0;
+        b->sent_visible = -1;
+        return cursor_send(b);
+    }
+    return 0;
+}
+
+/*****************************************************************************/
 /* One EGFX frame for a monitor, as xorgxrdp sends it: begin update, order
    62 (StartFrame, WireToSurface1 or 2, EndFrame), end update; then, when
    shm_fd is given, the frame's data as that fd. cmd is 1 (WireToSurface1:
@@ -583,8 +606,7 @@ send_gfx(struct mon *m, int cmd, int codec_id, int flags,
         return 1;
     }
     free_stream(s);
-    b->frames_sent++;
-    return 0;
+    return frame_sent(b);
 }
 
 /*****************************************************************************/
@@ -633,8 +655,7 @@ send_paint_rect(struct mon *m, const struct xh_rect *drects, int num_drects,
         return 1;
     }
     free_stream(s);
-    b->frames_sent++;
-    return 0;
+    return frame_sent(b);
 }
 
 /*****************************************************************************/
@@ -1739,6 +1760,7 @@ handle_client_info(struct be *b, const char *data, int bytes)
 
     kbd_load_keymap(b);
     b->sent_visible = -1; /* replay the current cursor to this client */
+    b->cursor_replay = 1;
 
     /* at most one capture per frame interval, as xorgxrdp paces capture */
     b->frame_interval_ms = b->ci.h264_frame_interval > 0
@@ -1830,6 +1852,7 @@ handle_xrdp_msg(struct be *b, const char *data, int len)
                 }
                 /* either way, or xrdp holds every later resize */
                 send_resize_done(b);
+                b->cursor_replay = 1;
                 break;
             }
             handle_input(b, msg, p1, p2, p3, p4);
