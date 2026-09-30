@@ -111,6 +111,7 @@ xrdp_accel_assist_nvenc_create_encoder(int width, int height, int tex,
     NV_ENC_INPUT_RESOURCE_OPENGL_TEX res;
     NV_ENC_REGISTER_RESOURCE reg_res;
     NV_ENC_CONFIG encCfg;
+    NV_ENC_CONFIG_H264_VUI_PARAMETERS *vui;
     NVENCSTATUS nv_error;
     struct enc_info *lei;
     char *rateControlMode_str;
@@ -219,6 +220,17 @@ xrdp_accel_assist_nvenc_create_encoder(int width, int height, int tex,
     encCfg.encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
     encCfg.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
     encCfg.encodeCodecConfig.h264Config.disableSPSPPS = 0;
+    /* The shaders convert to full-range BT.709. Say so in the VUI, as the
+       VA-API encoder does, or decoders assume limited range and stretch
+       the contrast. */
+    vui = &(encCfg.encodeCodecConfig.h264Config.h264VUIParameters);
+    vui->videoSignalTypePresentFlag = 1;
+    vui->videoFormat = 5;               /* unspecified */
+    vui->videoFullRangeFlag = 1;
+    vui->colourDescriptionPresentFlag = 1;
+    vui->colourPrimaries = 1;           /* BT.709 */
+    vui->transferCharacteristics = 1;   /* BT.709 */
+    vui->colourMatrix = 1;              /* BT.709 */
 
     g_memset(&createEncodeParams, 0, sizeof(createEncodeParams));
     createEncodeParams.version = NV_ENC_INITIALIZE_PARAMS_VER;
