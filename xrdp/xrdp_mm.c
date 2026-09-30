@@ -853,8 +853,12 @@ xrdp_mm_process_rail_update_window_text(struct xrdp_mm *self, struct stream *s)
 /*****************************************************************************/
 /* Does this confirmed EGFX capability set allow AVC444 (MS-RDPEGFX 2.2.3)?
    CAPVERSION_10 and 10.2 .. 10.7 do unless RDPGFX_CAPS_FLAG_AVC_DISABLED is
-   set; CAPVERSION_81 is AVC420 only; 8 and 101 have no AVC. Evaluated on
-   the confirmed set, since that is the contract. */
+   set; CAPVERSION_81 is AVC420 only; 8 has no AVC. CAPVERSION_101 has no
+   flags, and the spec says it implies AVC444v2 ("Versioning and Capability
+   Negotiation"), but it is never confirmed for H.264 here: clients that
+   send it also send 10.0 or 10.2 and later, and confirming it for an AVC420
+   stream would be out of spec. Evaluated on the confirmed set, since that
+   is the contract. */
 static int
 xrdp_mm_egfx_caps_avc444(int version, int flags)
 {
