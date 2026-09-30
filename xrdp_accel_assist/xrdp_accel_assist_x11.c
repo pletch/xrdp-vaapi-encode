@@ -351,13 +351,21 @@ xrdp_accel_assist_x11_init(void)
 }
 
 /*****************************************************************************/
-/* Headless init for a non-X frame source: EGL on GBM, VA-API encode. */
+/* Headless init for a non-X frame source: EGL on GBM, and NVENC or VA-API
+   by the render node's driver. NVENC takes the GL texture as on X11. */
 int
-xrdp_accel_assist_x11_init_headless(void *gbm_device)
+xrdp_accel_assist_x11_init_headless(void *gbm_device, int nvenc)
 {
     g_inf = INF_DMABUF;
-    g_enc = ENC_VA;
-    if (xrdp_accel_assist_inf_egl_init_gbm(gbm_device) != 0)
+    g_enc = nvenc ? ENC_NVENC : ENC_VA;
+    if (g_enc_funcs[g_enc].init == NULL)
+    {
+        LOG(LOG_LEVEL_ERROR, "xrdp_accel_assist_x11_init_headless: "
+            "the render node needs %s, not in this build",
+            nvenc ? "NVENC (--enable-nvenc)" : "VA-API (--enable-vaapi)");
+        return 1;
+    }
+    if (xrdp_accel_assist_inf_egl_init_gbm(gbm_device, !nvenc) != 0)
     {
         LOG(LOG_LEVEL_ERROR, "xrdp_accel_assist_x11_init_headless: "
             "EGL (GBM) init failed");

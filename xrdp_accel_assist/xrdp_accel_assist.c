@@ -37,11 +37,15 @@
 #include <X11/Xlib.h> /* Pixmap, in the EGL header's prototypes */
 #include "xrdp_accel_assist_egl.h"
 
-#if defined(XRDP_VAAPI)
+#if defined(XRDP_VAAPI) || defined(XRDP_ACCEL_HEADLESS)
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
+#endif
+#if defined(XRDP_ACCEL_HEADLESS)
 #include <gbm.h>
+#endif
+#if defined(XRDP_VAAPI)
 #include "xrdp_accel_assist_vaapi.h"
 #endif
 
@@ -1088,7 +1092,18 @@ signal_ready(void)
     }
 }
 
-#if defined(XRDP_VAAPI)
+#if defined(XRDP_VAAPI) || defined(XRDP_ACCEL_HEADLESS)
+/*****************************************************************************/
+/* The render node to encode on. XRDP_VAAPI_DEVICE names it for NVENC as
+   well: the variable predates NVENC support here. */
+static const char *
+render_node(void)
+{
+    const char *dev = g_getenv("XRDP_VAAPI_DEVICE");
+
+    return dev != NULL ? dev : "/dev/dri/renderD128";
+}
+
 /*****************************************************************************/
 /* Is the encoder's render node driven by NVIDIA's driver (NVENC, not VA-API)?
    Asked of sysfs, not of the X server: xorgxrdp, which is the X server,
@@ -1096,13 +1111,12 @@ signal_ready(void)
 static int
 render_node_is_nvidia(void)
 {
-    const char *dev = g_getenv("XRDP_VAAPI_DEVICE");
     char path[128];
     char link[256];
     struct stat st;
     ssize_t n;
 
-    if (stat(dev != NULL ? dev : "/dev/dri/renderD128", &st) != 0)
+    if (stat(render_node(), &st) != 0)
     {
         return 0;
     }
@@ -1117,6 +1131,9 @@ render_node_is_nvidia(void)
     return g_strcmp(g_strrchr(link, '/') != NULL ? g_strrchr(link, '/') + 1
                     : link, "nvidia") == 0;
 }
+#endif
+
+#if defined(XRDP_VAAPI)
 
 /*****************************************************************************/
 /* Start the VA-API encoder without the X server. With DISPLAY set, libva or
@@ -1174,16 +1191,20 @@ main(int argc, char **argv)
     g_signal_pipe(sigpipe_func);
     if (g_headless)
     {
-#if defined(XRDP_VAAPI)
-        const char *dev = g_getenv("XRDP_VAAPI_DEVICE");
+#if defined(XRDP_ACCEL_HEADLESS)
         int drm_fd;
+        int nvidia;
         struct gbm_device *gbm;
 
-        /* the same render node the encoder opens */
-        drm_fd = g_file_open_ex(dev != NULL ? dev : "/dev/dri/renderD128",
-                                1, 1, 0, 0);
+        /* EGL on the same render node the encoder uses; NVENC on NVIDIA's
+           driver, VA-API on any other */
+        nvidia = render_node_is_nvidia();
+        LOG(LOG_LEVEL_INFO, "headless: render node %s, encoder %s",
+            render_node(), nvidia ? "NVENC" : "VA-API");
+        drm_fd = g_file_open_ex(render_node(), 1, 1, 0, 0);
         gbm = (drm_fd >= 0) ? gbm_create_device(drm_fd) : NULL;
-        if (gbm == NULL || xrdp_accel_assist_x11_init_headless(gbm) != 0)
+        if (gbm == NULL ||
+                xrdp_accel_assist_x11_init_headless(gbm, nvidia) != 0)
         {
             LOG(LOG_LEVEL_ERROR, "headless (dma-buf) init failed");
             return 1;
@@ -1191,7 +1212,8 @@ main(int argc, char **argv)
         LOG(LOG_LEVEL_INFO, "headless: frames arrive as dma-bufs");
         signal_ready();
 #else
-        LOG(LOG_LEVEL_ERROR, "-w needs a build with --enable-vaapi");
+        LOG(LOG_LEVEL_ERROR, "-w needs a build with --enable-vaapi, or "
+            "--enable-nvenc with --enable-wayland");
         return 1;
 #endif
     }

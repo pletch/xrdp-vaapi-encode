@@ -20,6 +20,12 @@ XRDP_EXTRA_LIBS += $(XRDP_VAAPI_LIBS)
 XRDP_EXTRA_SOURCES += xrdp_accel_assist_vaapi.c xrdp_accel_assist_vaapi.h
 endif
 
+if XRDP_ACCEL_HEADLESS
+AM_CPPFLAGS += -DXRDP_ACCEL_HEADLESS
+AM_CPPFLAGS += $(XRDP_ACCEL_GBM_CFLAGS)
+XRDP_EXTRA_LIBS += $(XRDP_ACCEL_GBM_LIBS)
+endif
+
 pkglibexec_PROGRAMS = \
   xrdp-accel-assist
 

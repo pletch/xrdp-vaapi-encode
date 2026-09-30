@@ -519,6 +519,20 @@ fi
 
 AM_CONDITIONAL(XRDP_ACCEL, [test x$enable_accel = xyes])
 
+# The helper's -w mode takes frames as dma-bufs, for the Wayland backend,
+# and needs GBM for its EGL display: built with VA-API, as before, and with
+# any encoder in a Wayland build.
+enable_accel_headless=no
+if test "x$enable_accel" = "xyes"
+then
+  if test "x$enable_vaapi" = "xyes" || test "x$enable_wayland" = "xyes"
+  then
+    enable_accel_headless=yes
+    PKG_CHECK_MODULES(XRDP_ACCEL_GBM, [gbm])
+  fi
+fi
+AM_CONDITIONAL(XRDP_ACCEL_HEADLESS, [test x$enable_accel_headless = xyes])
+
 if test "x$enable_wayland" = "xyes"
 then
 PKG_CHECK_MODULES(XRDP_WAYLAND, [wayland-client gbm libdrm xkbcommon])

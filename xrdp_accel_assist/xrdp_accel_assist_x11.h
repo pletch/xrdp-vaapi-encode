@@ -31,7 +31,7 @@ int
 xrdp_accel_assist_x11_init(void);
 /* Headless: no X display; frames come from dma-bufs (Wayland capture). */
 int
-xrdp_accel_assist_x11_init_headless(void *gbm_device);
+xrdp_accel_assist_x11_init_headless(void *gbm_device, int nvenc);
 int
 xrdp_accel_assist_x11_create_surface(int width, int height, int mon_id);
 int

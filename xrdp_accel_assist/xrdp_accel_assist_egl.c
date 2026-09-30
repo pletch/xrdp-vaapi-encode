@@ -127,12 +127,22 @@ xrdp_accel_assist_inf_egl_init(void)
 
 /*****************************************************************************/
 /* Headless init for a non-X source (Wayland capture): EGL on the GBM
-   platform with a surfaceless context, no X display. */
+   platform with a surfaceless context, no X display. need_export: the
+   encoder takes its input as a dma-buf (VA-API), which needs Mesa's export
+   extension; NVENC takes the GL texture and doesn't. */
 int
-xrdp_accel_assist_inf_egl_init_gbm(void *gbm_device)
+xrdp_accel_assist_inf_egl_init_gbm(void *gbm_device, int need_export)
 {
+    EGLConfig config;
+    EGLint num_config;
     int egl_ver;
     int ok;
+    static const EGLint config_attr[] =
+    {
+        EGL_SURFACE_TYPE, EGL_DONT_CARE,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_NONE
+    };
 
     ok = eglBindAPI(EGL_OPENGL_API);
     LOG(LOG_LEVEL_INFO, "eglBindAPI ok %d", ok);
@@ -151,15 +161,29 @@ xrdp_accel_assist_inf_egl_init_gbm(void *gbm_device)
     LOG(LOG_LEVEL_INFO, "egl_ver %d", egl_ver);
     if ((!xrdp_accel_assist_check_ext("EGL_EXT_image_dma_buf_import")) ||
             (!xrdp_accel_assist_check_ext("EGL_EXT_image_dma_buf_import_modifiers")) ||
-            (!xrdp_accel_assist_check_ext("EGL_MESA_image_dma_buf_export")) ||
-            (!xrdp_accel_assist_check_ext("EGL_KHR_surfaceless_context")) ||
-            (!xrdp_accel_assist_check_ext("EGL_KHR_no_config_context")))
+            (need_export &&
+             !xrdp_accel_assist_check_ext("EGL_MESA_image_dma_buf_export")) ||
+            (!xrdp_accel_assist_check_ext("EGL_KHR_surfaceless_context")))
     {
         LOG(LOG_LEVEL_ERROR, "missing ext");
         eglTerminate(g_egl_display);
         return 1;
     }
-    g_egl_context = eglCreateContext(g_egl_display, EGL_NO_CONFIG_KHR,
+    /* Without EGL_KHR_no_config_context, any OpenGL config will do: the
+       context only ever renders to textures. */
+    config = EGL_NO_CONFIG_KHR;
+    if (!epoxy_has_egl_extension(g_egl_display, "EGL_KHR_no_config_context"))
+    {
+        if (!eglChooseConfig(g_egl_display, config_attr, &config, 1,
+                             &num_config) || num_config < 1)
+        {
+            LOG(LOG_LEVEL_ERROR, "no EGL config for an OpenGL context");
+            eglTerminate(g_egl_display);
+            return 1;
+        }
+        LOG(LOG_LEVEL_INFO, "no EGL_KHR_no_config_context, using a config");
+    }
+    g_egl_context = eglCreateContext(g_egl_display, config,
                                      EGL_NO_CONTEXT, g_create_context_attr);
     LOG(LOG_LEVEL_INFO, "g_egl_context %p", g_egl_context);
     if (g_egl_context == EGL_NO_CONTEXT)

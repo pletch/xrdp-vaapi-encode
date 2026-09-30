@@ -22,7 +22,7 @@
 int
 xrdp_accel_assist_inf_egl_init(void);
 int
-xrdp_accel_assist_inf_egl_init_gbm(void *gbm_device);
+xrdp_accel_assist_inf_egl_init_gbm(void *gbm_device, int need_export);
 int
 xrdp_accel_assist_inf_egl_import_dmabuf(int width, int height,
                                         unsigned int fourcc, int fd,
