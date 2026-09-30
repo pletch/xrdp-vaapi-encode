@@ -39,6 +39,15 @@ enum wlxrdp_cpu_layout
 size_t
 wlxrdp_cpu_bytes(enum wlxrdp_cpu_layout layout, int width, int height);
 
+/* BGR888 (three bytes a pixel, the byte order of XBGR8888) into an
+   XBGR8888 frame of width * 4 bytes a row, over the 64x64 tiles the rects
+   touch, for the converters below. Some GLES2 drivers (NVIDIA's) read back
+   only this. */
+void
+wlxrdp_cpu_expand_bgr888(const uint8_t *src, int src_stride,
+                         uint8_t *dst, int width, int height,
+                         const struct xh_rect *rects, int num_rects);
+
 /* Convert the changed rects of an XRGB8888 frame (XBGR8888 with bgr) into
    out (the full frame in that layout, kept between frames). NV12 and XRGB rewrite rects[] as
    sent (clipped; even-aligned for NV12) and return their count. */

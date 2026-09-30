@@ -57,7 +57,7 @@ struct wla_buffer
 {
     int width;
     int height;
-    uint32_t fourcc;            ///< DRM_FORMAT_XRGB8888 or _XBGR8888
+    uint32_t fourcc;            ///< DRM_FORMAT_XRGB8888, _XBGR8888 or (shm) _BGR888
     int fd;                     ///< dma-buf, else -1
     uint32_t stride;
     uint32_t offset;

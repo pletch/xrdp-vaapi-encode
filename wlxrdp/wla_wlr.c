@@ -151,7 +151,7 @@ struct wlr_mon
     int width;
     int height;
     int have_xrgb;
-    uint32_t shm_format;        /* CPU path: XRGB8888, else XBGR8888; 0 none */
+    uint32_t shm_format;        /* CPU path: XRGB8888, XBGR8888, BGR888; 0 none */
     uint32_t shm_offered[4];    /* what the compositor offered, for the log */
     int num_shm_offered;
     uint64_t *mods;
@@ -812,9 +812,18 @@ session_shm_format(void *data,
     {
         m->shm_offered[m->num_shm_offered++] = format;
     }
-    /* either byte order; GLES2 renderers read back XBGR8888 only */
-    if (format == WL_SHM_FORMAT_XRGB8888 ||
-            (format == WL_SHM_FORMAT_XBGR8888 && m->shm_format == 0))
+    /* either byte order; GLES2 renderers read back XBGR8888 only, and
+       NVIDIA's only BGR888, which the core widens */
+    if (format == WL_SHM_FORMAT_XRGB8888)
+    {
+        m->shm_format = format;
+    }
+    else if (format == WL_SHM_FORMAT_XBGR8888 &&
+             (m->shm_format == 0 || m->shm_format == WL_SHM_FORMAT_BGR888))
+    {
+        m->shm_format = format;
+    }
+    else if (format == WL_SHM_FORMAT_BGR888 && m->shm_format == 0)
     {
         m->shm_format = format;
     }
@@ -993,7 +1002,8 @@ alloc_buf(struct wlr_mon *m, struct buf *bf, int index)
         struct wl_shm_pool *pool;
         int fd;
 
-        bf->shm_stride = m->width * 4;
+        bf->shm_stride = m->shm_format == WL_SHM_FORMAT_BGR888
+                         ? (m->width * 3 + 3) & ~3 : m->width * 4;
         bf->shm_bytes = (size_t) bf->shm_stride * m->height;
         fd = memfd_create("wlxrdp-capture", MFD_CLOEXEC);
         if (fd < 0 || ftruncate(fd, bf->shm_bytes) != 0)
@@ -1890,7 +1900,7 @@ capture_start(struct wlr_mon *m)
         else if (b->wl_shm)
         {
             LOG(LOG_LEVEL_ERROR, "monitor %d: capture session unusable: no "
-                "XRGB8888 or XBGR8888 shm format; offered %d: 0x%08x 0x%08x "
+                "XRGB8888, XBGR8888 or BGR888 shm format; offered %d: 0x%08x 0x%08x "
                 "0x%08x 0x%08x", m->index, m->num_shm_offered,
                 m->shm_offered[0], m->shm_offered[1], m->shm_offered[2],
                 m->shm_offered[3]);
@@ -1920,8 +1930,18 @@ capture_start(struct wlr_mon *m)
         memset(w, 0, sizeof(*w));
         w->width = m->width;
         w->height = m->height;
-        w->fourcc = !b->wl_shm || m->shm_format == WL_SHM_FORMAT_XRGB8888
-                    ? DRM_FORMAT_XRGB8888 : DRM_FORMAT_XBGR8888;
+        if (!b->wl_shm || m->shm_format == WL_SHM_FORMAT_XRGB8888)
+        {
+            w->fourcc = DRM_FORMAT_XRGB8888;
+        }
+        else if (m->shm_format == WL_SHM_FORMAT_BGR888)
+        {
+            w->fourcc = DRM_FORMAT_BGR888;
+        }
+        else
+        {
+            w->fourcc = DRM_FORMAT_XBGR8888;
+        }
         w->fd = m->bufs[i].fd;
         w->stride = m->bufs[i].stride;
         w->offset = m->bufs[i].offset;

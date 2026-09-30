@@ -175,6 +175,52 @@ clip_rect(struct xh_rect *r, int width, int height)
 }
 
 /*****************************************************************************/
+void
+wlxrdp_cpu_expand_bgr888(const uint8_t *src, int src_stride,
+                         uint8_t *dst, int width, int height,
+                         const struct xh_rect *rects, int num_rects)
+{
+    int i;
+    int j;
+    int k;
+
+    for (i = 0; i < num_rects; i++)
+    {
+        struct xh_rect r = rects[i];
+        int x2;
+        int y2;
+
+        /* out to the 64x64 tiles the rect touches: the YUVA converter
+           reads whole tiles, NV12 even-aligned boxes */
+        x2 = (r.x + r.w + 63) & ~63;
+        y2 = (r.y + r.h + 63) & ~63;
+        r.x &= ~63;
+        r.y &= ~63;
+        r.w = x2 - r.x;
+        r.h = y2 - r.y;
+        if (!clip_rect(&r, width, height))
+        {
+            continue;
+        }
+        for (j = r.y; j < r.y + r.h; j++)
+        {
+            const uint8_t *s = src + (size_t) j * src_stride + r.x * 3;
+            uint8_t *d = dst + ((size_t) j * width + r.x) * 4;
+
+            for (k = 0; k < r.w; k++)
+            {
+                d[0] = s[0];
+                d[1] = s[1];
+                d[2] = s[2];
+                d[3] = 0xff;
+                s += 3;
+                d += 4;
+            }
+        }
+    }
+}
+
+/*****************************************************************************/
 size_t
 wlxrdp_cpu_bytes(enum wlxrdp_cpu_layout layout, int width, int height)
 {

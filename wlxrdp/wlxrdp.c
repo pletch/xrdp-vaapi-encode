@@ -119,6 +119,7 @@ struct mon
     size_t cpu_out_bytes;
     uint64_t *cpu_hashes;       /* RFX: one per 64x64 tile */
     int cpu_num_tiles;
+    uint8_t *cpu_in;            /* BGR888 capture expanded to XBGR8888 */
 };
 
 struct be
@@ -647,6 +648,8 @@ cpu_send_frame(struct mon *m, int index, struct xh_rect *rects,
     struct be *b = m->b;
     const struct wla_buffer *bf;
     struct xh_rect *tiles = NULL;
+    const uint8_t *src;
+    int src_stride;
     int bgr;
     void *addr;
     int shm_fd;
@@ -659,15 +662,35 @@ cpu_send_frame(struct mon *m, int index, struct xh_rect *rects,
         return 0;
     }
     bf = m->wb + index;
+    src = bf->shm;
+    src_stride = bf->shm_stride;
     bgr = bf->fourcc == DRM_FORMAT_XBGR8888;
+    if (bf->fourcc == DRM_FORMAT_BGR888)
+    {
+        /* three bytes a pixel: widen what changed, then as XBGR8888 */
+        if (m->cpu_in == NULL)
+        {
+            m->cpu_in = (uint8_t *) calloc((size_t) bf->width * 4,
+                                           bf->height);
+            if (m->cpu_in == NULL)
+            {
+                return 0;
+            }
+        }
+        wlxrdp_cpu_expand_bgr888(bf->shm, bf->shm_stride, m->cpu_in,
+                                 bf->width, bf->height, rects, num_rects);
+        src = m->cpu_in;
+        src_stride = bf->width * 4;
+        bgr = 1;
+    }
     switch (b->cpu_layout)
     {
         case WLXRDP_CPU_NV12:
-            n = wlxrdp_cpu_nv12(bf->shm, bf->shm_stride, bgr, m->cpu_out,
+            n = wlxrdp_cpu_nv12(src, src_stride, bgr, m->cpu_out,
                                 bf->width, bf->height, rects, num_rects);
             break;
         case WLXRDP_CPU_XRGB:
-            n = wlxrdp_cpu_xrgb(bf->shm, bf->shm_stride, bgr, m->cpu_out,
+            n = wlxrdp_cpu_xrgb(src, src_stride, bgr, m->cpu_out,
                                 bf->width, bf->height, rects, num_rects);
             break;
         default:
@@ -677,7 +700,7 @@ cpu_send_frame(struct mon *m, int index, struct xh_rect *rects,
             {
                 return 0;
             }
-            n = wlxrdp_cpu_yuvalp(bf->shm, bf->shm_stride, bgr, m->cpu_out,
+            n = wlxrdp_cpu_yuvalp(src, src_stride, bgr, m->cpu_out,
                                   bf->width, bf->height, rects, num_rects,
                                   m->cpu_hashes, force,
                                   tiles, m->cpu_num_tiles);
@@ -1948,6 +1971,8 @@ core_buffers(void *core, int mon, int n, const struct wla_buffer *bufs)
     m->cpu_out = NULL;
     free(m->cpu_hashes);
     m->cpu_hashes = NULL;
+    free(m->cpu_in);
+    m->cpu_in = NULL;
     if (n > 0 && b->cpu)
     {
         /* CPU path: the frame in the capture code's layout */
