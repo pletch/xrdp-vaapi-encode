@@ -310,6 +310,16 @@ PULSE_SCRIPT=@sesmansysconfdir@/pulse/default.pa
 ;XRDP_VAAPI_BITRATE=5000
 ; Render node to encode on, when the default pick is wrong.
 ;XRDP_VAAPI_DEVICE=/dev/dri/renderD128
+; NVENC (--enable-nvenc). Constant QP by default, 28 for the main view and
+; 18 for the AVC444 auxiliary view; XRDP_NVENC_QP takes effect with the
+; CONSTQP mode set. NV_ENC_PARAMS_RC_VBR with XRDP_NVENC_AVERAGE_BITRATE
+; (bit/s) switches to VBR, where rate control picks both views' QPs.
+;XRDP_NVENC_RATE_CONTROL_MODE=NV_ENC_PARAMS_RC_CONSTQP
+;XRDP_NVENC_QP=28
+;XRDP_NVENC_AUX_QP=18
+; Write the NVENC stream to <prefix>.h264 with a per-picture index, for
+; checking it offline. Stops at 64 MB.
+;XRDP_NVENC_DUMP_STREAM=/tmp/nvdump
 ;
 ; Audio. The drift corrector in chansrv fires when the wave-confirm round trip
 ; grows 250 ms beyond the best ever seen, which catches a round trip that
