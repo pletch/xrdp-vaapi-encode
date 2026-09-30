@@ -31,6 +31,6 @@ xrdp_accel_assist_nvenc_delete_encoder(struct enc_info *ei);
 enum encoder_result
 xrdp_accel_assist_nvenc_encode(struct enc_info *ei, int tex,
                                void *cdata, int *cdata_bytes,
-                               int flags);
+                               int flags, int idr_pic_id);
 
 #endif

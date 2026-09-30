@@ -34,10 +34,10 @@ enum encoder_result
 xrdp_accel_assist_vaapi_encode_dual(struct enc_info *ei,
                                     void *cdata1, int *cdata1_bytes,
                                     void *cdata2, int *cdata2_bytes,
-                                    int flags);
+                                    int flags, int idr_pic_id);
 enum encoder_result
 xrdp_accel_assist_vaapi_encode(struct enc_info *ei, int tex,
                                void *cdata, int *cdata_bytes,
-                               int flags);
+                               int flags, int idr_pic_id);
 
 #endif
