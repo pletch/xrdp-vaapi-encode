@@ -545,6 +545,12 @@ then
   AC_MSG_ERROR([wayland-scanner not found])
 fi
 # PNG for the Wayland clipboard's images (without it, BMP only)
+# libXcursor: where the compositor can't give wlxrdp the cursor, it sends
+# the theme's arrow at the session's scale
+PKG_CHECK_MODULES(XRDP_WAYLAND_XCURSOR, [xcursor],
+  [AC_DEFINE([XRDP_WAYLAND_XCURSOR], [1],
+             [wlxrdp sends a scaled theme arrow when it can't capture the cursor])],
+  [AC_MSG_WARN([libXcursor not found: where wlxrdp can't capture the cursor, the client shows its own])])
 PKG_CHECK_MODULES(XRDP_WAYLAND_PNG, [libpng],
   [AC_DEFINE([XRDP_WAYLAND_PNG], [1],
              [chansrv's Wayland clipboard converts PNG])],

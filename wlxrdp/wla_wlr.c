@@ -64,6 +64,9 @@
 #include "os_calls.h"
 #include "string_calls.h"
 #include "log.h"
+#if defined(XRDP_WAYLAND_XCURSOR)
+#include <X11/Xcursor/Xcursor.h>
+#endif
 #include "wla.h"
 
 /* capture buffers per monitor: the core holds the newest (full-frame
@@ -119,6 +122,7 @@ struct cursor
     int entered;                /* the pointer is on this output */
     uint32_t *image;            /* last captured image, buf_w x buf_h */
     int have_image;
+    int fixed;                  /* image is the theme's arrow, no capture */
     /* A hotspot change waits (briefly) for its image, so the client never
        gets the new hotspot on the old shape. */
     int hot_pending;
@@ -1231,7 +1235,10 @@ cursor_active(struct wlr *b)
     {
         struct cursor *c = &b->mons[i].cur_ptr;
 
-        if (b->mons[i].session != NULL && c->entered)
+        /* a fixed arrow follows the pointer, which no session reports */
+        if (b->mons[i].session != NULL &&
+                (c->entered || (c->fixed && (b->ptr_mon == b->mons + i ||
+                                             (b->ptr_mon == NULL && i == 0)))))
         {
             return c;
         }
@@ -1752,6 +1759,10 @@ wlr_motion(void *a, int x, int y, int width, int height)
     }
     x = x < m->x ? m->x : x >= m->x + m->want_w ? m->x + m->want_w - 1 : x;
     y = y < m->y ? m->y : y >= m->y + m->want_h ? m->y + m->want_h - 1 : y;
+    if (b->ptr_mon != m)
+    {
+        b->cursor_dirty = 1; /* a fixed arrow moves to this monitor */
+    }
     b->ptr_mon = m;
     b->ptr_x = x;
     b->ptr_y = y;
@@ -1923,6 +1934,56 @@ open_gbm(struct wlr *b, const struct wlr_mon *m)
 }
 
 /*****************************************************************************/
+/* No cursor capture: the theme's arrow at the monitor's scale, for the
+   client to draw. It moves at once but keeps its shape. Returns 1 when
+   there is none (no libXcursor, or no theme). */
+static int
+cursor_load_arrow(struct wlr_mon *m)
+{
+#if defined(XRDP_WAYLAND_XCURSOR)
+    static const char *names[] = { "left_ptr", "default", "arrow" };
+    struct cursor *c = &m->cur_ptr;
+    const char *env = g_getenv("XCURSOR_SIZE");
+    XcursorImage *img = NULL;
+    int size;
+    unsigned int i;
+
+    size = env != NULL ? g_atoi(env) : 0;
+    size = (size > 0 ? size : 24) * m->scale / 100;
+    for (i = 0; i < sizeof(names) / sizeof(names[0]) && img == NULL; i++)
+    {
+        img = XcursorLibraryLoadImage(names[i], g_getenv("XCURSOR_THEME"),
+                                      size);
+    }
+    if (img == NULL)
+    {
+        return 1;
+    }
+    c->image = (uint32_t *) malloc((size_t) img->width * img->height * 4);
+    if (c->image == NULL)
+    {
+        XcursorImageDestroy(img);
+        return 1;
+    }
+    /* XcursorPixel is premultiplied ARGB, as a captured cursor */
+    memcpy(c->image, img->pixels, (size_t) img->width * img->height * 4);
+    c->buf_w = (int) img->width;
+    c->buf_h = (int) img->height;
+    c->hot_x = (int) img->xhot;
+    c->hot_y = (int) img->yhot;
+    c->have_image = 1;
+    c->fixed = 1;
+    XcursorImageDestroy(img);
+    m->b->cursor_dirty = 1;
+    LOG(LOG_LEVEL_INFO, "monitor %d: no cursor capture; the client draws "
+        "the theme's arrow, %dx%d", m->index, c->buf_w, c->buf_h);
+    return 0;
+#else
+    return 1;
+#endif
+}
+
+/*****************************************************************************/
 static int
 capture_start(struct wlr_mon *m)
 {
@@ -1945,15 +2006,26 @@ capture_start(struct wlr_mon *m)
     m->have_dev = 0;
     /* The cursor goes to the client as the RDP pointer, from its own
        capture. A compositor that can't give it as ARGB8888 (wlroots' GLES2
-       renderer on NVIDIA reads back BGR888 only) paints it into the frames
-       instead, and the client's pointer is hidden: it moves at the frame
-       rate, but has the session's size and shape. */
+       renderer on NVIDIA reads back BGR888 only) leaves the client to draw
+       the theme's arrow at the session's scale: it moves at once, but keeps
+       its shape. WLXRDP_PAINT_CURSOR=1 has the compositor paint it into the
+       frames instead, with the client's pointer hidden: the session's
+       shapes, but moving at the frame rate. */
     if (!b->paint_cursors && cursor_start(m) != 0)
     {
-        LOG(LOG_LEVEL_WARNING, "monitor %d: no cursor capture; the "
-            "compositor paints the cursor into the frames", m->index);
         cursor_stop(m);
-        b->paint_cursors = 1;
+        if (g_getenv("WLXRDP_PAINT_CURSOR") != NULL &&
+                g_strcmp(g_getenv("WLXRDP_PAINT_CURSOR"), "0") != 0)
+        {
+            LOG(LOG_LEVEL_INFO, "monitor %d: no cursor capture; the "
+                "compositor paints the cursor into the frames", m->index);
+            b->paint_cursors = 1;
+        }
+        else if (cursor_load_arrow(m) != 0)
+        {
+            LOG(LOG_LEVEL_WARNING, "monitor %d: no cursor capture, and no "
+                "theme arrow: the client shows its own pointer", m->index);
+        }
     }
     source = ext_output_image_capture_source_manager_v1_create_source(
                  b->source_mgr, m->output);

@@ -6,7 +6,8 @@ AM_CPPFLAGS = \
   -DXRDP_LIBEXEC_PATH=\"${pkglibexecdir}\" \
   -I$(top_srcdir)/common \
   -I$(top_srcdir)/xrdp_accel_assist \
-  $(XRDP_WAYLAND_CFLAGS)
+  $(XRDP_WAYLAND_CFLAGS) \
+  $(XRDP_WAYLAND_XCURSOR_CFLAGS)
 
 pkglibexec_PROGRAMS = \
   wlxrdp
@@ -40,7 +41,8 @@ wlxrdp_SOURCES = \
 
 wlxrdp_LDADD = \
   $(top_builddir)/common/libcommon.la \
-  $(XRDP_WAYLAND_LIBS)
+  $(XRDP_WAYLAND_LIBS) \
+  $(XRDP_WAYLAND_XCURSOR_LIBS)
 
 # the compositor contract; the wlroots protocols, from wlr-protocols /
 # wlroots (MIT)
