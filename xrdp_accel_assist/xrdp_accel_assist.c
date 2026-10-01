@@ -35,6 +35,12 @@
 #include "xrdp_accel_assist.h"
 #include "xrdp_accel_assist_x11.h"
 
+#if defined(HAVE_SYS_PRCTL_H)
+#include <sys/prctl.h>
+#include <signal.h>
+#include <unistd.h>
+#endif
+
 #if defined(XRDP_VAAPI)
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -1063,6 +1069,29 @@ vaapi_init_without_x(void)
 #endif
 
 /*****************************************************************************/
+/* Die with the process that started us (Xorg, or wlxrdp). The kernel
+   delivers it, so it works where nothing in the helper could notice: a
+   helper whose X server aborted mid-frame was left asleep on a lock in the
+   GL or encoder library for hours, holding an encoder session. */
+static void
+die_with_parent(void)
+{
+#if defined(HAVE_SYS_PRCTL_H) && defined(PR_SET_PDEATHSIG)
+    pid_t parent = getppid();
+
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0)
+    {
+        return;
+    }
+    /* the parent may have gone before the call */
+    if (getppid() != parent)
+    {
+        _exit(1);
+    }
+#endif
+}
+
+/*****************************************************************************/
 int
 main(int argc, char **argv)
 {
@@ -1076,6 +1105,7 @@ main(int argc, char **argv)
     int timeout;
     struct xorgxrdp_info xi;
 
+    die_with_parent();
     if (argc < 2)
     {
         g_writeln("need to pass -d");
