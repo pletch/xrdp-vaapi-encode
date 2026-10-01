@@ -1305,9 +1305,14 @@ xrdp_accel_assist_x11_run_shader(int left, int top, int width, int height,
     }
     else
     {
+        /* In the target's geometry, not the surface's: AVC444 v2 encodes
+           at the 16-aligned width and v1 at the 16-aligned height, so
+           scaling by the surface size drew each rect up to 8 pixels off
+           its place towards the right edge, leaving columns of it stale. */
         vertices = mi->get_vertices(&vertices_bytes, &vertices_pointes,
-                                    num_crects, crects,
-                                    left, top, width, height);
+                                    num_crects, crects, left, top,
+                                    mi->enc_w > 0 ? mi->enc_w : width,
+                                    pad_h > 0 ? pad_h : height);
     }
     if (vertices == NULL)
     {
