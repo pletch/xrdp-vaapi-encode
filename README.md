@@ -86,7 +86,8 @@ Tested on Ubuntu 26.04 with labwc 0.9.3 (wlroots 0.19), sway 1.11, XFCE 4.20 and
 wayland-protocols 1.47. Needed to build: `wayland-client`, `wayland-protocols`
 >= 1.39 (`ext-image-copy-capture`, `ext-data-control`), `wayland-scanner`, `gbm`,
 `libdrm`, `xkbcommon`; optional: `json-c` (RemoteApp), `libpng` (PNG clipboard
-images), `libfuse3` (files and drives). At run time: `labwc`, `wlr-randr`, and
+images), `libfuse3` (files and drives), `libxcursor` (a scaled pointer where
+the cursor can't be captured; see NVIDIA below). At run time: `labwc`, `wlr-randr`, and
 `sway` for RemoteApp. The compositor must offer `ext-image-copy-capture`; otherwise
 wlxrdp refuses to start and logs the protocols it needs.
 
@@ -117,6 +118,7 @@ the AVC444 and QP settings in **Tuning** below). Wayland adds:
 | `WLXRDP_ACCEL` | on | `0` takes the CPU path (xrdp encodes) |
 | `WLXRDP_AVC420` | unset | set: AVC420 even for AVC444 clients (half the decode work; see the mstsc known issue) |
 | `WLXRDP_DRM` | the compositor's device | overrides the GBM device for the capture buffers |
+| `WLXRDP_PAINT_CURSOR` | unset | `1`: where the cursor can't be captured, the compositor paints it into the frames (the session's shapes, but moving at the frame rate) instead of the client drawing the theme's arrow |
 | `WLXRDP_DEBUG` | unset | debug logging |
 
 A user's own desktop command goes in `~/.config/xrdp/waylandsession`
@@ -297,7 +299,7 @@ exec dbus-run-session -- startxfce4
 | xorgxrdp configure | `--enable-glamor` | `--enable-glamor --enable-lrandr` |
 | Xorg config | `xrdp/xorg.conf` (xrdpdev) | a copy of `xrdp/xorg_nvidia.conf` with your `BusID` |
 | AVC420 / AVC444 | both | both (AVC444 needs two long-term reference frames, which the helper checks for) |
-| Wayland sessions (`feature/wayland`) | GPU encoding | CPU encoding (the Wayland helper needs VA-API) |
+| Wayland sessions (`feature/wayland`) | GPU encoding | GPU encoding (NVENC; see below) |
 
 For NVIDIA:
 
@@ -328,6 +330,20 @@ For NVIDIA:
       sleep 0.1; i=$((i+1))
   done
   ```
+
+Wayland sessions on NVIDIA (`--enable-nvenc --enable-wayland`):
+
+* The helper picks NVENC by the render node's driver, and takes the GL
+  texture as on Xorg. labwc and its capture work on the proprietary driver
+  (tested with 595 and labwc 0.9.3).
+* Keep labwc on its OpenGL renderer (the default). With `WLR_RENDERER=vulkan`
+  it gives a captured cursor, but doesn't report all the damage: parts of the
+  screen stay stale until something redraws them.
+* On OpenGL, NVIDIA's driver reads pixels back only as BGR888, with no alpha:
+  the CPU path widens it, but the cursor can't be captured. wlxrdp then sends
+  the cursor theme's arrow at the session's scale (with `libxcursor`), which
+  the client draws: it moves at once, but stays an arrow. `WLXRDP_PAINT_CURSOR=1`
+  trades that for the real shapes, painted into the frames.
 
 **Checking that the GPU is doing the work:**
 
