@@ -1739,9 +1739,10 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
     }
     ei->frameCount++;
 
+    /* vaapi_finish() returns this, deferred or not */
+    ei->pending_rv[view] = rv;
     if (defer)
     {
-        ei->pending_rv[view] = rv;
         return rv;
     }
     return vaapi_finish(ei, flags, cdata, cdata_bytes);
