@@ -522,7 +522,10 @@ Many of these work on some or all of Windows, Mac OS, iOS, and/or Android.
 
 RDP transport is encrypted using TLS by default.
 
-![demo](https://github.com/neutrinolabs/xrdp/raw/gh-pages/xrdp_demo.gif)
+![Modern xrdp login followed by a successful connection to an Xfce desktop](docs/images/lvgl-demo.gif)
+
+The demo shows the [optional LVGL login interface](docs/lvgl.md).
+The legacy login remains the default.
 
 ## Features
 
@@ -650,3 +653,6 @@ xrdp
 ├── xrdpvr ······ API for playing media over RDP
 └── xup ········· xorgxrdp client module
 ```
+
+An optional modern pre-session interface is available with the system LVGL
+library. See [LVGL login UI](docs/lvgl.md) for build requirements and configuration.
