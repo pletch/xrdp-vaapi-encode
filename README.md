@@ -18,7 +18,8 @@ plus experimental **Wayland sessions**:
   and RemoteApp (over sway). Built with `--enable-wayland`; Xorg sessions are
   unchanged.
 * **[VA-API hardware H.264 encoding](#fork-intel-vaapi-hardware-h264-encoding-ffmpeg-free)**
-  with AVC444 - the `xrdp_accel_assist` encoder both session types use.
+  with AVC444 - the `xrdp_accel_assist` encoder both session types use; on
+  NVIDIA, the same helper encodes with NVENC, AVC444 included.
 
 The VA-API work alone is on `feature/vaapi-accel-assist`.
 
@@ -26,21 +27,21 @@ The VA-API work alone is on `feature/vaapi-accel-assist`.
 
 This branch (`feature/wayland`) adds **Wayland sessions** on top of the VA-API
 encoder described below: log in and get a desktop running on a Wayland
-compositor instead of Xorg, encoded by the same `xrdp_accel_assist` VA-API helper
-(AVC420 or AVC444). It is experimental and off unless built with
+compositor instead of Xorg, encoded by the same `xrdp_accel_assist` helper
+(AVC420 or AVC444; VA-API, or NVENC on NVIDIA). It is experimental and off unless built with
 `--enable-wayland`; Xorg sessions are unchanged.
 
 **Pipeline:** a headless [labwc](https://labwc.github.io/) compositor (wlroots)
 runs the desktop (XFCE, or any session you choose). `wlxrdp`, a new backend,
 plays xorgxrdp's part on the xup socket: it captures each output with
 `ext-image-copy-capture` into GBM dma-bufs and hands them to accel-assist in its
-headless mode (`-w`), which runs the same RGB->NV12 / AVC444 shaders and VA-API
-encoder as for Xorg. Input goes back through the compositor's virtual keyboard
+headless mode (`-w`), which runs the same RGB->NV12 / AVC444 shaders and encoder
+(VA-API, or NVENC on NVIDIA) as for Xorg. Input goes back through the compositor's virtual keyboard
 and pointer. X11 applications run under Xwayland.
 
 ```
 labwc output --ext-image-copy-capture--> GBM dma-buf --> xrdp_accel_assist -w
-  (shader, VA-API) --> xrdp --> client
+  (shader, VA-API or NVENC) --> xrdp --> client
 client input --> xrdp --> wlxrdp --> zwp_virtual_keyboard / zwlr_virtual_pointer --> labwc
 ```
 
