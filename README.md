@@ -166,7 +166,7 @@ exec dbus-run-session -- startxfce4
 | xorgxrdp configure | `--enable-glamor` | `--enable-glamor --enable-lrandr` |
 | Xorg config | `xrdp/xorg.conf` (xrdpdev) | a copy of `xrdp/xorg_nvidia.conf` with your `BusID` |
 | AVC420 / AVC444 | both | both (AVC444 needs two long-term reference frames, which the helper checks for) |
-| Wayland sessions (`feature/wayland`) | GPU encoding | CPU encoding (the Wayland helper needs VA-API) |
+| Wayland sessions (`feature/wayland`) | GPU encoding | GPU encoding (NVENC; see that branch's README) |
 
 For NVIDIA:
 
