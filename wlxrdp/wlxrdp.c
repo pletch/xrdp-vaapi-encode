@@ -1673,7 +1673,12 @@ static void
 choose_path(struct be *b)
 {
     b->codec_id = 0x000B;
-    if (b->ci.gfx_avc444 > 0 && g_getenv("WLXRDP_AVC420") == NULL)
+    /* XRDP_ACCEL_AVC444=0 forces AVC420 for Xorg sessions (xorgxrdp) and
+       sets the helper up without the aux view, so it must here too, or every
+       AVC444 frame fails in the helper. */
+    if (b->ci.gfx_avc444 > 0 && g_getenv("WLXRDP_AVC420") == NULL &&
+            !(g_getenv("XRDP_ACCEL_AVC444") != NULL &&
+              g_strcmp(g_getenv("XRDP_ACCEL_AVC444"), "0") == 0))
     {
         b->codec_id = (b->ci.gfx_avc444 >= 2) ? 0x000F : 0x000E;
     }
