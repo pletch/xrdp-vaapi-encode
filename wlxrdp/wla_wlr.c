@@ -172,6 +172,10 @@ struct wlr_mon
     int cur;                    /* buffer the pending frame captures into */
     int last_ready;             /* newest complete buffer, -1 if none */
     struct xh_rect rects[MAX_RECTS];
+    /* painted cursor: where the last frame had it (monitor pixels) */
+    int pc_x;
+    int pc_y;
+    int pc_valid;
     int num_rects;
     int frame_state;            /* 0 none, 1 pending, 2 ready, 3 failed */
 
@@ -210,6 +214,9 @@ struct wlr
     int wl_shm;                 /* capture into shm (the CPU path) */
     int cursor_dirty;           /* an image or hotspot came */
     int paint_cursors;          /* no cursor capture: frames carry it */
+    struct wlr_mon *ptr_mon;    /* the pointer's monitor, and its place */
+    int ptr_x;
+    int ptr_y;
     int capturing;              /* between start and stop */
 };
 
@@ -913,6 +920,61 @@ static void
 frame_transform(void *data, struct ext_image_copy_capture_frame_v1 *frame,
                 uint32_t transform)
 {
+}
+
+/*****************************************************************************/
+/* add a rect to the frame's damage, clipped to the monitor */
+static void
+damage_add(struct wlr_mon *m, int x, int y, int width, int height)
+{
+    struct xh_rect *r;
+    int x2 = x + width > m->width ? m->width : x + width;
+    int y2 = y + height > m->height ? m->height : y + height;
+
+    x = x < 0 ? 0 : x;
+    y = y < 0 ? 0 : y;
+    if (x2 <= x || y2 <= y)
+    {
+        return;
+    }
+    if (m->num_rects >= MAX_RECTS)
+    {
+        m->num_rects = 1;
+        m->rects[0].x = 0;
+        m->rects[0].y = 0;
+        m->rects[0].w = m->width;
+        m->rects[0].h = m->height;
+        return;
+    }
+    r = m->rects + m->num_rects++;
+    r->x = x;
+    r->y = y;
+    r->w = x2 - x;
+    r->h = y2 - y;
+}
+
+/*****************************************************************************/
+/* Painted cursor: the compositor draws it into the copy without damage, so
+   the frame's damage gains the cursor where it was and where it is. The
+   box runs 64 logical pixels before the hotspot and 128 after, to hold any
+   theme's cursor whatever its hotspot. */
+static void
+damage_painted_cursor(struct wlr_mon *m)
+{
+    struct wlr *b = m->b;
+    int s = 64 * m->scale / 100;
+
+    if (m->pc_valid)
+    {
+        damage_add(m, m->pc_x - s, m->pc_y - s, s * 3, s * 3);
+    }
+    m->pc_valid = b->ptr_mon == m;
+    if (m->pc_valid)
+    {
+        m->pc_x = b->ptr_x - m->x;
+        m->pc_y = b->ptr_y - m->y;
+        damage_add(m, m->pc_x - s, m->pc_y - s, s * 3, s * 3);
+    }
 }
 
 /*****************************************************************************/
@@ -1690,6 +1752,9 @@ wlr_motion(void *a, int x, int y, int width, int height)
     }
     x = x < m->x ? m->x : x >= m->x + m->want_w ? m->x + m->want_w - 1 : x;
     y = y < m->y ? m->y : y >= m->y + m->want_h ? m->y + m->want_h - 1 : y;
+    b->ptr_mon = m;
+    b->ptr_x = x;
+    b->ptr_y = y;
     lx = m->lx + (x - m->x) * 100.0 / m->scale;
     ly = m->ly + (y - m->y) * 100.0 / m->scale;
     /* in 1/16ths of a logical pixel, so a scaled monitor keeps every
@@ -2074,6 +2139,10 @@ on_frame_done(struct wlr_mon *m)
     m->last_ready = m->cur;
     m->bufs[m->cur].held = 1;
     m->wanted = 0;
+    if (m->b->paint_cursors)
+    {
+        damage_painted_cursor(m);
+    }
     m->b->ev->frame(m->b->core, m->index, m->cur, m->rects, m->num_rects);
 }
 
