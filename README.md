@@ -65,6 +65,12 @@ Not yet: multitouch (xrdp has no MS-RDPEI; a client may still turn touch into
 mouse input on its own), GNOME (Mutter) or KDE (KWin) sessions, and Wayfire (its
 0.11 release has the capture protocol but needs wlroots 0.20).
 
+Known issue (XFCE 4.20 on labwc): rebooting or shutting down from XFCE's
+logout dialog asks for a password, but the prompt takes no typing. The
+logout dialog seems to keep the keyboard, and cancelling ends the session,
+since XFCE has already begun to close it. `xfce4-session-logout --reboot`
+from a terminal, which skips the dialog, or `sudo systemctl reboot`, works.
+
 **Compositor adapters.** wlxrdp's core knows RDP (the xup protocol, pacing, the
 helper, the keyboard); an adapter (`wlxrdp/wla.h`) knows one family of
 compositors. `wla_wlr.c` drives wlroots compositors through standard protocols:
