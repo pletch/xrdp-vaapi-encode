@@ -35,10 +35,12 @@ void main(void)\n\
     gl_FragColor = texture2D(tex, gl_FragCoord.xy / tex_size);\n\
 }\n";
 
-/* Four bytes per fragment, as in the MV shader below; 2x2 chroma mean. */
+/* Four bytes per fragment, as in the MV shader below; 2x2 chroma mean.
+   pad_h: the Y/UV boundary row of the target. */
 static const GLchar g_fs_rgb_to_yuv420[] = "\
 uniform sampler2D tex;\n\
 uniform vec2 tex_size;\n\
+uniform float pad_h;\n\
 uniform vec4 ymath;\n\
 uniform vec4 umath;\n\
 uniform vec4 vmath;\n\
@@ -55,7 +57,7 @@ void main(void)\n\
     float sy;\n\
     bx = floor(gl_FragCoord.x) * 4.0;\n\
     y = gl_FragCoord.y;\n\
-    if (y < tex_size.y)\n\
+    if (y < pad_h)\n\
     {\n\
         p0 = texture2D(tex, vec2(bx + 0.5, y) / tex_size); p0.a = 1.0;\n\
         p1 = texture2D(tex, vec2(bx + 1.5, y) / tex_size); p1.a = 1.0;\n\
@@ -67,7 +69,7 @@ void main(void)\n\
     }\n\
     else\n\
     {\n\
-        sy = floor(y - tex_size.y) * 2.0 + 0.5;\n\
+        sy = floor(y - pad_h) * 2.0 + 0.5;\n\
         ca = texture2D(tex, vec2(bx + 0.5, sy) / tex_size)\n\
            + texture2D(tex, vec2(bx + 1.5, sy) / tex_size)\n\
            + texture2D(tex, vec2(bx + 0.5, sy + 1.0) / tex_size)\n\
@@ -332,6 +334,7 @@ the source are clamped and never read.
 static const GLchar g_fs_rgb_to_yuv420_av_v2[] = "\
 uniform sampler2D tex;\n\
 uniform vec2 tex_size;\n\
+uniform float pad_h;\n\
 uniform vec4 umath;\n\
 uniform vec4 vmath;\n\
 void main(void)\n\
@@ -362,7 +365,7 @@ void main(void)\n\
         base = bx - x1;\n\
         m = vmath;\n\
     }\n\
-    if (y < tex_size.y)\n\
+    if (y < pad_h)\n\
     {\n\
         sx = base * 2.0 + 1.5;\n\
         sy = y;\n\
@@ -370,7 +373,7 @@ void main(void)\n\
     else\n\
     {\n\
         sx = base * 2.0 + 0.5;\n\
-        sy = floor(y - tex_size.y) * 2.0 + 1.5;\n\
+        sy = floor(y - pad_h) * 2.0 + 1.5;\n\
     }\n\
     p0 = texture2D(tex, vec2(sx,       sy) / tex_size); p0.a = 1.0;\n\
     p1 = texture2D(tex, vec2(sx + 2.0, sy) / tex_size); p1.a = 1.0;\n\

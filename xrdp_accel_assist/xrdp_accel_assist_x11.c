@@ -200,6 +200,8 @@ struct mon_info
     int enc_w;                    /* encode width; 16-aligned for v2 */
     int enc_w4;                   /* enc_w / 4: the packed viewport width */
     int pad_h;                    /* encode height; == height for v2 */
+    int buf_h;                    /* the target's Y plane rows: UV starts
+                                     here. VA-API: pad_h 16-aligned */
     int avc444_frame_count;
 };
 
@@ -658,7 +660,7 @@ get_vertices_av_v2(struct mon_info *mi, GLuint *vertices_bytes,
     }
     x1 = ((mi->width + 15) / 16) * 8;
     fw = mi->enc_w4;
-    fh = mi->pad_h * 3 / 2;
+    fh = mi->buf_h * 3 / 2;
     nquads = 0;
     for (index = 0; index < num_crects; index++)
     {
@@ -670,8 +672,8 @@ get_vertices_av_v2(struct mon_info *mi, GLuint *vertices_bytes,
 
         rows[0][0] = r->y;
         rows[0][1] = r->y + r->h;
-        rows[1][0] = mi->pad_h + r->y / 2;
-        rows[1][1] = mi->pad_h + (r->y + r->h + 1) / 2 + 1;
+        rows[1][0] = mi->buf_h + r->y / 2;
+        rows[1][1] = mi->buf_h + (r->y + r->h + 1) / 2 + 1;
         cols[0] = 0;
         cols[1] = x1;
         for (quad = 0; quad < 4; quad++)
@@ -993,17 +995,24 @@ xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
            2.2.4.4.2); v2 needs none. */
         mi->pad_h = (mi->avc444 && !mi->avc444_v2)
                     ? ((height + 15) & ~15) : height;
+        /* The UV plane at a 16-aligned row: the Intel VA-API drivers read
+           it there whatever offset the import names, so at a height that
+           isn't a multiple of 16 the chroma was read 2 rows down (shifted
+           up on screen, the bottom rows zero, i.e. green), or the picture
+           was refused. The encoder still codes pad_h rows and the SPS
+           crops to them. */
+        mi->buf_h = (g_enc == ENC_VA) ? ((mi->pad_h + 15) & ~15) : mi->pad_h;
         /* RGBA8 over a quarter-width viewport: four bytes per fragment.
            Same bytes as the R8 view, so the exported dma-buf is unchanged. */
         mi->enc_w4 = (mi->enc_w + 3) / 4;
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, mi->enc_w4,
-                     mi->pad_h * 3 / 2, 0,
+                     mi->buf_h * 3 / 2, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, NULL);
         mi->get_vertices = get_vertices420;
         mi->viewport.x = 0;
         mi->viewport.y = 0;
         mi->viewport.w = mi->enc_w4;
-        mi->viewport.h = mi->pad_h * 3 / 2;
+        mi->viewport.h = mi->buf_h * 3 / 2;
     }
     else
     {
@@ -1012,6 +1021,8 @@ xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
         mi->tex_format = XH_YUV444;
         mi->enc_w = width;
         mi->enc_w4 = width;
+        mi->pad_h = height;
+        mi->buf_h = height;
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
                      GL_RGBA, GL_UNSIGNED_INT_8_8_8_8, NULL);
         mi->get_vertices = get_vertices444;
@@ -1039,7 +1050,7 @@ xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         /* Packed four bytes to a fragment, like the main view. */
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, mi->enc_w4,
-                     mi->pad_h * 3 / 2, 0,
+                     mi->buf_h * 3 / 2, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, NULL);
         glBindTexture(GL_TEXTURE_2D, 0);
         LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_create_pixmap: "
@@ -1272,8 +1283,7 @@ xrdp_accel_assist_x11_dump_src(int frame, GLuint tex, int width, int height)
 }
 
 /*****************************************************************************/
-/* pad_h: 0 uses mi->height as the Y/UV boundary; >0 sets it for the v1
-   aux surface padded to 16 rows (MS-RDPEGFX 2.2.4.4.2). */
+/* pad_h: the target's Y/UV boundary row (mi->buf_h), 0 for mi->height. */
 static void
 xrdp_accel_assist_x11_run_shader(int left, int top, int width, int height,
                                  struct mon_info *mi,
@@ -1516,14 +1526,14 @@ encode_pixmap(int left, int top, int width, int height,
         si = g_si + XH_SHADERRGB2YUV420MV;
         xrdp_accel_assist_x11_run_shader(left, top, width, height, mi, si,
                                          mi->enc_texture, num_crects, crects,
-                                         mi->pad_h, mi->enc_w4, 0);
+                                         mi->buf_h, mi->enc_w4, 0);
         /* Split the GL time into xorgxrdp's copy and our conversion. */
         xrdp_accel_assist_x11_time_gl(t_copy);
         if (frame_no == 0)
         {
             xrdp_accel_assist_x11_dump_plane("main", frame_no,
                                              mi->enc_texture,
-                                             mi->enc_w4, mi->pad_h * 3 / 2,
+                                             mi->enc_w4, mi->buf_h * 3 / 2,
                                              1);
         }
 
@@ -1592,7 +1602,7 @@ encode_pixmap(int left, int top, int width, int height,
                 xrdp_accel_assist_x11_run_shader(0, 0, width, height,
                                                  mi, si, mi->enc_texture_aux,
                                                  1, &aux_rect,
-                                                 mi->pad_h, mi->enc_w4, 1);
+                                                 mi->buf_h, mi->enc_w4, 1);
                 /* xrdp declares whatever was rendered. */
                 have_aux_rect = 1;
                 aux_x1 = aux_rect.x;
@@ -1604,7 +1614,7 @@ encode_pixmap(int left, int top, int width, int height,
             {
                 xrdp_accel_assist_x11_run_shader(0, 0, width, height, mi, si,
                                                  mi->enc_texture_aux, 1,
-                                                 &full_rect, mi->pad_h,
+                                                 &full_rect, mi->buf_h,
                                                  mi->enc_w4, 0);
             }
             mi->aux_dirty = 0;
@@ -1613,7 +1623,7 @@ encode_pixmap(int left, int top, int width, int height,
                 xrdp_accel_assist_x11_dump_plane("aux", frame_no,
                                                  mi->enc_texture_aux,
                                                  mi->enc_w4,
-                                                 mi->pad_h * 3 / 2, 1);
+                                                 mi->buf_h * 3 / 2, 1);
             }
         }
         XFlush(g_display);
@@ -1720,7 +1730,7 @@ encode_pixmap(int left, int top, int width, int height,
     si = g_si + mi->tex_format % XH_NUM_SHADERS;
     xrdp_accel_assist_x11_run_shader(left, top, width, height, mi, si,
                                      mi->enc_texture, num_crects, crects,
-                                     mi->pad_h, mi->enc_w4, 0);
+                                     mi->buf_h, mi->enc_w4, 0);
     /* flush before encoding, let encoders call glFinish() as needed */
     XFlush(g_display);
     /* encode */
