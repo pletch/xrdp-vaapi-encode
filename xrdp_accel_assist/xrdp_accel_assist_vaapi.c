@@ -783,8 +783,12 @@ xrdp_accel_assist_vaapi_import_surface(struct enc_info *lei, int view)
     VASurfaceAttrib attribs[2];
     int stride;
     VAStatus va_status;
+    int buf_h;
 
     stride = lei->dmabuf_stride[view];
+    /* The UV plane starts at the 16-aligned row (see buf_h in
+       xrdp_accel_assist_x11.c): the drivers read it there. */
+    buf_h = (lei->height + 15) & ~15;
 
     g_memset(&desc, 0, sizeof(desc));
     desc.fourcc = VA_FOURCC_NV12;
@@ -792,7 +796,7 @@ xrdp_accel_assist_vaapi_import_surface(struct enc_info *lei, int view)
     desc.height = lei->height;
     desc.num_objects = 1;
     desc.objects[0].fd = lei->dmabuf_fd[view];
-    desc.objects[0].size = stride * lei->height * 3 / 2;
+    desc.objects[0].size = stride * buf_h * 3 / 2;
     desc.objects[0].drm_format_modifier = XH_DRM_FORMAT_MOD_LINEAR;
     desc.num_layers = 2;
     /* Y plane */
@@ -806,7 +810,7 @@ xrdp_accel_assist_vaapi_import_surface(struct enc_info *lei, int view)
     desc.layers[1].num_planes = 1;
     desc.layers[1].object_index[0] = 0;
     desc.layers[1].offset[0] = lei->dmabuf_offset[view] +
-                               stride * lei->height;
+                               stride * buf_h;
     desc.layers[1].pitch[0] = stride;
 
     g_memset(attribs, 0, sizeof(attribs));
