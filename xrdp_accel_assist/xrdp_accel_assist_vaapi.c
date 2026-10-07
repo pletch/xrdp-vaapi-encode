@@ -1369,6 +1369,7 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
     int is_idr;
     int w_mbs;
     int h_mbs;
+    VAStatus va_status;
     int i;
     int idr_id_used;
     unsigned char sps[256];
@@ -1466,10 +1467,12 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
     {
         ei->t_begin_ms[view] = g_get_elapsed_ms();
     }
-    if (vaBeginPicture(g_va_dpy, ei->context, ei->input_surface[view])
-            != VA_STATUS_SUCCESS)
+    va_status = vaBeginPicture(g_va_dpy, ei->context,
+                               ei->input_surface[view]);
+    if (va_status != VA_STATUS_SUCCESS)
     {
-        LOG(LOG_LEVEL_ERROR, "vaapi: vaBeginPicture failed");
+        LOG(LOG_LEVEL_ERROR, "vaapi: vaBeginPicture failed %d (%s)",
+            va_status, vaErrorStr(va_status));
         return ENCODER_ERROR;
     }
 
@@ -1678,9 +1681,11 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
         goto cleanup_err;
     }
 
-    if (vaEndPicture(g_va_dpy, ei->context) != VA_STATUS_SUCCESS)
+    va_status = vaEndPicture(g_va_dpy, ei->context);
+    if (va_status != VA_STATUS_SUCCESS)
     {
-        LOG(LOG_LEVEL_ERROR, "vaapi: vaEndPicture failed");
+        LOG(LOG_LEVEL_ERROR, "vaapi: vaEndPicture failed %d (%s)",
+            va_status, vaErrorStr(va_status));
         goto cleanup_err;
     }
     for (i = 0; i < ntrack; i++)
