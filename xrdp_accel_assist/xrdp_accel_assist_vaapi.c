@@ -979,6 +979,11 @@ xrdp_accel_assist_vaapi_import_plane(struct enc_info *lei, int view,
             (const char *) &fourcc, width, rows, modifier, eglGetError());
         return 1;
     }
+    /* Clear errors left by earlier calls (glEnable(GL_TEXTURE_2D) is one
+       in a core profile context), so the check below sees only ours. */
+    while (glGetError() != GL_NO_ERROR)
+    {
+    }
     glGenTextures(1, &lei->plane_tex[view][plane]);
     glBindTexture(GL_TEXTURE_2D, lei->plane_tex[view][plane]);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
