@@ -56,8 +56,27 @@ SPS/PPS/slice headers are generated directly - no ffmpeg, no libx264.
 
 ### Building / enabling
 
+**Install the companion xorgxrdp fork as well,**
+[pletch/xorgxrdp-glamor-gbm](https://github.com/pletch/xorgxrdp-glamor-gbm)
+(branch `feature/gbm-dmabuf-hwencode`). Upstream xorgxrdp is not enough for most of
+what this branch does, and where it falls short, it does so quietly:
+
+| you want | with upstream xorgxrdp |
+| -------- | ---------------------- |
+| AVC444 | never negotiated: the session runs AVC420 with no error, even for an AVC444 client |
+| Intel `xe` kernel driver (the default from Lunar Lake and Battlemage on) | glamor does not start, so there is no GPU path ([neutrinolabs/xorgxrdp#423](https://github.com/neutrinolabs/xorgxrdp/pull/423)) |
+| NVIDIA | no RandR 1.5 and no start size: the XFCE desktop stays at 640x480 or the first client's size (see **Which setup for which GPU** below) |
+| AVC420 on `i915` or AMD | not tested here; use the fork |
+
 ```
 ./configure --enable-rfxcodec --enable-x264 --enable-vaapi   # needs libva-dev, libva-drm-dev
+```
+
+and in the xorgxrdp fork:
+
+```
+git clone -b feature/gbm-dmabuf-hwencode https://github.com/pletch/xorgxrdp-glamor-gbm
+cd xorgxrdp-glamor-gbm && ./bootstrap && ./configure --enable-glamor && make && sudo make install
 ```
 
 Enable per session in `sesman.ini` `[SessionVariables]` with `XRDP_USE_ACCEL_ASSIST=1`
@@ -84,11 +103,12 @@ vaapi_init: using H.264 High/EncSliceLP (profile_idc 100, 8x8 transform on)
 
 The DRM node defaults to `/dev/dri/renderD128`; on a multi-GPU host set
 `XRDP_VAAPI_DEVICE` (and xorgxrdp's matching `DRMDevice` / `XORGXRDP_DRM_DEVICE`) to
-the same GPU. **Requires the companion
-[pletch/xorgxrdp-glamor-gbm](https://github.com/pletch/xorgxrdp-glamor-gbm) fork**: it
-carries the xorgxrdp side of the AVC444 negotiation, which has to match this branch
-(xorgxrdp decides from the client info xrdp sends whether AVC444 is in effect), and
-FlyGoat's glamor/DRI3 fixes that make glamor work on the Intel `xe` kernel driver
+the same GPU.
+
+Why the xorgxrdp fork is needed: it carries the xorgxrdp side of the AVC444
+negotiation, which has to match this branch (xorgxrdp decides from the client info
+xrdp sends whether AVC444 is in effect, and tells the helper), and FlyGoat's
+glamor/DRI3 fixes that make glamor work on the Intel `xe` kernel driver
 ([neutrinolabs/xorgxrdp#423](https://github.com/neutrinolabs/xorgxrdp/pull/423)).
 
 ### Installing from source: layout and common snags
@@ -217,6 +237,7 @@ For NVIDIA:
 | *waitforx: Unable to find any RandR outputs* | NVIDIA driver without xorgxrdp `--enable-lrandr` |
 | *No devices detected*, then `/dev/tty0` fatal | wrong `BusID` in the NVIDIA Xorg config |
 | wallpaper only in a 640x480 corner, or doesn't follow a reconnect at another size | NVIDIA path with upstream xorgxrdp (RandR 1.3): update the xorgxrdp fork, or restart xfdesktop |
+| AVC444 client, but the session runs AVC420 | upstream xorgxrdp instead of the fork (no *(AVC444 ... negotiated)* line in `~/.xorgxrdp.*.log`), a client that doesn't advertise AVC444 (FreeRDP without `/gfx:AVC444`), or `XRDP_ACCEL_AVC444=0` |
 | no *hardware encoding active* line | `XRDP_USE_ACCEL_ASSIST` unset, no x264/OpenH264 in the build, or (NVIDIA) the xrdpdev `xorg.conf` |
 | bash: *!dev: event not found* when pasting a command | history expansion on `!` inside double quotes; use single quotes |
 
@@ -236,6 +257,12 @@ persistent corruption that looks like a chroma bug but is not.
 * **Capability negotiation**: xrdp derives AVC444 support from the client's
   advertised EGFX capability set (MS-RDPEGFX 2.2.3) and falls back to AVC420 on
   its own, so `XRDP_ACCEL_AVC444=1` is safe to leave enabled for mixed clients.
+  AVC444 also needs the xorgxrdp fork, which passes the negotiated result to the
+  helper; with upstream xorgxrdp the session stays on AVC420. The fork logs the
+  outcome in `~/.xorgxrdp.<display>.log`: *rdpSendAccelAssistMonitors:
+  capabilities ... (AVC444 v2 negotiated)*, or *not negotiated*. The client has
+  to advertise it as well: current mstsc does by default, FreeRDP with
+  `/gfx:AVC444`.
   The confirmed capability version also picks the chroma layout: 10.2 and later
   get v2, a bare 10.0 client is held to v1. There is no capability flag
   separating the two layouts - the whole set is `THINCLIENT`, `SMALL_CACHE`,
