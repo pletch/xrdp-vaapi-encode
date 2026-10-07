@@ -40,6 +40,10 @@ xrdp_accel_assist_x11_set_caps(int caps);
 int
 xrdp_accel_assist_x11_avc444_v2(void);
 int
+xrdp_accel_assist_x11_mon_avc444_v2(int mon_id);
+int
+xrdp_accel_assist_x11_encoder_avc444_v2(void);
+int
 xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
                                     int con_id, int mon_id);
 enum encoder_result

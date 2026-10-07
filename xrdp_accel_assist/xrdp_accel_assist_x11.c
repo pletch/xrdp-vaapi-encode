@@ -795,6 +795,25 @@ xrdp_accel_assist_x11_avc444_enabled(void)
 }
 
 /*****************************************************************************/
+/* The layout of the encoder being created (set before each create_enc). */
+static int g_create_v2 = 0;
+
+int
+xrdp_accel_assist_x11_encoder_avc444_v2(void)
+{
+    return g_create_v2;
+}
+
+/*****************************************************************************/
+/* Whether a monitor's surface uses the v2 layout: the session's choice,
+   unless its width rules v2 out (see create_encode_surface). */
+int
+xrdp_accel_assist_x11_mon_avc444_v2(int mon_id)
+{
+    return g_mons[mon_id % MAX_MON].avc444_v2;
+}
+
+/*****************************************************************************/
 /* ChromaV1 (0x000E) or ChromaV2 (0x000F) for the aux view. v2 compresses
    better: its row mapping is the identity, where v1 alternates U and V
    rows in groups of eight.
@@ -987,6 +1006,18 @@ xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
         mi->idr_pending = 0;
         mi->avc444 = xrdp_accel_assist_x11_avc444_enabled();
         mi->avc444_v2 = mi->avc444 && xrdp_accel_assist_x11_avc444_v2();
+        /* v2 splits the aux view into U and V halves. At a 16-aligned
+           width of an odd number of macroblocks the clients disagree on
+           where: FreeRDP at half that width, mstsc at half the coded width
+           (and it drops a picture whose width is an odd number of
+           macroblocks). v1 has no split, so it serves such a surface. */
+        if (mi->avc444_v2 && (((width + 15) / 16) & 1) != 0)
+        {
+            LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_create_pixmap: "
+                "width %d is an odd number of macroblocks; AVC444v1 for this "
+                "monitor", width);
+            mi->avc444_v2 = 0;
+        }
         /* v2 splits the aux plane into U and V halves at half the
            16-aligned width (FreeRDP's nTotalWidth; mstsc agrees), so encode
            at the aligned width. Clients copy only the surface width. */
@@ -1058,6 +1089,7 @@ xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
             mi->avc444_v2 ? "v2" : "v1", mi->enc_w, mi->pad_h, width, height);
     }
 
+    g_create_v2 = mi->avc444_v2;
     if (g_enc_funcs[g_enc].create_enc(mi->enc_w, mi->pad_h,
                                       enc_texture, mi->enc_texture_aux,
                                       mi->tex_format,
@@ -1753,6 +1785,7 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
     if (mi->ei == NULL)
     {
         /* its re-creation after a failure failed: try again */
+        g_create_v2 = mi->avc444_v2;
         if (mi->enc_w <= 0 ||
                 g_enc_funcs[g_enc].create_enc(mi->enc_w, mi->pad_h,
                                               mi->enc_texture,
@@ -1785,6 +1818,7 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
         {
             g_enc_funcs[g_enc].destroy_enc(mi->ei);
             mi->ei = NULL;
+            g_create_v2 = mi->avc444_v2;
             if (g_enc_funcs[g_enc].create_enc(mi->enc_w, mi->pad_h,
                                               mi->enc_texture,
                                               mi->enc_texture_aux,

@@ -922,7 +922,7 @@ xrdp_accel_assist_vaapi_create_encoder(int width, int height, int tex,
        chroma in 16-row groups, so filtering smooths across false edges;
        v2 holds a coherent U|V chroma image, which deblocks normally. */
     lei->deblock_view[0] = 1;
-    lei->deblock_view[1] = xrdp_accel_assist_x11_avc444_v2();
+    lei->deblock_view[1] = xrdp_accel_assist_x11_encoder_avc444_v2();
 
     qp_str = g_getenv("XRDP_VAAPI_TIMING");
     lei->timing = (qp_str != NULL && g_atoi(qp_str) != 0);
