@@ -783,17 +783,28 @@ xrdp_accel_assist_vaapi_import_surface(struct enc_info *lei, int view)
     VASurfaceAttrib attribs[2];
     int stride;
     VAStatus va_status;
+    int buf_w;
     int buf_h;
 
     stride = lei->dmabuf_stride[view];
-    /* The UV plane starts at the 16-aligned row (see buf_h in
-       xrdp_accel_assist_x11.c): the drivers read it there. */
+    /* Declare the surface at the coded size, 16-aligned, which the
+       buffer has room for: the UV plane starts at the 16-aligned row (see
+       buf_h in xrdp_accel_assist_x11.c) and the pitch covers the aligned
+       width. iHD fails vaEndPicture when an external surface is smaller
+       than the coded size (intel/media-driver#738), and at a height that
+       isn't a multiple of 16 its encoder was seen reading the UV plane
+       from the aligned row. The SPS crops to the true size. */
+    buf_w = (lei->width + 15) & ~15;
+    if (buf_w > stride)
+    {
+        buf_w = lei->width;
+    }
     buf_h = (lei->height + 15) & ~15;
 
     g_memset(&desc, 0, sizeof(desc));
     desc.fourcc = VA_FOURCC_NV12;
-    desc.width = lei->width;
-    desc.height = lei->height;
+    desc.width = buf_w;
+    desc.height = buf_h;
     desc.num_objects = 1;
     desc.objects[0].fd = lei->dmabuf_fd[view];
     desc.objects[0].size = stride * buf_h * 3 / 2;
@@ -824,13 +835,13 @@ xrdp_accel_assist_vaapi_import_surface(struct enc_info *lei, int view)
     attribs[1].value.value.p = &desc;
 
     va_status = vaCreateSurfaces(g_va_dpy, VA_RT_FORMAT_YUV420,
-                                 lei->width, lei->height,
+                                 buf_w, buf_h,
                                  &lei->input_surface[view], 1,
                                  attribs, 2);
     if (va_status != VA_STATUS_SUCCESS)
     {
-        LOG(LOG_LEVEL_ERROR, "vaapi: vaCreateSurfaces(import) failed %d",
-            va_status);
+        LOG(LOG_LEVEL_ERROR, "vaapi: vaCreateSurfaces(import) %dx%d "
+            "failed %d (%s)", buf_w, buf_h, va_status, vaErrorStr(va_status));
         return 1;
     }
     return 0;

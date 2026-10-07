@@ -1026,12 +1026,12 @@ xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
            2.2.4.4.2); v2 needs none. */
         mi->pad_h = (mi->avc444 && !mi->avc444_v2)
                     ? ((height + 15) & ~15) : height;
-        /* The UV plane at a 16-aligned row: the Intel VA-API drivers read
-           it there whatever offset the import names, so at a height that
-           isn't a multiple of 16 the chroma was read 2 rows down (shifted
-           up on screen, the bottom rows zero, i.e. green), or the picture
-           was refused. The encoder still codes pad_h rows and the SPS
-           crops to them. */
+        /* The UV plane at a 16-aligned row, as VA-API encoders allocate
+           their surfaces. At a height that isn't a multiple of 16, iHD's
+           encoder was seen reading the UV plane from the aligned row
+           although the import named the true one: the chroma came 2 rows
+           down (shifted up on screen, the bottom rows zero, i.e. green).
+           The encoder still codes pad_h rows and the SPS crops to them. */
         mi->buf_h = (g_enc == ENC_VA) ? ((mi->pad_h + 15) & ~15) : mi->pad_h;
         /* RGBA8 over a quarter-width viewport: four bytes per fragment.
            Same bytes as the R8 view, so the exported dma-buf is unchanged. */
