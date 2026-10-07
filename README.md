@@ -178,6 +178,14 @@ unset DBUS_SESSION_BUS_ADDRESS
 exec dbus-run-session -- startxfce4
 ```
 
+**Intel `xe` in a VM with GPU passthrough: turn off runtime power
+management.** Otherwise the card can be suspended while the session is using
+it, and sessions turn sluggish or freeze. A udev rule keeps it powered:
+
+```
+ACTION=="add|bind", SUBSYSTEM=="pci", DRIVER=="xe", ATTR{power/control}="on"
+```
+
 **Which setup for which GPU:**
 
 | | Intel / AMD (VA-API) | NVIDIA (NVENC) |
@@ -234,6 +242,7 @@ For NVIDIA:
 | *Only console users are allowed to run the X server* | `param=Xorg` in `sesman.ini`; use `/usr/lib/xorg/Xorg` |
 | *X server could not be started*, no `~/.xorgxrdp.*.log` | as above, or a `make install` reset `sesman.ini` |
 | *Session failed immediately* / *window manager exited quickly* | the same user logged in locally: separate D-Bus bus |
+| sessions sluggish or frozen (Intel `xe`, VM passthrough) | GPU runtime-suspended: set `power/control=on` (udev rule above) |
 | *waitforx: Unable to find any RandR outputs* | NVIDIA driver without xorgxrdp `--enable-lrandr` |
 | *No devices detected*, then `/dev/tty0` fatal | wrong `BusID` in the NVIDIA Xorg config |
 | wallpaper only in a 640x480 corner, or doesn't follow a reconnect at another size | NVIDIA path with upstream xorgxrdp (RandR 1.3): update the xorgxrdp fork, or restart xfdesktop |
