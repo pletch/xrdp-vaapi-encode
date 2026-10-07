@@ -147,10 +147,13 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
     {
         codec_id = 0x000E;
     }
-    /* The codec id follows the helper's aux layout: 0x000E v1, 0x000F v2. */
-    if (codec_id == 0x000E && xrdp_accel_assist_x11_avc444_v2())
+    /* The codec id follows the monitor's aux layout: 0x000E v1, 0x000F v2.
+       Either may arrive: xorgxrdp asks for 0x000E, wlxrdp for what the
+       client offers. */
+    if (codec_id == 0x000E || codec_id == 0x000F)
     {
-        codec_id = 0x000F;
+        codec_id = xrdp_accel_assist_x11_mon_avc444_v2(surface_id)
+                   ? 0x000F : 0x000E;
     }
     LOG_DEVEL(LOG_LEVEL_INFO, "gfx_wiretosurface1: surface_id %d codec_id %d "
               "pixel_format %d flags %d",
