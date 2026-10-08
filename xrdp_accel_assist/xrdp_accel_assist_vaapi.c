@@ -618,81 +618,11 @@ xrdp_accel_assist_vaapi_probe(VAProfile profile, VAEntrypoint entrypoint,
 }
 
 /*****************************************************************************/
-/* The shaders' output reaches the encoder as a dma-buf, which only works
-   (or only works well) within one GPU. Compare the render node EGL is on
-   with the one libva opened. They can differ when XRDP_VAAPI_DEVICE names
-   another GPU, or when xorgxrdp doesn't pass its device and glamor is not
-   on renderD128. */
-#ifndef EGL_DRM_RENDER_NODE_FILE_EXT
-#define EGL_DRM_RENDER_NODE_FILE_EXT 0x3377
-#endif
-
-/* The GPU behind a DRM device number: its sysfs device directory, which
-   a card node and its render node share. */
+/* Open VA-API on dev and pick the H.264 profile/entrypoint, into the
+   globals. On failure the globals are left closed. */
 static int
-xrdp_accel_assist_vaapi_gpu_of(dev_t rdev, char *gpu, int bytes)
+xrdp_accel_assist_vaapi_open(const char *dev)
 {
-    char path[128];
-
-    g_snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/device",
-               major(rdev), minor(rdev));
-    if (bytes < PATH_MAX || realpath(path, gpu) == NULL)
-    {
-        return 1;
-    }
-    return 0;
-}
-
-static void
-xrdp_accel_assist_vaapi_check_gl_device(void)
-{
-    EGLAttrib attr;
-    const char *gl_node;
-    struct stat gl_st;
-    struct stat va_st;
-    char gl_gpu[PATH_MAX];
-    char va_gpu[PATH_MAX];
-
-    if (g_egl_display == EGL_NO_DISPLAY || g_drm_fd < 0)
-    {
-        return;
-    }
-    attr = 0;
-    gl_node = NULL;
-    if (epoxy_has_egl_extension(EGL_NO_DISPLAY, "EGL_EXT_device_query") &&
-            eglQueryDisplayAttribEXT(g_egl_display, EGL_DEVICE_EXT, &attr) &&
-            attr != 0)
-    {
-        gl_node = eglQueryDeviceStringEXT((EGLDeviceEXT) attr,
-                                          EGL_DRM_RENDER_NODE_FILE_EXT);
-    }
-    if (gl_node == NULL || stat(gl_node, &gl_st) != 0 ||
-            fstat(g_drm_fd, &va_st) != 0 ||
-            xrdp_accel_assist_vaapi_gpu_of(gl_st.st_rdev, gl_gpu,
-                                           sizeof(gl_gpu)) != 0 ||
-            xrdp_accel_assist_vaapi_gpu_of(va_st.st_rdev, va_gpu,
-                                           sizeof(va_gpu)) != 0)
-    {
-        LOG(LOG_LEVEL_INFO, "vaapi: cannot tell which GPU GL renders on; "
-            "assuming the encoder's (%s)", xrdp_accel_assist_render_node());
-        return;
-    }
-    if (g_strcmp(gl_gpu, va_gpu) != 0)
-    {
-        LOG(LOG_LEVEL_WARNING, "vaapi: GL renders on %s but the encoder is on "
-            "%s; the frames cross between GPUs, which can fail or be slow. "
-            "Point XRDP_VAAPI_DEVICE at %s, or unset it", gl_node,
-            xrdp_accel_assist_render_node(), gl_node);
-        return;
-    }
-    LOG(LOG_LEVEL_INFO, "vaapi: GL and the encoder share %s", gl_node);
-}
-
-/*****************************************************************************/
-int
-xrdp_accel_assist_vaapi_init(void)
-{
-    char *dev;
     int major;
     int minor;
     int index;
@@ -701,14 +631,6 @@ xrdp_accel_assist_vaapi_init(void)
     int attribs_ok;
     VAStatus va_status;
 
-    if (g_va_dpy != NULL)
-    {
-        /* Already up: the helper starts it before connecting to X. Now
-           that EGL is too, check they share a GPU. */
-        xrdp_accel_assist_vaapi_check_gl_device();
-        return 0;
-    }
-    dev = (char *) xrdp_accel_assist_render_node();
     g_drm_fd = g_file_open_ex(dev, 1, 1, 0, 0);
     if (g_drm_fd < 0)
     {
@@ -785,6 +707,144 @@ xrdp_accel_assist_vaapi_init(void)
         "8x8 transform %s)", g_va_candidates[best].name, g_profile_idc,
         g_transform_8x8 ? "on" : "off");
     return 0;
+}
+
+#ifndef EGL_DRM_RENDER_NODE_FILE_EXT
+#define EGL_DRM_RENDER_NODE_FILE_EXT 0x3377
+#endif
+
+/*****************************************************************************/
+/* The GPU behind a DRM device number: its sysfs device directory, which
+   a card node and its render node share. */
+static int
+xrdp_accel_assist_vaapi_gpu_of(dev_t rdev, char *gpu, int bytes)
+{
+    char path[128];
+
+    g_snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/device",
+               major(rdev), minor(rdev));
+    if (bytes < PATH_MAX || realpath(path, gpu) == NULL)
+    {
+        return 1;
+    }
+    return 0;
+}
+
+/*****************************************************************************/
+/* GL renders on gl_node but the encoder was opened elsewhere: on the GPU
+   XRDP_VAAPI_DEVICE names, or on renderD128 when the session passed no
+   device (an older xorgxrdp). The frames would have to cross
+   between GPUs: between separate cards the import fails and the session
+   never comes up; between functions of one GPU it works but gains
+   nothing. So encode on GL's GPU instead, if it can encode H.264, before
+   any encoder exists. If it can't, keep the configured device, which is
+   then the only way to encode at all. */
+static void
+xrdp_accel_assist_vaapi_switch_to(const char *gl_node)
+{
+    VADisplay old_dpy = g_va_dpy;
+    int old_fd = g_drm_fd;
+    VAProfile old_profile = g_va_profile;
+    VAEntrypoint old_entrypoint = g_va_entrypoint;
+    int old_idc = g_profile_idc;
+    int old_8x8 = g_transform_8x8;
+
+    g_va_dpy = NULL;
+    g_drm_fd = -1;
+    if (xrdp_accel_assist_vaapi_open(gl_node) == 0)
+    {
+        vaTerminate(old_dpy);
+        g_file_close(old_fd);
+        if (g_getenv("XRDP_VAAPI_DEVICE") != NULL)
+        {
+            LOG(LOG_LEVEL_WARNING, "vaapi: GL renders on %s but "
+                "XRDP_VAAPI_DEVICE names %s, another GPU; encoding on %s "
+                "instead, since frames cannot reliably cross between GPUs. "
+                "Unset XRDP_VAAPI_DEVICE, or point it at %s", gl_node,
+                xrdp_accel_assist_render_node(), gl_node, gl_node);
+        }
+        else
+        {
+            LOG(LOG_LEVEL_INFO, "vaapi: GL renders on %s, not on %s, "
+                "where the encoder started (the session did not say which "
+                "GPU it uses); encoding on %s", gl_node,
+                xrdp_accel_assist_render_node(), gl_node);
+        }
+        return;
+    }
+    g_va_dpy = old_dpy;
+    g_drm_fd = old_fd;
+    g_va_profile = old_profile;
+    g_va_entrypoint = old_entrypoint;
+    g_profile_idc = old_idc;
+    g_transform_8x8 = old_8x8;
+    LOG(LOG_LEVEL_WARNING, "vaapi: GL renders on %s, which cannot encode "
+        "H.264, and the encoder is on %s; the frames cross between GPUs, "
+        "which fails between separate cards", gl_node,
+        xrdp_accel_assist_render_node());
+}
+
+/*****************************************************************************/
+/* The shaders' output reaches the encoder as a dma-buf, which only works
+   within one GPU (between functions of one GPU it works but gains
+   nothing). Compare the render node EGL is on with the one libva opened,
+   and move the encoder to GL's GPU if they differ. They can differ when
+   XRDP_VAAPI_DEVICE names another GPU, or when xorgxrdp doesn't pass its
+   device and glamor is not on renderD128. */
+static void
+xrdp_accel_assist_vaapi_check_gl_device(void)
+{
+    EGLAttrib attr;
+    const char *gl_node;
+    struct stat gl_st;
+    struct stat va_st;
+    char gl_gpu[PATH_MAX];
+    char va_gpu[PATH_MAX];
+
+    if (g_egl_display == EGL_NO_DISPLAY || g_drm_fd < 0)
+    {
+        return;
+    }
+    attr = 0;
+    gl_node = NULL;
+    if (epoxy_has_egl_extension(EGL_NO_DISPLAY, "EGL_EXT_device_query") &&
+            eglQueryDisplayAttribEXT(g_egl_display, EGL_DEVICE_EXT, &attr) &&
+            attr != 0)
+    {
+        gl_node = eglQueryDeviceStringEXT((EGLDeviceEXT) attr,
+                                          EGL_DRM_RENDER_NODE_FILE_EXT);
+    }
+    if (gl_node == NULL || stat(gl_node, &gl_st) != 0 ||
+            fstat(g_drm_fd, &va_st) != 0 ||
+            xrdp_accel_assist_vaapi_gpu_of(gl_st.st_rdev, gl_gpu,
+                                           sizeof(gl_gpu)) != 0 ||
+            xrdp_accel_assist_vaapi_gpu_of(va_st.st_rdev, va_gpu,
+                                           sizeof(va_gpu)) != 0)
+    {
+        LOG(LOG_LEVEL_INFO, "vaapi: cannot tell which GPU GL renders on; "
+            "assuming the encoder's (%s)", xrdp_accel_assist_render_node());
+        return;
+    }
+    if (g_strcmp(gl_gpu, va_gpu) != 0)
+    {
+        xrdp_accel_assist_vaapi_switch_to(gl_node);
+        return;
+    }
+    LOG(LOG_LEVEL_INFO, "vaapi: GL and the encoder share %s", gl_node);
+}
+
+/*****************************************************************************/
+int
+xrdp_accel_assist_vaapi_init(void)
+{
+    if (g_va_dpy != NULL)
+    {
+        /* Already up: the helper starts it before connecting to X. Now
+           that EGL is too, check they share a GPU. */
+        xrdp_accel_assist_vaapi_check_gl_device();
+        return 0;
+    }
+    return xrdp_accel_assist_vaapi_open(xrdp_accel_assist_render_node());
 }
 
 /*****************************************************************************/
