@@ -1636,11 +1636,11 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
     view = (flags & XH_ENC_FLAGS_AUXVIEW) ? 1 : 0;
     qp = ei->qp_view[view];
 
-    /* glFinish, not glFlush: the surface now belongs to libva, and a
-       driver need not wait on the implicit fences GL leaves on a buffer
-       it allocated itself (the GL-allocated buffer it used to import was
-       an external one, which it does wait on). */
-    glFinish();
+    /* glFlush, not glFinish: the dma-buf's implicit sync orders the GL
+       writes before the encode, on a surface libva allocated too. Checked
+       on iHD 26.1.2 (xe) with a slow render each frame and every encoded
+       frame decoded and compared: no stale frames. */
+    glFlush();
 
     w_mbs = (ei->width + 15) / 16;
     h_mbs = (ei->height + 15) / 16;
