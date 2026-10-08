@@ -679,7 +679,7 @@ xrdp_accel_assist_vaapi_check_gl_device(void)
     }
     if (g_strcmp(gl_gpu, va_gpu) != 0)
     {
-        LOG(LOG_LEVEL_ERROR, "vaapi: GL renders on %s but the encoder is on "
+        LOG(LOG_LEVEL_WARNING, "vaapi: GL renders on %s but the encoder is on "
             "%s; the frames cross between GPUs, which can fail or be slow. "
             "Point XRDP_VAAPI_DEVICE at %s, or unset it", gl_node,
             xrdp_accel_assist_render_node(), gl_node);
