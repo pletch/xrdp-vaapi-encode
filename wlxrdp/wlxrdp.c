@@ -827,6 +827,8 @@ helper_start(struct be *b)
     int ready[2];
     const char *path = g_getenv("WLXRDP_ACCEL_ASSIST");
     char exe[256];
+    char gpu[256];
+    int have_gpu;
     pid_t pid;
 
     if (b->helper_pid > 0)
@@ -835,6 +837,22 @@ helper_start(struct be *b)
     }
     g_snprintf(exe, sizeof(exe), "%s",
                path != NULL ? path : XRDP_LIBEXEC_PATH "/xrdp-accel-assist");
+    /* The helper renders and encodes on the compositor's GPU: our frames
+       reach it as dma-bufs from there. Its device is known now, before any
+       capture session could name it. */
+    have_gpu = (b->ops->render_node != NULL &&
+                b->ops->render_node(b->ad, gpu, sizeof(gpu)) == 0);
+    if (have_gpu && g_getenv("XRDP_VAAPI_DEVICE") != NULL)
+    {
+        LOG(LOG_LEVEL_INFO, "the compositor renders on %s; the helper "
+            "would follow it, but XRDP_VAAPI_DEVICE (%s) overrides that",
+            gpu, g_getenv("XRDP_VAAPI_DEVICE"));
+    }
+    else if (have_gpu)
+    {
+        LOG(LOG_LEVEL_INFO, "the compositor renders on %s; the helper "
+            "follows it", gpu);
+    }
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, spair) != 0)
     {
         return 1;
@@ -880,6 +898,10 @@ helper_start(struct be *b)
         g_setenv("XORGXRDP_XRDP_FD", text, 1);
         g_snprintf(text, sizeof(text), "%d", ready[1]);
         g_setenv("XRDP_ACCEL_ASSIST_READY_FD", text, 1);
+        if (have_gpu)
+        {
+            g_setenv("XRDP_ACCEL_ASSIST_DRM_DEVICE", gpu, 1);
+        }
         execl(exe, exe, "-w", (char *) NULL);
         _exit(127);
     }
