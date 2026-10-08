@@ -27,6 +27,10 @@ typedef intptr_t inf_image_t;
    xrdp_accel_assist_yami */
 struct enc_info;
 
+/* The render node to encode (and, headless, render) on; in
+   xrdp_accel_assist.c. */
+const char *
+xrdp_accel_assist_render_node(void);
 int
 xrdp_accel_assist_x11_init(void);
 /* Headless: no X display; frames come from dma-bufs (Wayland capture). */
