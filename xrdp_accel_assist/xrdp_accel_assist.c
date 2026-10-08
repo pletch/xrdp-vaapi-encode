@@ -1023,11 +1023,12 @@ signal_ready(void)
 #if defined(XRDP_VAAPI)
 /*****************************************************************************/
 /* The render node to encode on. XRDP_VAAPI_DEVICE names it outright.
-   Otherwise it is the render node of the GPU the X server renders on, which
-   xorgxrdp passes as XRDP_ACCEL_ASSIST_DRM_DEVICE (the node glamor opened,
-   card or render): the shaders' output reaches the encoder as a dma-buf, so
-   both must be on one GPU. Without either (an xorgxrdp that doesn't pass
-   it), /dev/dri/renderD128, which is also glamor's default. */
+   Otherwise it is the render node of the GPU the session renders on, passed
+   as XRDP_ACCEL_ASSIST_DRM_DEVICE by xorgxrdp (the node glamor opened, card
+   or render) or wlxrdp (the compositor's main device): the frames reach the
+   encoder as dma-bufs, so both must be on one GPU. Without either (an
+   older xorgxrdp or wlxrdp), /dev/dri/renderD128, which is also glamor's
+   default. */
 const char *
 xrdp_accel_assist_render_node(void)
 {
@@ -1058,7 +1059,7 @@ xrdp_accel_assist_render_node(void)
     }
     if (stat(dev, &st) != 0 || !S_ISCHR(st.st_mode))
     {
-        LOG(LOG_LEVEL_WARNING, "render node: the X server's DRM device %s "
+        LOG(LOG_LEVEL_WARNING, "render node: the session's DRM device %s "
             "is not a device; using %s", dev, node);
         return node;
     }
@@ -1084,11 +1085,11 @@ xrdp_accel_assist_render_node(void)
     closedir(dir);
     if (!found)
     {
-        LOG(LOG_LEVEL_WARNING, "render node: the X server's GPU (%s) has "
+        LOG(LOG_LEVEL_WARNING, "render node: the session's GPU (%s) has "
             "none; using %s", dev, node);
         return node;
     }
-    LOG(LOG_LEVEL_INFO, "render node: %s, the X server's GPU (%s)", node,
+    LOG(LOG_LEVEL_INFO, "render node: %s, the session's GPU (%s)", node,
         dev);
     return node;
 }
