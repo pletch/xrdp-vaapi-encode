@@ -45,6 +45,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
+#include <dirent.h>
 #include "xrdp_accel_assist_vaapi.h"
 #endif
 
@@ -1021,19 +1022,90 @@ signal_ready(void)
 
 #if defined(XRDP_VAAPI)
 /*****************************************************************************/
+/* The render node to encode on. XRDP_VAAPI_DEVICE names it outright.
+   Otherwise it is the render node of the GPU the X server renders on, which
+   xorgxrdp passes as XRDP_ACCEL_ASSIST_DRM_DEVICE (the node glamor opened,
+   card or render): the shaders' output reaches the encoder as a dma-buf, so
+   both must be on one GPU. Without either (an xorgxrdp that doesn't pass
+   it), /dev/dri/renderD128, which is also glamor's default. */
+const char *
+xrdp_accel_assist_render_node(void)
+{
+    static char node[64];
+    static int resolved = 0;
+    const char *dev;
+    char path[128];
+    struct stat st;
+    DIR *dir;
+    struct dirent *ent;
+    int found;
+
+    dev = g_getenv("XRDP_VAAPI_DEVICE");
+    if (dev != NULL)
+    {
+        return dev;
+    }
+    if (resolved)
+    {
+        return node;
+    }
+    resolved = 1;
+    g_strncpy(node, "/dev/dri/renderD128", sizeof(node) - 1);
+    dev = g_getenv("XRDP_ACCEL_ASSIST_DRM_DEVICE");
+    if (dev == NULL)
+    {
+        return node;
+    }
+    if (stat(dev, &st) != 0 || !S_ISCHR(st.st_mode))
+    {
+        LOG(LOG_LEVEL_WARNING, "render node: the X server's DRM device %s "
+            "is not a device; using %s", dev, node);
+        return node;
+    }
+    /* A card node and its render node share a device directory in sysfs. */
+    g_snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/device/drm",
+               major(st.st_rdev), minor(st.st_rdev));
+    dir = opendir(path);
+    if (dir == NULL)
+    {
+        LOG(LOG_LEVEL_WARNING, "render node: no %s for %s; using %s", path,
+            dev, node);
+        return node;
+    }
+    found = 0;
+    while (!found && (ent = readdir(dir)) != NULL)
+    {
+        if (g_strncmp(ent->d_name, "renderD", 7) == 0)
+        {
+            g_snprintf(node, sizeof(node), "/dev/dri/%s", ent->d_name);
+            found = 1;
+        }
+    }
+    closedir(dir);
+    if (!found)
+    {
+        LOG(LOG_LEVEL_WARNING, "render node: the X server's GPU (%s) has "
+            "none; using %s", dev, node);
+        return node;
+    }
+    LOG(LOG_LEVEL_INFO, "render node: %s, the X server's GPU (%s)", node,
+        dev);
+    return node;
+}
+
+/*****************************************************************************/
 /* Is the encoder's render node driven by NVIDIA's driver (NVENC, not VA-API)?
    Asked of sysfs, not of the X server: xorgxrdp, which is the X server,
    waits for signal_ready() before it serves us */
 static int
 render_node_is_nvidia(void)
 {
-    const char *dev = g_getenv("XRDP_VAAPI_DEVICE");
     char path[128];
     char link[256];
     struct stat st;
     ssize_t n;
 
-    if (stat(dev != NULL ? dev : "/dev/dri/renderD128", &st) != 0)
+    if (stat(xrdp_accel_assist_render_node(), &st) != 0)
     {
         return 0;
     }
