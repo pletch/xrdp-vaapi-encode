@@ -1216,18 +1216,24 @@ create_encode_surface(struct mon_info *mi, int width, int height)
             mi->avc444_v2 ? "v2" : "v1", mi->enc_w, mi->pad_h, width, height);
     }
 
+    /* Before the encoder: if it fails, encode_pixmap retries it on the
+       next frame, which needs the texture and the size. Set after, a
+       failed first create left the size at 0, so every frame failed the
+       size check even once a retry succeeded, and the retry was handed
+       texture 0. */
+    mi->enc_texture = enc_texture;
+    mi->width = width;
+    mi->height = height;
+
     g_create_v2 = mi->avc444_v2;
     if (g_enc_funcs[g_enc].create_enc(mi->enc_w, mi->pad_h,
                                       enc_texture, mi->enc_texture_aux,
                                       mi->tex_format,
                                       &(mi->ei)) != 0)
     {
+        mi->ei = NULL;
         return 1;
     }
-
-    mi->enc_texture = enc_texture;
-    mi->width = width;
-    mi->height = height;
 
     return 0;
 }
