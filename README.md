@@ -101,9 +101,10 @@ Baseline is not in the list - the stream uses CABAC. The chosen pair is logged:
 vaapi_init: using H.264 High/EncSliceLP (profile_idc 100, 8x8 transform on)
 ```
 
-The DRM node defaults to `/dev/dri/renderD128`; on a multi-GPU host set
-`XRDP_VAAPI_DEVICE` (and xorgxrdp's matching `DRMDevice` / `XORGXRDP_DRM_DEVICE`) to
-the same GPU.
+The encoder runs on the GPU glamor renders on: xorgxrdp's `DRMDevice` (or
+`XORGXRDP_DRM_DEVICE`), which the xorgxrdp fork passes to the helper. Without
+that it is `/dev/dri/renderD128`. `XRDP_VAAPI_DEVICE` overrides it, and the helper
+logs a warning if the GPU it names is not the one GL renders on.
 
 Why the xorgxrdp fork is needed: it carries the xorgxrdp side of the AVC444
 negotiation, which has to match this branch (xorgxrdp decides from the client info
