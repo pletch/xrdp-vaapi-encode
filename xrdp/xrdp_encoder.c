@@ -1033,6 +1033,7 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
            case the aux declares the whole frame. */
         int have_aux_rect = 0;
         struct xrdp_egfx_rect wire_aux_rect;
+        int trailer_pos = 8 + len1 + len2;
 
         g_memset(&wire_aux_rect, 0, sizeof(wire_aux_rect));
         if (len2 > 0)
@@ -1071,6 +1072,58 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
                         wire_aux_rect.y2 = ry2;
                         have_aux_rect = 1;
                     }
+                    trailer_pos = used + XH_AVC444_AUX_RECT_BYTES;
+                }
+            }
+        }
+        /* Optional trailer: the rects that actually changed (the helper's
+           damage detection, see xrdp_accel_assist.h). Declared for both
+           views in place of xorgxrdp's damage, so repainted but unchanged
+           areas are not shown at 4:2:0 again. */
+        struct xrdp_egfx_rect *chg_rects = NULL;
+        int num_chg_rects = 0;
+
+        if (avail - trailer_pos >= XH_AVC444_RECTS_HEAD_BYTES)
+        {
+            const unsigned char *t = d + trailer_pos;
+            unsigned int magic = t[0] | (t[1] << 8) | (t[2] << 16) |
+                                 ((unsigned int) t[3] << 24);
+            unsigned int count = t[4] | (t[5] << 8) | (t[6] << 16) |
+                                 ((unsigned int) t[7] << 24);
+
+            if (magic == XH_AVC444_RECTS_MAGIC && count >= 1 &&
+                    count <= XH_AVC444_RECTS_MAX &&
+                    (int) (XH_AVC444_RECTS_HEAD_BYTES + count * 8) <=
+                    avail - trailer_pos)
+            {
+                chg_rects = g_new0(struct xrdp_egfx_rect, count);
+            }
+            if (chg_rects != NULL)
+            {
+                unsigned int ri;
+
+                t += XH_AVC444_RECTS_HEAD_BYTES;
+                for (ri = 0; ri < count; ri++, t += 8)
+                {
+                    /* From shared memory: clamp. */
+                    int x1 = MIN(t[0] | (t[1] << 8), width);
+                    int y1 = MIN(t[2] | (t[3] << 8), height);
+                    int x2 = MIN(t[4] | (t[5] << 8), width);
+                    int y2 = MIN(t[6] | (t[7] << 8), height);
+
+                    if ((x2 > x1) && (y2 > y1))
+                    {
+                        chg_rects[num_chg_rects].x1 = x1;
+                        chg_rects[num_chg_rects].y1 = y1;
+                        chg_rects[num_chg_rects].x2 = x2;
+                        chg_rects[num_chg_rects].y2 = y2;
+                        num_chg_rects++;
+                    }
+                }
+                if (num_chg_rects == 0)
+                {
+                    g_free(chg_rects);
+                    chg_rects = NULL;
                 }
             }
         }
@@ -1110,6 +1163,11 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
             full.y2 = height;
             meta_rects = d_rects;
             meta_num_rects = num_rects_d;
+            if (chg_rects != NULL)
+            {
+                meta_rects = chg_rects;
+                meta_num_rects = num_chg_rects;
+            }
             align_y = (codec_id == XR_RDPGFX_CODECID_AVC444V2) ? 2 : 16;
 
             out_uint32_le(s, 0); /* cbAvc420EncodedBitstreamInfo, backfilled */
@@ -1122,6 +1180,7 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
                 g_free(s->data);
                 g_free(c_rects);
                 g_free(d_rects);
+                g_free(chg_rects);
                 g_free(crects);
                 return NULL;
             }
@@ -1152,6 +1211,7 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
                     g_free(s->data);
                     g_free(c_rects);
                     g_free(d_rects);
+                    g_free(chg_rects);
                     g_free(crects);
                     return NULL;
                 }
@@ -1173,6 +1233,7 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
 
         g_free(c_rects);
         g_free(d_rects);
+        g_free(chg_rects);
         s_mark_end(s);
         bitmap_data_length = (int) (s->end - s->data);
         if (self->frame_log)

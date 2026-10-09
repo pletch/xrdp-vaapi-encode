@@ -49,6 +49,13 @@ struct xh_rect
    Layout: magic, then x1, y1, x2, y2 as signed 32-bit little-endian. */
 #define XH_AVC444_AUX_RECT_MAGIC 0x52584141  /* "AAXR" */
 #define XH_AVC444_AUX_RECT_BYTES 20
+/* Optional trailer after the aux rect trailer (or after the streams when
+   there is none): the rects that actually changed, which xrdp declares
+   for both views instead of xorgxrdp's damage. u32 magic, u32 count, then
+   count x (u16 x1, y1, x2, y2), all little-endian. */
+#define XH_AVC444_RECTS_MAGIC 0x54434552  /* "RECT" */
+#define XH_AVC444_RECTS_HEAD_BYTES 8
+#define XH_AVC444_RECTS_MAX 4096
 
 /* Session capability bits from xorgxrdp's control batch. */
 #define XH_CAPS_AVC444        (1 << 0)
@@ -58,7 +65,8 @@ enum encoder_result
 {
     INCREMENTAL_FRAME_ENCODED,  /* P frame */
     KEY_FRAME_ENCODED,          /* IDR frame */
-    ENCODER_ERROR
+    ENCODER_ERROR,
+    FRAME_UNCHANGED             /* nothing changed: no frame, no IDR */
 };
 
 #endif

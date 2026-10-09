@@ -225,11 +225,12 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
          codec_id, encoder_flags);
     LOG_DEVEL(LOG_LEVEL_INFO, "gfx_wiretosurface1: rv %d cdata_bytes %d",
               rv, cdata_bytes);
-    if (rv == ENCODER_ERROR)
+    if (rv == ENCODER_ERROR || rv == FRAME_UNCHANGED)
     {
         /* Nothing encoded: forward the frame empty, not the whole shared
            buffer as if it held a picture. xrdp skips an empty pre-encoded
-           frame, and the next is an IDR. */
+           frame. After an error the next frame is an IDR; after
+           FRAME_UNCHANGED (only repainted pixels) nothing was owed. */
         cdata_bytes = 0;
     }
     if (codec_id == 0x000E || codec_id == 0x000F)

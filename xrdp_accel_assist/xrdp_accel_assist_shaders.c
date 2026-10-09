@@ -35,6 +35,35 @@ void main(void)\n\
     gl_FragColor = texture2D(tex, gl_FragCoord.xy / tex_size);\n\
 }\n";
 
+/* Damage detection: one fragment per 16x16 cell of the source, 1.0 in red
+   if any pixel of the cell differs from the copy of the previous frame. */
+static const GLchar g_fs_cell_diff[] = "\
+uniform sampler2D tex;\n\
+uniform sampler2D prev;\n\
+uniform vec2 tex_size;\n\
+void main(void)\n\
+{\n\
+    vec2 base;\n\
+    vec2 p;\n\
+    float diff;\n\
+    base = floor(gl_FragCoord.xy) * 16.0;\n\
+    diff = 0.0;\n\
+    for (int j = 0; j < 16; j++)\n\
+    {\n\
+        for (int i = 0; i < 16; i++)\n\
+        {\n\
+            p = base + vec2(float(i) + 0.5, float(j) + 0.5);\n\
+            if (p.x < tex_size.x && p.y < tex_size.y &&\n\
+                    any(notEqual(texture2D(tex, p / tex_size).rgb,\n\
+                                 texture2D(prev, p / tex_size).rgb)))\n\
+            {\n\
+                diff = 1.0;\n\
+            }\n\
+        }\n\
+    }\n\
+    gl_FragColor = vec4(diff, 0.0, 0.0, 1.0);\n\
+}\n";
+
 /* Four bytes per fragment, as in the MV shader below; 2x2 chroma mean.
    pad_h: the Y/UV boundary row of the target. */
 static const GLchar g_fs_rgb_to_yuv420[] = "\
