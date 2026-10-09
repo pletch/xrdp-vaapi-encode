@@ -272,6 +272,13 @@ PULSE_SCRIPT=@sesmansysconfdir@/pulse/default.pa
 ; separates them and a client that cannot parse codec id 0x000F has no way
 ; to say so. Set to 1 to force v2 or 0 to force v1.
 ;XRDP_ACCEL_AVC444_V2=1
+; A monitor whose width is an odd number of 16-pixel macroblocks (3440,
+; 1680, a resized window) gets v1 by default: at such a width v2's chroma
+; split lands where FreeRDP expects it but not where mstsc does, and mstsc
+; drops the pictures. 1 keeps v2 for every client; auto keeps it only for a
+; client that sends no clientDigProductId, which FreeRDP does not and mstsc
+; does. v2 at those widths gives FreeRDP visibly cleaner coloured text.
+;XRDP_AVC444_V2_ODD_WIDTH=auto
 ; How often the auxiliary chroma picture is sent, in frames. 1 sends it every
 ; frame, which is correct but roughly doubles the encode cost. Higher values
 ; refresh chroma less often; luma still updates every frame, so the cost is
