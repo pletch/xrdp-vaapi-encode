@@ -805,6 +805,18 @@ xrdp_accel_assist_x11_encoder_avc444_v2(void)
 }
 
 /*****************************************************************************/
+/* XRDP_AVC444_V2_ODD_WIDTH=1 keeps AVC444v2 for a monitor whose width is an
+   odd number of macroblocks. Off by default: the v2 layout then suits
+   FreeRDP but not mstsc, which drops such pictures. */
+int
+xrdp_accel_assist_x11_avc444_v2_odd_width(void)
+{
+    const char *env = g_getenv("XRDP_AVC444_V2_ODD_WIDTH");
+
+    return env != NULL && g_atoi(env) != 0;
+}
+
+/*****************************************************************************/
 /* Whether a monitor's surface uses the v2 layout: the session's choice,
    unless its width rules v2 out (see create_encode_surface). */
 int
@@ -1013,10 +1025,22 @@ xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
            macroblocks). v1 has no split, so it serves such a surface. */
         if (mi->avc444_v2 && (((width + 15) / 16) & 1) != 0)
         {
-            LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_create_pixmap: "
-                "width %d is an odd number of macroblocks; AVC444v1 for this "
-                "monitor", width);
-            mi->avc444_v2 = 0;
+            if (xrdp_accel_assist_x11_avc444_v2_odd_width())
+            {
+                /* The layout below splits at half the 16-aligned width,
+                   which is where FreeRDP looks. Only for hosts whose
+                   clients are all FreeRDP: mstsc drops such pictures. */
+                LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_create_pixmap: "
+                    "width %d is an odd number of macroblocks; keeping "
+                    "AVC444v2 (XRDP_AVC444_V2_ODD_WIDTH)", width);
+            }
+            else
+            {
+                LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_create_pixmap: "
+                    "width %d is an odd number of macroblocks; AVC444v1 for "
+                    "this monitor", width);
+                mi->avc444_v2 = 0;
+            }
         }
         /* v2 splits the aux plane into U and V halves at half the
            16-aligned width (FreeRDP's nTotalWidth; mstsc agrees), so encode
