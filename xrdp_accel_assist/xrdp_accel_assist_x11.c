@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -77,8 +78,14 @@ static GC g_gc;
 struct enc_funcs
 {
     int (*init)(void);
+    /* NVENC encodes GL textures it is given. */
     int (*create_enc)(int width, int height, int tex, int tex_aux,
                       int tex_format, struct enc_info **ei);
+    /* VA-API allocates its own surfaces and hands back GL targets over
+       them, one per view. One of the two create calls is NULL. */
+    int (*create_enc_targets)(int width, int height, int nviews,
+                              struct enc_info **ei,
+                              struct xh_enc_target *targets);
     int (*destroy_enc)(struct enc_info *ei);
     /* idr_pic_id: the stream's id for the picture if it is an IDR. The
        count lives here, per monitor, so it survives an encoder rebuild. */
@@ -98,23 +105,25 @@ static struct enc_funcs g_enc_funcs[] =
     {
 #if defined(XRDP_VAAPI)
         xrdp_accel_assist_vaapi_init,
+        NULL,
         xrdp_accel_assist_vaapi_create_encoder,
         xrdp_accel_assist_vaapi_delete_encoder,
         xrdp_accel_assist_vaapi_encode,
         xrdp_accel_assist_vaapi_encode_dual
 #else
-        NULL, NULL, NULL, NULL, NULL
+        NULL, NULL, NULL, NULL, NULL, NULL
 #endif
     },
     {
 #if defined(XRDP_NVENC)
         xrdp_accel_assist_nvenc_init,
         xrdp_accel_assist_nvenc_create_encoder,
+        NULL,
         xrdp_accel_assist_nvenc_delete_encoder,
         xrdp_accel_assist_nvenc_encode,
         xrdp_accel_assist_nvenc_encode_dual
 #else
-        NULL, NULL, NULL, NULL, NULL
+        NULL, NULL, NULL, NULL, NULL, NULL
 #endif
     }
 };
@@ -184,7 +193,13 @@ struct mon_info
     Pixmap pixmap[ACCEL_ASSIST_MAX_BUFFERS];
     inf_image_t inf_image[ACCEL_ASSIST_MAX_BUFFERS];
     GLuint bmp_texture[ACCEL_ASSIST_MAX_BUFFERS];
-    GLuint enc_texture;
+    /* What the shaders draw into, per view: [0] main, [1] AVC444 aux.
+       Owned by the encoder when it allocated them (tgt_from_enc). */
+    struct xh_enc_target tgt[2];
+    int tgt_from_enc;
+    /* The main view's target is blank or stale (a new encoder-owned
+       surface): draw the next one whole, not just its damage. */
+    int full_pending;
     int cur_buf;                  /* capture buffer this frame used */
     /* Damage since the aux view was last rendered, as a bounding box. A
        box, not a region: it only has to be a superset, and one that grows
@@ -211,8 +226,6 @@ struct mon_info
                              int left, int top, int width, int height);
     struct xh_rect viewport;
     struct enc_info *ei;
-    /* AVC444 auxiliary view, set up on first use */
-    GLuint enc_texture_aux;       /* AVC444 auxiliary view, 0 if not enabled */
     int avc444;                   /* both views live in mi->ei, one sequence */
     int avc444_v2;                /* ChromaV2 aux layout (codec id 0x000F) */
     int enc_w;                    /* encode width; 16-aligned for v2 */
@@ -221,6 +234,21 @@ struct mon_info
     int buf_h;                    /* the target's Y plane rows: UV starts
                                      here. VA-API: pad_h 16-aligned */
     int avc444_frame_count;
+    /* Damage detection (see damage_detect): the source as last encoded,
+       a cell map the compare pass renders, and its CPU copy. */
+    GLuint dd_prev_texture;       /* RGBA8, dd_w x dd_h */
+    GLuint dd_mask_texture;       /* R8, dd_w x dd_h: 1.0 where different */
+    GLuint dd_cell_texture;       /* RGBA8, one texel per 16x16 cell */
+    int dd_w;
+    int dd_h;
+    int dd_cells_w;
+    int dd_cells_h;
+    unsigned char *dd_map;        /* dd_cells_w x dd_cells_h RGBA */
+    unsigned char *dd_cand;       /* cells the damage touches */
+    int dd_prev_valid;            /* 0: dd_prev_texture holds nothing */
+    int dd_busy_frames;           /* consecutive frames almost all changed */
+    int dd_bypass;                /* frames left without comparing */
+    int force_aux;                /* send the aux view with the next frame */
 };
 
 #define MAX_MON 16
@@ -241,8 +269,10 @@ static GLuint g_fb = 0;
 #define XH_SHADERRGB2YUV420MV   4
 #define XH_SHADERRGB2YUV420AV   5
 #define XH_SHADERRGB2YUV420AVV2 6
+#define XH_SHADERMASKDIFF       7
+#define XH_SHADERCELLMAX        8
 
-#define XH_NUM_SHADERS 7
+#define XH_NUM_SHADERS 9
 
 struct shader_info
 {
@@ -252,6 +282,9 @@ struct shader_info
     GLint tex_loc;
     GLint tex_size_loc;
     GLint pad_h_loc;       /* only present in the AV (aux) shader; -1 elsewhere */
+    GLint bpf_loc;         /* bytes per fragment, NV12 shaders only */
+    GLint y_off_loc;       /* row offset of the plane drawn, NV12 only */
+    GLint prev_loc;        /* only present in the mask diff shader */
     GLint ymath_loc;
     GLint umath_loc;
     GLint vmath_loc;
@@ -438,6 +471,12 @@ xrdp_accel_assist_gl_init(void)
     vsource[XH_SHADERRGB2YUV420AVV2] = g_vs;
     fsource[XH_SHADERRGB2YUV420AVV2] = g_fs_rgb_to_yuv420_av_v2;
 
+    vsource[XH_SHADERMASKDIFF] = g_vs;
+    fsource[XH_SHADERMASKDIFF] = g_fs_mask_diff;
+
+    vsource[XH_SHADERCELLMAX] = g_vs;
+    fsource[XH_SHADERCELLMAX] = g_fs_cell_max;
+
     for (index = 0; index < XH_NUM_SHADERS; index++)
     {
         g_si[index].vertex_shader = glCreateShader(GL_VERTEX_SHADER);
@@ -470,6 +509,12 @@ xrdp_accel_assist_gl_init(void)
             glGetUniformLocation(g_si[index].program, "tex_size");
         g_si[index].pad_h_loc =
             glGetUniformLocation(g_si[index].program, "pad_h");
+        g_si[index].bpf_loc =
+            glGetUniformLocation(g_si[index].program, "bpf");
+        g_si[index].y_off_loc =
+            glGetUniformLocation(g_si[index].program, "y_off");
+        g_si[index].prev_loc =
+            glGetUniformLocation(g_si[index].program, "prev");
         g_si[index].ymath_loc =
             glGetUniformLocation(g_si[index].program, "ymath");
         g_si[index].umath_loc =
@@ -555,12 +600,17 @@ xrdp_accel_assist_x11_delete_all_pixmaps(void)
 
             g_enc_funcs[g_enc].destroy_enc(mi->ei);
             mi->ei = NULL;
-            glDeleteTextures(1, &(mi->enc_texture));
-            if (mi->enc_texture_aux != 0)
+            if (!mi->tgt_from_enc)
             {
-                glDeleteTextures(1, &(mi->enc_texture_aux));
-                mi->enc_texture_aux = 0;
+                for (buf = 0; buf < 2; buf++)
+                {
+                    if (mi->tgt[buf].tex[0] != 0)
+                    {
+                        glDeleteTextures(1, &(mi->tgt[buf].tex[0]));
+                    }
+                }
             }
+            g_memset(mi->tgt, 0, sizeof(mi->tgt));
             for (buf = 0; buf < ACCEL_ASSIST_MAX_BUFFERS; buf++)
             {
                 glDeleteTextures(1, &(mi->bmp_texture[buf]));
@@ -576,6 +626,22 @@ xrdp_accel_assist_x11_delete_all_pixmaps(void)
                 }
             }
         }
+        if (mi->dd_prev_texture != 0)
+        {
+            glDeleteTextures(1, &(mi->dd_prev_texture));
+            glDeleteTextures(1, &(mi->dd_mask_texture));
+            glDeleteTextures(1, &(mi->dd_cell_texture));
+            mi->dd_prev_texture = 0;
+            mi->dd_mask_texture = 0;
+            mi->dd_cell_texture = 0;
+        }
+        g_free(mi->dd_map);
+        g_free(mi->dd_cand);
+        mi->dd_map = NULL;
+        mi->dd_cand = NULL;
+        mi->dd_w = 0;
+        mi->dd_h = 0;
+        mi->dd_prev_valid = 0;
     }
     return 0;
 }
@@ -1109,18 +1175,27 @@ static int
 create_encode_surface(struct mon_info *mi, int width, int height)
 {
     GLuint enc_texture;
+    GLuint enc_texture_aux;
+    int gl_alloc;
     int buf;
 
     glEnable(GL_TEXTURE_2D);
-    /* texture that gets encoded */
-    glGenTextures(1, &enc_texture);
-    glBindTexture(GL_TEXTURE_2D, enc_texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    /* The texture that gets encoded, unless the encoder allocates its own
+       surfaces and gives us targets over them. */
+    gl_alloc = (g_enc_funcs[g_enc].create_enc_targets == NULL);
+    enc_texture = 0;
+    enc_texture_aux = 0;
+    if (gl_alloc)
+    {
+        glGenTextures(1, &enc_texture);
+        glBindTexture(GL_TEXTURE_2D, enc_texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
     if ((g_enc == ENC_NVENC) || (g_enc == ENC_VA))
     {
-        /* NV12 in a single R8 texture: Y (width x height), then
-           interleaved UV (width x height / 2). */
+        /* NV12: Y (width x height), then interleaved UV (width x
+           height / 2), in one texture or in the encoder's two layers. */
         LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_create_pixmap: "
             "using XH_YUV420");
         mi->tex_format = XH_YUV420;
@@ -1153,19 +1228,20 @@ create_encode_surface(struct mon_info *mi, int width, int height)
            2.2.4.4.2); v2 needs none. */
         mi->pad_h = (mi->avc444 && !mi->avc444_v2)
                     ? ((height + 15) & ~15) : height;
-        /* The UV plane at a 16-aligned row, as VA-API encoders allocate
-           their surfaces. At a height that isn't a multiple of 16, iHD's
-           encoder was seen reading the UV plane from the aligned row
-           although the import named the true one: the chroma came 2 rows
-           down (shifted up on screen, the bottom rows zero, i.e. green).
-           The encoder still codes pad_h rows and the SPS crops to them. */
+        /* The UV plane at a 16-aligned row: VA-API allocates its input
+           surfaces at the 16-aligned size, and the shaders' Y/UV boundary
+           must be the surface's. The encoder still codes pad_h rows and
+           the SPS crops to them. */
         mi->buf_h = (g_enc == ENC_VA) ? ((mi->pad_h + 15) & ~15) : mi->pad_h;
-        /* RGBA8 over a quarter-width viewport: four bytes per fragment.
-           Same bytes as the R8 view, so the exported dma-buf is unchanged. */
+        /* The viewport's width in fragments of four bytes; a plane written
+           fewer bytes a fragment widens it (see run_shader). */
         mi->enc_w4 = (mi->enc_w + 3) / 4;
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, mi->enc_w4,
-                     mi->buf_h * 3 / 2, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        if (gl_alloc)
+        {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, mi->enc_w4,
+                         mi->buf_h * 3 / 2, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        }
         mi->get_vertices = get_vertices420;
         mi->viewport.x = 0;
         mi->viewport.y = 0;
@@ -1181,8 +1257,11 @@ create_encode_surface(struct mon_info *mi, int width, int height)
         mi->enc_w4 = width;
         mi->pad_h = height;
         mi->buf_h = height;
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
-                     GL_RGBA, GL_UNSIGNED_INT_8_8_8_8, NULL);
+        if (gl_alloc)
+        {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
+                         GL_RGBA, GL_UNSIGNED_INT_8_8_8_8, NULL);
+        }
         mi->get_vertices = get_vertices444;
         mi->viewport.x = 0;
         mi->viewport.y = 0;
@@ -1202,15 +1281,18 @@ create_encode_surface(struct mon_info *mi, int width, int height)
     /* AVC444 aux view: same NV12 geometry as the main view. */
     if (mi->avc444)
     {
-        glGenTextures(1, &(mi->enc_texture_aux));
-        glBindTexture(GL_TEXTURE_2D, mi->enc_texture_aux);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        /* Packed four bytes to a fragment, like the main view. */
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, mi->enc_w4,
-                     mi->buf_h * 3 / 2, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        glBindTexture(GL_TEXTURE_2D, 0);
+        if (gl_alloc)
+        {
+            glGenTextures(1, &enc_texture_aux);
+            glBindTexture(GL_TEXTURE_2D, enc_texture_aux);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            /* Packed four bytes to a fragment, like the main view. */
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, mi->enc_w4,
+                         mi->buf_h * 3 / 2, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
         LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_create_pixmap: "
             "AVC444%s enabled, encoding both views at %dx%d (desktop %dx%d)",
             mi->avc444_v2 ? "v2" : "v1", mi->enc_w, mi->pad_h, width, height);
@@ -1221,15 +1303,32 @@ create_encode_surface(struct mon_info *mi, int width, int height)
        failed first create left the size at 0, so every frame failed the
        size check even once a retry succeeded, and the retry was handed
        texture 0. */
-    mi->enc_texture = enc_texture;
     mi->width = width;
     mi->height = height;
 
     g_create_v2 = mi->avc444_v2;
-    if (g_enc_funcs[g_enc].create_enc(mi->enc_w, mi->pad_h,
-                                      enc_texture, mi->enc_texture_aux,
-                                      mi->tex_format,
-                                      &(mi->ei)) != 0)
+    g_memset(mi->tgt, 0, sizeof(mi->tgt));
+    mi->tgt_from_enc = !gl_alloc;
+    /* A new target holds nothing yet. */
+    mi->full_pending = 1;
+    if (gl_alloc)
+    {
+        mi->tgt[0].tex[0] = enc_texture;
+        mi->tgt[0].bpf[0] = 4;
+        mi->tgt[1].tex[0] = enc_texture_aux;
+        mi->tgt[1].bpf[0] = 4;
+        if (g_enc_funcs[g_enc].create_enc(mi->enc_w, mi->pad_h,
+                                          enc_texture, enc_texture_aux,
+                                          mi->tex_format,
+                                          &(mi->ei)) != 0)
+        {
+            mi->ei = NULL;
+            return 1;
+        }
+    }
+    else if (g_enc_funcs[g_enc].create_enc_targets(mi->enc_w, mi->pad_h,
+             mi->avc444 ? 2 : 1,
+             &(mi->ei), mi->tgt) != 0)
     {
         mi->ei = NULL;
         return 1;
@@ -1269,7 +1368,8 @@ save_fb_to_file(int width, int height)
    <dir>/<tag>_<frame>_<w>x<h>.nv12 (h includes the UV plane), for
    checking the shader's packing offline. One frame is dumped. */
 static int
-xrdp_accel_assist_x11_dump_plane(const char *tag, int frame, GLuint tex,
+xrdp_accel_assist_x11_dump_plane(const char *tag, int frame,
+                                 struct xh_enc_target *tgt,
                                  int width, int height, int packed)
 {
     static const char *dump_dir = NULL;
@@ -1297,11 +1397,35 @@ xrdp_accel_assist_x11_dump_plane(const char *tag, int frame, GLuint tex,
         return 1;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, g_fb);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_2D, tex, 0);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, width, height, packed ? GL_RGBA : GL_RED,
-                 GL_UNSIGNED_BYTE, pixels);
+    if (tgt->tex[1] == 0 || !packed)
+    {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, tgt->tex[0], 0);
+        glReadPixels(0, 0, width, height, packed ? GL_RGBA : GL_RED,
+                     GL_UNSIGNED_BYTE, pixels);
+    }
+    else
+    {
+        /* Two planes: read each in its own format into the stacked
+           layout, rows of width * 4 bytes, Y rows then UV rows. */
+        static const GLenum fmt[5] = { 0, GL_RED, GL_RG, 0, GL_RGBA };
+        int y_rows = height * 2 / 3;
+        int plane;
+        int rows;
+        int bpf;
+
+        for (plane = 0; plane < 2; plane++)
+        {
+            bpf = tgt->bpf[plane];
+            rows = (plane == 0) ? y_rows : height - y_rows;
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, tgt->tex[plane], 0);
+            glReadPixels(0, 0, width * 4 / bpf, rows, fmt[bpf <= 4 ? bpf : 4],
+                         GL_UNSIGNED_BYTE,
+                         pixels + (plane == 0 ? 0 : y_rows * width * 4));
+        }
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     g_snprintf(filename, sizeof(filename) - 1, "%s/%s_%4.4d_%dx%d.nv12",
                dump_dir, tag, frame, packed ? width * 4 : width, height);
@@ -1448,11 +1572,18 @@ xrdp_accel_assist_x11_dump_src(int frame, GLuint tex, int width, int height)
 }
 
 /*****************************************************************************/
-/* pad_h: the target's Y/UV boundary row (mi->buf_h), 0 for mi->height. */
+/* pad_h: the target's Y/UV boundary row (mi->buf_h), 0 for mi->height.
+   The vertices and the shaders see one target of pad_h * 3 / 2 rows, Y
+   then UV. A target split into two planes gets two draws over the same
+   vertices: the Y plane, then the UV plane with the viewport moved down
+   pad_h rows, so the UV rows land at its top, and y_off restoring the
+   row the shader expects. Each draw's other rows fall outside its plane
+   and are clipped. */
 static void
 xrdp_accel_assist_x11_run_shader(int left, int top, int width, int height,
                                  struct mon_info *mi,
-                                 struct shader_info *si, GLuint enc_texture,
+                                 struct shader_info *si,
+                                 struct xh_enc_target *tgt,
                                  int num_crects, struct xh_rect *crects,
                                  int pad_h, int vp_w, int aux_v2)
 {
@@ -1461,6 +1592,10 @@ xrdp_accel_assist_x11_run_shader(int left, int top, int width, int height,
     GLfloat *vertices;
     GLuint vertices_bytes;
     GLuint vertices_pointes;
+    int nplanes;
+    int plane;
+    int vp_h;
+    int bpf;
 
     /* rgb to yuv */
     glEnable(GL_TEXTURE_2D);
@@ -1468,8 +1603,6 @@ xrdp_accel_assist_x11_run_shader(int left, int top, int width, int height,
     glBindTexture(GL_TEXTURE_2D, mi->bmp_texture[mi->cur_buf]);
     g_inf_funcs[g_inf].bind_tex_image(mi->inf_image[mi->cur_buf]);
     glBindFramebuffer(GL_FRAMEBUFFER, g_fb);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_2D, enc_texture, 0);
     glUseProgram(si->program);
     /* setup vertices from crects */
     /* The v2 aux view builds its own quads from the damage rects. */
@@ -1512,16 +1645,28 @@ xrdp_accel_assist_x11_run_shader(int left, int top, int width, int height,
     }
     /* viewport and draw */
     /* vp_w is a quarter of the byte width; a parameter because the planes
-       differ in byte width under v1. */
-    if (pad_h > 0)
+       differ in byte width under v1. A plane written fewer than four bytes
+       to a fragment is that many times wider in fragments. */
+    vp_h = (pad_h > 0) ? pad_h * 3 / 2 : mi->viewport.h;
+    nplanes = (tgt->tex[1] != 0 && pad_h > 0) ? 2 : 1;
+    for (plane = 0; plane < nplanes; plane++)
     {
-        glViewport(mi->viewport.x, mi->viewport.y, vp_w, pad_h * 3 / 2);
+        bpf = (tgt->bpf[plane] > 0) ? tgt->bpf[plane] : 4;
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, tgt->tex[plane], 0);
+        if (si->bpf_loc >= 0)
+        {
+            glUniform1f(si->bpf_loc, (float) bpf);
+        }
+        if (si->y_off_loc >= 0)
+        {
+            glUniform1f(si->y_off_loc, (float) (plane == 0 ? 0 : pad_h));
+        }
+        glViewport(mi->viewport.x,
+                   mi->viewport.y - (plane == 0 ? 0 : pad_h),
+                   vp_w * 4 / bpf, vp_h);
+        glDrawArrays(GL_TRIANGLES, 0, vertices_pointes);
     }
-    else
-    {
-        glViewport(mi->viewport.x, mi->viewport.y, vp_w, mi->viewport.h);
-    }
-    glDrawArrays(GL_TRIANGLES, 0, vertices_pointes);
     /* cleanup */
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
@@ -1589,6 +1734,7 @@ encode_pixmap(int left, int top, int width, int height,
     struct mon_info *mi;
     struct shader_info *si;
     enum encoder_result rv;
+    struct xh_rect whole;
 
     mi = g_mons + mon_id % MAX_MON;
     /* Which capture buffer xorgxrdp used for this frame. */
@@ -1608,6 +1754,16 @@ encode_pixmap(int left, int top, int width, int height,
 #if XR_DUMP_PIXMAP
     save_pixmap_to_file(mi->pixmap[mi->cur_buf], width, height);
 #endif
+    if (mi->full_pending)
+    {
+        whole.x = 0;
+        whole.y = 0;
+        whole.w = width;
+        whole.h = height;
+        crects = &whole;
+        num_crects = 1;
+        mi->full_pending = 0;
+    }
     if (codec_id == XH_CODECID_AVC444 || codec_id == XH_CODECID_AVC444V2)
     {
         /* AVC444: two views, framed as
@@ -1687,10 +1843,12 @@ encode_pixmap(int left, int top, int width, int height,
            be submitted before either is waited on. */
         max_ms = xrdp_accel_assist_x11_chroma_max_ms();
         send_aux = ((frame_no % xrdp_accel_assist_x11_chroma_interval()) == 0)
+                   || mi->force_aux
                    || ((flags & XH_ENC_FLAGS_FORCEIDR) != 0)
                    || (max_ms > 0 && (!mi->aux_last_valid
                                       || now_ms - mi->aux_last_ms
                                       >= (unsigned int) max_ms));
+        mi->force_aux = 0;
         if (send_aux)
         {
             mi->aux_last_ms = now_ms;
@@ -1705,14 +1863,14 @@ encode_pixmap(int left, int top, int width, int height,
         t_copy = xrdp_accel_assist_x11_time_copy();
         si = g_si + XH_SHADERRGB2YUV420MV;
         xrdp_accel_assist_x11_run_shader(left, top, width, height, mi, si,
-                                         mi->enc_texture, num_crects, crects,
+                                         &mi->tgt[0], num_crects, crects,
                                          mi->buf_h, mi->enc_w4, 0);
         /* Split the GL time into xorgxrdp's copy and our conversion. */
         xrdp_accel_assist_x11_time_gl(t_copy);
         if (frame_no == 0)
         {
             xrdp_accel_assist_x11_dump_plane("main", frame_no,
-                                             mi->enc_texture,
+                                             &mi->tgt[0],
                                              mi->enc_w4, mi->buf_h * 3 / 2,
                                              1);
         }
@@ -1780,7 +1938,7 @@ encode_pixmap(int left, int top, int width, int height,
                     aux_rect = full_rect;
                 }
                 xrdp_accel_assist_x11_run_shader(0, 0, width, height,
-                                                 mi, si, mi->enc_texture_aux,
+                                                 mi, si, &mi->tgt[1],
                                                  1, &aux_rect,
                                                  mi->buf_h, mi->enc_w4, 1);
                 /* xrdp declares whatever was rendered. */
@@ -1793,7 +1951,7 @@ encode_pixmap(int left, int top, int width, int height,
             else
             {
                 xrdp_accel_assist_x11_run_shader(0, 0, width, height, mi, si,
-                                                 mi->enc_texture_aux, 1,
+                                                 &mi->tgt[1], 1,
                                                  &full_rect, mi->buf_h,
                                                  mi->enc_w4, 0);
             }
@@ -1801,7 +1959,7 @@ encode_pixmap(int left, int top, int width, int height,
             if (frame_no == 0)
             {
                 xrdp_accel_assist_x11_dump_plane("aux", frame_no,
-                                                 mi->enc_texture_aux,
+                                                 &mi->tgt[1],
                                                  mi->enc_w4,
                                                  mi->buf_h * 3 / 2, 1);
             }
@@ -1813,7 +1971,7 @@ encode_pixmap(int left, int top, int width, int height,
         if (!send_aux)
         {
             len1 = avail - 8;
-            rv = g_enc_funcs[g_enc].encode(mi->ei, mi->enc_texture,
+            rv = g_enc_funcs[g_enc].encode(mi->ei, mi->tgt[0].tex[0],
                                            p + 4, &len1, flags,
                                            mi->idr_seq);
             if (rv == ENCODER_ERROR)
@@ -1841,7 +1999,7 @@ encode_pixmap(int left, int top, int width, int height,
         else
         {
             len1 = avail - 8;
-            rv = g_enc_funcs[g_enc].encode(mi->ei, mi->enc_texture,
+            rv = g_enc_funcs[g_enc].encode(mi->ei, mi->tgt[0].tex[0],
                                            p + 4, &len1, flags,
                                            mi->idr_seq);
             if (rv == ENCODER_ERROR)
@@ -1851,7 +2009,7 @@ encode_pixmap(int left, int top, int width, int height,
             len2 = avail - 8 - len1;
             /* Never FORCEIDR: only the first view of a frame may be an
                IDR. */
-            rv2 = g_enc_funcs[g_enc].encode(mi->ei, mi->enc_texture_aux,
+            rv2 = g_enc_funcs[g_enc].encode(mi->ei, mi->tgt[1].tex[0],
                                             p + 4 + len1 + 4, &len2,
                                             (flags & ~XH_ENC_FLAGS_FORCEIDR) |
                                             XH_ENC_FLAGS_AUXVIEW,
@@ -1909,14 +2067,546 @@ encode_pixmap(int left, int top, int width, int height,
     /* AVC420 (default): single view */
     si = g_si + mi->tex_format % XH_NUM_SHADERS;
     xrdp_accel_assist_x11_run_shader(left, top, width, height, mi, si,
-                                     mi->enc_texture, num_crects, crects,
+                                     &mi->tgt[0], num_crects, crects,
                                      mi->buf_h, mi->enc_w4, 0);
     /* flush before encoding, let encoders call glFinish() as needed */
     flush_gl();
     /* encode */
-    rv = g_enc_funcs[g_enc].encode(mi->ei, mi->enc_texture,
+    rv = g_enc_funcs[g_enc].encode(mi->ei, mi->tgt[0].tex[0],
                                    cdata, cdata_bytes, flags, mi->idr_seq);
     return rv;
+}
+
+/*****************************************************************************/
+/* A new encoder for a monitor whose last one failed. Encoder-owned targets
+   go with the old encoder, and the new ones start out blank, so the next
+   main view is drawn whole rather than over its damage. */
+static int
+xrdp_accel_assist_x11_recreate_enc(struct mon_info *mi)
+{
+    int rv;
+
+    g_create_v2 = mi->avc444_v2;
+    if (mi->tgt_from_enc)
+    {
+        g_memset(mi->tgt, 0, sizeof(mi->tgt));
+        rv = g_enc_funcs[g_enc].create_enc_targets(mi->enc_w, mi->pad_h,
+             mi->avc444 ? 2 : 1,
+             &mi->ei, mi->tgt);
+        mi->full_pending = 1;
+    }
+    else
+    {
+        rv = g_enc_funcs[g_enc].create_enc(mi->enc_w, mi->pad_h,
+                                           mi->tgt[0].tex[0],
+                                           mi->tgt[1].tex[0],
+                                           mi->tex_format, &mi->ei);
+    }
+    if (rv != 0)
+    {
+        mi->ei = NULL;
+    }
+    return rv;
+}
+
+/*****************************************************************************/
+/* Damage detection. Toolkits report damage for pixels they repaint
+   unchanged: Chrome redraws its whole page when the pointer crosses the
+   address bar. Under AVC444 every rect of a luma-only frame is shown from
+   the 4:2:0 main view until the next aux frame, so repainted text flickers
+   between 4:2:0 and 4:4:4. Compare the damaged area with the source as last
+   encoded, in 16x16 cells on the GPU, and pass on only the cells that
+   changed. XRDP_AVC444_DAMAGE_DETECT=0 turns it off. */
+#define DD_CELL 16
+/* Frames almost all changed (video) before comparing stops for a while. */
+#define DD_BUSY_FRAMES 8
+#define DD_BYPASS_FRAMES 60
+/* More changed rects than this (scattered changes): declare the damage as
+   it came, rather than send kilobytes of rects. */
+#define DD_MAX_RECTS 256
+
+/* Every DD_STATS_MS, one log line: frames checked, the average time a
+   check took (GPU wait included), and what became of the frames. */
+#define DD_STATS_MS 5000
+static struct
+{
+    unsigned int start_ms;
+    unsigned long long us;
+    int checked;
+    int skipped;
+    int filtered;
+    int passed;
+    int bypassed;
+    int aux_owed;
+} g_dd_stats;
+
+static unsigned long long
+dd_now_us(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long) ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
+}
+
+static void
+dd_stats_log(void)
+{
+    unsigned int now = g_get_elapsed_ms();
+
+    if (g_dd_stats.start_ms == 0)
+    {
+        g_dd_stats.start_ms = now;
+        return;
+    }
+    if (now - g_dd_stats.start_ms < DD_STATS_MS)
+    {
+        return;
+    }
+    if (g_dd_stats.checked + g_dd_stats.bypassed > 0)
+    {
+        LOG(LOG_LEVEL_INFO, "damage detection: %d frames checked, %.2f ms "
+            "each; %d unchanged (skipped), %d filtered, %d passed as "
+            "damaged, %d aux catch-ups, %d not checked (video)",
+            g_dd_stats.checked,
+            g_dd_stats.checked > 0 ?
+            g_dd_stats.us / 1000.0 / g_dd_stats.checked : 0.0,
+            g_dd_stats.skipped, g_dd_stats.filtered, g_dd_stats.passed,
+            g_dd_stats.aux_owed, g_dd_stats.bypassed);
+    }
+    g_memset(&g_dd_stats, 0, sizeof(g_dd_stats));
+    g_dd_stats.start_ms = now;
+}
+
+static int
+xrdp_accel_assist_x11_damage_detect_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+    {
+        const char *env = g_getenv("XRDP_AVC444_DAMAGE_DETECT");
+
+        enabled = (env == NULL) || (g_strcmp(env, "0") != 0);
+        LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11: AVC444 damage detection "
+            "%s", enabled ? "on" : "off (XRDP_AVC444_DAMAGE_DETECT=0)");
+    }
+    return enabled;
+}
+
+/*****************************************************************************/
+static int
+dd_alloc(struct mon_info *mi, int width, int height)
+{
+    if (mi->dd_prev_texture != 0 && mi->dd_w == width && mi->dd_h == height)
+    {
+        return 0;
+    }
+    if (mi->dd_prev_texture != 0)
+    {
+        glDeleteTextures(1, &(mi->dd_prev_texture));
+        glDeleteTextures(1, &(mi->dd_mask_texture));
+        glDeleteTextures(1, &(mi->dd_cell_texture));
+    }
+    g_free(mi->dd_map);
+    g_free(mi->dd_cand);
+    mi->dd_w = width;
+    mi->dd_h = height;
+    mi->dd_cells_w = (width + DD_CELL - 1) / DD_CELL;
+    mi->dd_cells_h = (height + DD_CELL - 1) / DD_CELL;
+    mi->dd_map = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h * 4);
+    mi->dd_cand = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
+    glGenTextures(1, &(mi->dd_prev_texture));
+    glBindTexture(GL_TEXTURE_2D, mi->dd_prev_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenTextures(1, &(mi->dd_mask_texture));
+    glBindTexture(GL_TEXTURE_2D, mi->dd_mask_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0,
+                 GL_RED, GL_UNSIGNED_BYTE, NULL);
+    glGenTextures(1, &(mi->dd_cell_texture));
+    glBindTexture(GL_TEXTURE_2D, mi->dd_cell_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, mi->dd_cells_w, mi->dd_cells_h,
+                 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    mi->dd_prev_valid = 0;
+    if (mi->dd_map == NULL || mi->dd_cand == NULL)
+    {
+        return 1;
+    }
+    return 0;
+}
+
+/*****************************************************************************/
+/* Draw vertices (two floats each, triangles) with the current program
+   into enc_texture over a viewport of vp_w x vp_h. */
+static void
+dd_draw(GLuint target, int vp_w, int vp_h, const GLfloat *vertices,
+        GLuint vertices_bytes, GLuint vertices_pointes)
+{
+    GLuint vao;
+    GLuint vbo;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, g_fb);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, target, 0);
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, vertices_bytes, vertices, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 2, NULL);
+    glViewport(0, 0, vp_w, vp_h);
+    glDrawArrays(GL_TRIANGLES, 0, vertices_pointes);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+    glDeleteBuffers(1, &vbo);
+    glDeleteVertexArrays(1, &vao);
+}
+
+/*****************************************************************************/
+/* Copy the source over rects (all of it when num_rects < 1) into the
+   previous-frame texture. */
+static void
+dd_copy_to_prev(struct mon_info *mi, int num_rects, struct xh_rect *rects)
+{
+    struct shader_info *si = g_si + XH_SHADERCOPY;
+    GLfloat *vertices;
+    GLuint vertices_bytes;
+    GLuint vertices_pointes;
+
+    vertices = get_vertices444(&vertices_bytes, &vertices_pointes,
+                               num_rects, rects, 0, 0, mi->dd_w, mi->dd_h);
+    if (vertices == NULL)
+    {
+        mi->dd_prev_valid = 0;
+        return;
+    }
+    glUseProgram(si->program);
+    glUniform2f(si->tex_size_loc, mi->dd_w, mi->dd_h);
+    dd_draw(mi->dd_prev_texture, mi->dd_w, mi->dd_h, vertices,
+            vertices_bytes, vertices_pointes);
+    g_free(vertices);
+}
+
+/*****************************************************************************/
+/* Cells as rects: runs along each cell row, each merged into the rect
+   above it when that rect ends on the row above with the same columns.
+   Returns the count, or -1 if out_max is too small (the caller then passes
+   the damage on unfiltered). */
+static int
+dd_cells_to_rects(struct mon_info *mi, const unsigned char *changed,
+                  struct xh_rect *out, int out_max)
+{
+    int n = 0;
+    int cy;
+    int cx;
+    int start;
+    int i;
+    int x;
+    int w;
+    int y;
+    int h;
+    int *above;                   /* rects ending on the previous row */
+    int *here;                    /* rects ending on this row */
+    int num_above = 0;
+    int num_here;
+    int *t;
+
+    above = g_new(int, mi->dd_cells_w);
+    here = g_new(int, mi->dd_cells_w);
+    if (above == NULL || here == NULL)
+    {
+        g_free(above);
+        g_free(here);
+        return -1;
+    }
+    for (cy = 0; cy < mi->dd_cells_h; cy++)
+    {
+        y = cy * DD_CELL;
+        h = MIN(DD_CELL, mi->dd_h - y);
+        num_here = 0;
+        cx = 0;
+        while (cx < mi->dd_cells_w)
+        {
+            if (!changed[cy * mi->dd_cells_w + cx])
+            {
+                cx++;
+                continue;
+            }
+            start = cx;
+            while (cx < mi->dd_cells_w && changed[cy * mi->dd_cells_w + cx])
+            {
+                cx++;
+            }
+            x = start * DD_CELL;
+            w = MIN(cx * DD_CELL, mi->dd_w) - x;
+            for (i = 0; i < num_above; i++)
+            {
+                if (out[above[i]].x == x && out[above[i]].w == w)
+                {
+                    break;
+                }
+            }
+            if (i < num_above)
+            {
+                out[above[i]].h += h;
+                here[num_here++] = above[i];
+                continue;
+            }
+            if (n >= out_max)
+            {
+                g_free(above);
+                g_free(here);
+                return -1;
+            }
+            out[n].x = x;
+            out[n].y = y;
+            out[n].w = w;
+            out[n].h = h;
+            here[num_here++] = n;
+            n++;
+        }
+        t = above;
+        above = here;
+        here = t;
+        num_above = num_here;
+    }
+    g_free(above);
+    g_free(here);
+    return n;
+}
+
+/*****************************************************************************/
+/* Filters crects down to the cells that changed. Returns the number of
+   rects in out (0: nothing changed), or -1 to pass crects on as they are.
+   force_all: compare nothing, everything damaged counts as changed (an
+   IDR), but still refresh the previous-frame copy. */
+static int
+damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
+              struct xh_rect *crects, int force_all,
+              struct xh_rect *out, int out_max)
+{
+    struct shader_info *si;
+    unsigned char *changed;
+    int cells;
+    int index;
+    int cx;
+    int cy;
+    int num_cand = 0;
+    int num_changed = 0;
+    int n;
+    GLuint vao;
+    GLuint vbo;
+
+    if (num_crects < 1 || dd_alloc(mi, mi->width, mi->height) != 0)
+    {
+        return -1;
+    }
+    if (mi->dd_bypass > 0)
+    {
+        /* Video: everything changes. Stop comparing for a while; the copy
+           of the previous frame goes stale, so start over afterwards. */
+        mi->dd_bypass--;
+        mi->dd_prev_valid = 0;
+        return -1;
+    }
+    cells = mi->dd_cells_w * mi->dd_cells_h;
+    g_memset(mi->dd_cand, 0, cells);
+    for (index = 0; index < num_crects; index++)
+    {
+        struct xh_rect *r = crects + index;
+        int x1 = MAX(r->x, 0) / DD_CELL;
+        int y1 = MAX(r->y, 0) / DD_CELL;
+        int x2 = (MIN(r->x + r->w, mi->dd_w) + DD_CELL - 1) / DD_CELL;
+        int y2 = (MIN(r->y + r->h, mi->dd_h) + DD_CELL - 1) / DD_CELL;
+
+        for (cy = y1; cy < y2; cy++)
+        {
+            for (cx = x1; cx < x2; cx++)
+            {
+                mi->dd_cand[cy * mi->dd_cells_w + cx] = 1;
+            }
+        }
+    }
+
+    glEnable(GL_TEXTURE_2D);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, mi->bmp_texture[cur_buf]);
+    g_inf_funcs[g_inf].bind_tex_image(mi->inf_image[cur_buf]);
+    changed = mi->dd_cand;
+    if (!force_all && mi->dd_prev_valid)
+    {
+        struct xh_rect *cand_rects;
+        int num_cand_rects = -1;
+        GLfloat *vertices;
+        GLuint vertices_bytes;
+        GLuint vertices_pointes;
+
+        /* mask pass, over the damaged cells only (every cell there gets a
+           fresh mask; the rest of the mask is never read) */
+        cand_rects = g_new(struct xh_rect, DD_MAX_RECTS);
+        if (cand_rects != NULL)
+        {
+            num_cand_rects = dd_cells_to_rects(mi, mi->dd_cand, cand_rects,
+                                               DD_MAX_RECTS);
+        }
+        vertices = get_vertices444(&vertices_bytes, &vertices_pointes,
+                                   num_cand_rects > 0 ? num_cand_rects : 0,
+                                   cand_rects, 0, 0, mi->dd_w, mi->dd_h);
+        g_free(cand_rects);
+        if (vertices == NULL)
+        {
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            g_inf_funcs[g_inf].release_tex_image(mi->inf_image[cur_buf]);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            return -1;
+        }
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, mi->dd_prev_texture);
+        glActiveTexture(GL_TEXTURE0);
+        si = g_si + XH_SHADERMASKDIFF;
+        glUseProgram(si->program);
+        glUniform1i(si->tex_loc, 0);
+        glUniform1i(si->prev_loc, 1);
+        glUniform2f(si->tex_size_loc, mi->dd_w, mi->dd_h);
+        dd_draw(mi->dd_mask_texture, mi->dd_w, mi->dd_h, vertices,
+                vertices_bytes, vertices_pointes);
+        g_free(vertices);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
+        /* cell pass: one fragment per 16x16 cell, over the whole map */
+        glBindTexture(GL_TEXTURE_2D, mi->dd_mask_texture);
+        si = g_si + XH_SHADERCELLMAX;
+        glUseProgram(si->program);
+        glUniform1i(si->tex_loc, 0);
+        glUniform2f(si->tex_size_loc, mi->dd_w, mi->dd_h);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_fb);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, mi->dd_cell_texture, 0);
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &vbo);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(g_vertices), g_vertices,
+                     GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 2,
+                              NULL);
+        glViewport(0, 0, mi->dd_cells_w, mi->dd_cells_h);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glReadPixels(0, 0, mi->dd_cells_w, mi->dd_cells_h, GL_RGBA,
+                     GL_UNSIGNED_BYTE, mi->dd_map);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindVertexArray(0);
+        glDeleteBuffers(1, &vbo);
+        glDeleteVertexArrays(1, &vao);
+        /* the source again on unit 0, for the copy below */
+        glBindTexture(GL_TEXTURE_2D, mi->bmp_texture[cur_buf]);
+        /* changed = damaged and different; reuse dd_cand in place */
+        for (index = 0; index < cells; index++)
+        {
+            if (mi->dd_cand[index])
+            {
+                num_cand++;
+                mi->dd_cand[index] = mi->dd_map[index * 4] > 127;
+                num_changed += mi->dd_cand[index];
+            }
+        }
+        if (num_cand > 0 && num_changed * 10 >= num_cand * 9 &&
+                num_changed * 2 >= cells)
+        {
+            if (++mi->dd_busy_frames >= DD_BUSY_FRAMES)
+            {
+                mi->dd_busy_frames = 0;
+                mi->dd_bypass = DD_BYPASS_FRAMES;
+            }
+        }
+        else
+        {
+            mi->dd_busy_frames = 0;
+        }
+    }
+    else
+    {
+        for (index = 0; index < cells; index++)
+        {
+            num_changed += mi->dd_cand[index];
+        }
+    }
+
+    n = (num_changed > 0) ? dd_cells_to_rects(mi, changed, out, out_max) : 0;
+    /* the previous-frame copy follows what goes out */
+    if (!mi->dd_prev_valid)
+    {
+        dd_copy_to_prev(mi, 0, NULL);
+        mi->dd_prev_valid = 1;
+    }
+    else if (n > 0)
+    {
+        dd_copy_to_prev(mi, n, out);
+    }
+    else if (n < 0)
+    {
+        dd_copy_to_prev(mi, num_crects, crects);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    g_inf_funcs[g_inf].release_tex_image(mi->inf_image[cur_buf]);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
+    return n;
+}
+
+/*****************************************************************************/
+/* Appends the changed-rects trailer after whatever encode_pixmap wrote. */
+static void
+dd_append_rects(void *cdata, int *cdata_bytes, int avail,
+                int num_rects, const struct xh_rect *rects)
+{
+    unsigned char *t = (unsigned char *) cdata + *cdata_bytes;
+    int need = XH_AVC444_RECTS_HEAD_BYTES + num_rects * 8;
+    unsigned int head[2];
+    int i;
+    int k;
+
+    if (*cdata_bytes + need > avail)
+    {
+        return;
+    }
+    head[0] = XH_AVC444_RECTS_MAGIC;
+    head[1] = (unsigned int) num_rects;
+    for (k = 0; k < 2; k++)
+    {
+        t[0] = head[k] & 0xff;
+        t[1] = (head[k] >> 8) & 0xff;
+        t[2] = (head[k] >> 16) & 0xff;
+        t[3] = (head[k] >> 24) & 0xff;
+        t += 4;
+    }
+    for (i = 0; i < num_rects; i++)
+    {
+        unsigned int v[4];
+
+        v[0] = (unsigned int) rects[i].x;
+        v[1] = (unsigned int) rects[i].y;
+        v[2] = (unsigned int) (rects[i].x + rects[i].w);
+        v[3] = (unsigned int) (rects[i].y + rects[i].h);
+        for (k = 0; k < 4; k++)
+        {
+            t[0] = v[k] & 0xff;
+            t[1] = (v[k] >> 8) & 0xff;
+            t += 2;
+        }
+    }
+    *cdata_bytes += need;
 }
 
 /*****************************************************************************/
@@ -1929,18 +2619,14 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
 {
     struct mon_info *mi = g_mons + mon_id % MAX_MON;
     enum encoder_result rv;
+    struct xh_rect *dd_rects = NULL;
+    int dd_n = -1;
 
     if (mi->ei == NULL)
     {
         /* its re-creation after a failure failed: try again */
-        g_create_v2 = mi->avc444_v2;
-        if (mi->enc_w <= 0 ||
-                g_enc_funcs[g_enc].create_enc(mi->enc_w, mi->pad_h,
-                                              mi->enc_texture,
-                                              mi->enc_texture_aux,
-                                              mi->tex_format, &mi->ei) != 0)
+        if (mi->enc_w <= 0 || xrdp_accel_assist_x11_recreate_enc(mi) != 0)
         {
-            mi->ei = NULL;
             return ENCODER_ERROR;
         }
     }
@@ -1948,8 +2634,80 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
     {
         flags |= XH_ENC_FLAGS_FORCEIDR;
     }
-    rv = encode_pixmap(left, top, width, height, mon_id, num_crects, crects,
-                       cdata, cdata_bytes, codec_id, flags);
+    if ((codec_id == XH_CODECID_AVC444 || codec_id == XH_CODECID_AVC444V2) &&
+            mi->avc444 && xrdp_accel_assist_x11_damage_detect_enabled())
+    {
+        int force_all = (flags & XH_ENC_FLAGS_FORCEIDR) != 0;
+
+        int bypass = mi->dd_bypass > 0;
+        unsigned long long t0 = dd_now_us();
+
+        dd_rects = g_new(struct xh_rect, DD_MAX_RECTS);
+        if (dd_rects != NULL)
+        {
+            /* the capture buffer as encode_pixmap reads it: up to four
+               here, where the vaapi branch has two */
+            dd_n = damage_detect(mi, (flags & ACCEL_ASSIST_BUFFER_MASK) >>
+                                 ACCEL_ASSIST_BUFFER_SHIFT,
+                                 num_crects, crects, force_all,
+                                 dd_rects, DD_MAX_RECTS);
+        }
+        if (bypass)
+        {
+            g_dd_stats.bypassed++;
+        }
+        else
+        {
+            g_dd_stats.checked++;
+            g_dd_stats.us += dd_now_us() - t0;
+            if (dd_n > 0)
+            {
+                g_dd_stats.filtered++;
+            }
+            else if (dd_n < 0)
+            {
+                g_dd_stats.passed++;
+            }
+        }
+        dd_stats_log();
+        if (dd_n == 0 && !force_all)
+        {
+            if (!mi->aux_dirty)
+            {
+                /* Repainted, not changed: no frame at all. */
+                g_dd_stats.skipped++;
+                g_free(dd_rects);
+                *cdata_bytes = 0;
+                return FRAME_UNCHANGED;
+            }
+            g_dd_stats.aux_owed++;
+            /* Nothing changed, but luma-only frames left part of the
+               screen at 4:2:0: send the aux view now, over that part. */
+            dd_rects[0].x = MAX(mi->aux_x1, 0);
+            dd_rects[0].y = MAX(mi->aux_y1, 0);
+            dd_rects[0].w = MIN(mi->aux_x2, mi->width) - dd_rects[0].x;
+            dd_rects[0].h = MIN(mi->aux_y2, mi->height) - dd_rects[0].y;
+            dd_n = (dd_rects[0].w > 0 && dd_rects[0].h > 0) ? 1 : -1;
+            mi->force_aux = 1;
+        }
+    }
+    if (dd_n > 0)
+    {
+        int avail = *cdata_bytes;
+
+        rv = encode_pixmap(left, top, width, height, mon_id, dd_n, dd_rects,
+                           cdata, cdata_bytes, codec_id, flags);
+        if (rv != ENCODER_ERROR)
+        {
+            dd_append_rects(cdata, cdata_bytes, avail, dd_n, dd_rects);
+        }
+    }
+    else
+    {
+        rv = encode_pixmap(left, top, width, height, mon_id, num_crects,
+                           crects, cdata, cdata_bytes, codec_id, flags);
+    }
+    g_free(dd_rects);
     if (rv == ENCODER_ERROR)
     {
         /* The encoder may be left unusable (iHD: a picture too big for the
@@ -1966,14 +2724,9 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
         {
             g_enc_funcs[g_enc].destroy_enc(mi->ei);
             mi->ei = NULL;
-            g_create_v2 = mi->avc444_v2;
-            if (g_enc_funcs[g_enc].create_enc(mi->enc_w, mi->pad_h,
-                                              mi->enc_texture,
-                                              mi->enc_texture_aux,
-                                              mi->tex_format, &mi->ei) != 0)
+            if (xrdp_accel_assist_x11_recreate_enc(mi) != 0)
             {
                 LOG(LOG_LEVEL_ERROR, "monitor %d: no new encoder", mon_id);
-                mi->ei = NULL;
             }
         }
     }

@@ -19,9 +19,11 @@
 /*
  * VA-API hardware H.264 encoder for xrdp_accel_assist.
  *
- * The shaders convert the bound screen pixmap to an NV12-layout GL texture,
- * which is exported as a dma-buf (EGL_MESA_image_dma_buf_export) and imported
- * into libva as an NV12 surface, zero-copy.
+ * Each view's input is an NV12 surface libva allocates, in whatever layout
+ * the driver picks. Its Y and UV layers are exported as dma-bufs and
+ * imported into GL with their format modifiers
+ * (EGL_EXT_image_dma_buf_import_modifiers), and the shaders render the
+ * converted screen pixmap straight into them, zero-copy.
  *
  * libva only encodes slice data. SPS, PPS and slice headers are written here
  * as packed headers, because AVC444 needs control the parameter buffers do
@@ -39,6 +41,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 
 #include <epoxy/gl.h>
 #include <epoxy/egl.h>
@@ -67,8 +70,12 @@ extern EGLContext g_egl_context; /* in xrdp_accel_assist_egl.c */
      ((unsigned int) (c) << 16) | ((unsigned int) (d) << 24))
 #define XH_DRM_FORMAT_R8    XH_FOURCC('R', '8', ' ', ' ')
 #define XH_DRM_FORMAT_GR88  XH_FOURCC('G', 'R', '8', '8')
+#define XH_DRM_FORMAT_ABGR8888 XH_FOURCC('A', 'B', '2', '4')
 /* DRM_FORMAT_MOD_LINEAR, avoids a hard dependency on drm_fourcc.h */
 #define XH_DRM_FORMAT_MOD_LINEAR 0ULL
+
+/* Modifiers EGL is asked about per format; drivers list a handful. */
+#define XH_MAX_MODIFIERS 64
 
 #define XH_VAAPI_DEFAULT_QP     28
 /* The AVC444 aux Y plane carries chroma, which luma quantisation makes
@@ -125,14 +132,13 @@ struct enc_info
     int rc_mode;         /* VA_RC_CQP or VA_RC_VBR */
     int bitrate_kbps;    /* XRDP_VAAPI_BITRATE, 0 = CQP */
 
-    /* GL -> dma-buf export, one per view */
-    EGLImageKHR egl_image[2];
-    int dmabuf_fd[2];
-    int dmabuf_stride[2];
-    int dmabuf_offset[2];
+    /* GL's view of each input surface: [view][plane], plane 0 Y, 1 UV */
+    EGLImageKHR egl_image[2][2];
+    GLuint plane_tex[2][2];
+    int plane_bpf[2][2];       /* bytes each fragment writes */
 
     /* VA-API objects */
-    VASurfaceID input_surface[2];  /* NV12 sources, backed by the dma-bufs */
+    VASurfaceID input_surface[2];  /* NV12 sources the shaders render into */
     VASurfaceID recon_surfaces[XH_VAAPI_NUM_RECON];
     VAConfigID config;
     VAContextID context;
@@ -718,140 +724,362 @@ xrdp_accel_assist_vaapi_init(void)
 }
 
 /*****************************************************************************/
-/* Export the NV12-layout GL texture as a dma-buf. The shader renders a
-   single R8 texture of height * 3 / 2: Y, then interleaved UV. */
+/* Can EGL import a fourcc dma-buf with this modifier as a GL_TEXTURE_2D,
+   and so render into it? A modifier EGL lists as external-only can only
+   be sampled. */
 static int
-xrdp_accel_assist_vaapi_export_dmabuf(struct enc_info *lei, int view, int tex)
+xrdp_accel_assist_vaapi_egl_modifier_ok(unsigned int fourcc,
+                                        unsigned long long modifier)
 {
-    int fourcc;
-    int num_planes;
-    EGLuint64KHR modifiers;
-    int fds;
-    EGLint strides;
-    EGLint offsets;
+    EGLuint64KHR mods[XH_MAX_MODIFIERS];
+    EGLBoolean external_only[XH_MAX_MODIFIERS];
+    EGLint num;
+    int index;
 
-    lei->egl_image[view] = eglCreateImageKHR(g_egl_display, g_egl_context,
-                           EGL_GL_TEXTURE_2D,
-                           (EGLClientBuffer) (intptr_t) tex, NULL);
-    if (lei->egl_image[view] == EGL_NO_IMAGE_KHR)
+    num = 0;
+    if (epoxy_has_egl_extension(g_egl_display,
+                                "EGL_EXT_image_dma_buf_import_modifiers") &&
+            !eglQueryDmaBufModifiersEXT(g_egl_display, fourcc,
+                                        XH_MAX_MODIFIERS, mods,
+                                        external_only, &num))
     {
-        LOG(LOG_LEVEL_ERROR, "vaapi: eglCreateImageKHR failed");
-        return 1;
+        num = 0;
     }
-    if (!eglExportDMABUFImageQueryMESA(g_egl_display, lei->egl_image[view],
-                                       &fourcc, &num_planes, &modifiers))
+    if (num == 0)
     {
-        LOG(LOG_LEVEL_ERROR, "vaapi: eglExportDMABUFImageQueryMESA failed");
-        eglDestroyImageKHR(g_egl_display, lei->egl_image[view]);
-        lei->egl_image[view] = EGL_NO_IMAGE_KHR;
-        return 1;
+        /* No list: an import without a modifier means linear. */
+        return modifier == XH_DRM_FORMAT_MOD_LINEAR;
     }
-    LOG(LOG_LEVEL_INFO, "vaapi: exported dmabuf fourcc 0x%8.8x num_planes %d "
-        "modifier 0x%llx", fourcc, num_planes,
-        (unsigned long long) modifiers);
-    if (modifiers != XH_DRM_FORMAT_MOD_LINEAR)
+    for (index = 0; index < num; index++)
     {
-        /* The import assumes linear; a tiled export would not fail, it
-           would decode as garbage. */
-        LOG(LOG_LEVEL_ERROR, "vaapi: exported dmabuf is not linear "
-            "(modifier 0x%llx); the NV12 import assumes linear and the "
-            "picture will be wrong", (unsigned long long) modifiers);
+        if (mods[index] == modifier)
+        {
+            return !external_only[index];
+        }
     }
-    if (!eglExportDMABUFImageMESA(g_egl_display, lei->egl_image[view],
-                                  &fds, &strides, &offsets))
-    {
-        LOG(LOG_LEVEL_ERROR, "vaapi: eglExportDMABUFImageMESA failed");
-        eglDestroyImageKHR(g_egl_display, lei->egl_image[view]);
-        lei->egl_image[view] = EGL_NO_IMAGE_KHR;
-        return 1;
-    }
-    lei->dmabuf_fd[view] = fds;
-    lei->dmabuf_stride[view] = strides;
-    lei->dmabuf_offset[view] = offsets;
-    LOG(LOG_LEVEL_INFO, "vaapi: dmabuf fd %d stride %d offset %d",
-        fds, strides, offsets);
     return 0;
 }
 
 /*****************************************************************************/
-/* Import the single-plane R8 dma-buf as an NV12 VA surface, both planes
-   in one object at different offsets. */
+/* The modifiers EGL renders both NV12 layer formats (R8, GR88) into. */
 static int
-xrdp_accel_assist_vaapi_import_surface(struct enc_info *lei, int view)
+xrdp_accel_assist_vaapi_egl_modifiers(uint64_t *out, int max)
 {
-    VADRMPRIMESurfaceDescriptor desc;
-    VASurfaceAttrib attribs[2];
-    int stride;
-    VAStatus va_status;
-    int buf_w;
-    int buf_h;
+    EGLuint64KHR mods[XH_MAX_MODIFIERS];
+    EGLBoolean external_only[XH_MAX_MODIFIERS];
+    EGLint num;
+    int index;
+    int count;
 
-    stride = lei->dmabuf_stride[view];
-    /* Declare the surface at the coded size, 16-aligned, which the
-       buffer has room for: the UV plane starts at the 16-aligned row (see
-       buf_h in xrdp_accel_assist_x11.c) and the pitch covers the aligned
-       width. iHD fails vaEndPicture when an external surface is smaller
-       than the coded size (intel/media-driver#738), and at a height that
-       isn't a multiple of 16 its encoder was seen reading the UV plane
-       from the aligned row. The SPS crops to the true size. */
-    buf_w = (lei->width + 15) & ~15;
-    if (buf_w > stride)
+    num = 0;
+    if (!epoxy_has_egl_extension(g_egl_display,
+                                 "EGL_EXT_image_dma_buf_import_modifiers") ||
+            !eglQueryDmaBufModifiersEXT(g_egl_display, XH_DRM_FORMAT_R8,
+                                        XH_MAX_MODIFIERS, mods,
+                                        external_only, &num))
     {
-        buf_w = lei->width;
+        num = 0;
     }
-    buf_h = (lei->height + 15) & ~15;
+    count = 0;
+    for (index = 0; index < num && count < max; index++)
+    {
+        if (!external_only[index] &&
+                xrdp_accel_assist_vaapi_egl_modifier_ok(XH_DRM_FORMAT_GR88,
+                    mods[index]))
+        {
+            out[count++] = mods[index];
+        }
+    }
+    if (count == 0 && max > 0)
+    {
+        out[count++] = XH_DRM_FORMAT_MOD_LINEAR;
+    }
+    return count;
+}
 
-    g_memset(&desc, 0, sizeof(desc));
-    desc.fourcc = VA_FOURCC_NV12;
-    desc.width = buf_w;
-    desc.height = buf_h;
-    desc.num_objects = 1;
-    desc.objects[0].fd = lei->dmabuf_fd[view];
-    desc.objects[0].size = stride * buf_h * 3 / 2;
-    desc.objects[0].drm_format_modifier = XH_DRM_FORMAT_MOD_LINEAR;
-    desc.num_layers = 2;
-    /* Y plane */
-    desc.layers[0].drm_format = XH_DRM_FORMAT_R8;
-    desc.layers[0].num_planes = 1;
-    desc.layers[0].object_index[0] = 0;
-    desc.layers[0].offset[0] = lei->dmabuf_offset[view];
-    desc.layers[0].pitch[0] = stride;
-    /* interleaved UV plane */
-    desc.layers[1].drm_format = XH_DRM_FORMAT_GR88;
-    desc.layers[1].num_planes = 1;
-    desc.layers[1].object_index[0] = 0;
-    desc.layers[1].offset[0] = lei->dmabuf_offset[view] +
-                               stride * buf_h;
-    desc.layers[1].pitch[0] = stride;
+/*****************************************************************************/
+static void
+xrdp_accel_assist_vaapi_close_desc(VADRMPRIMESurfaceDescriptor *desc)
+{
+    unsigned int index;
+
+    for (index = 0; index < desc->num_objects; index++)
+    {
+        if (desc->objects[index].fd >= 0)
+        {
+            g_file_close(desc->objects[index].fd);
+            desc->objects[index].fd = -1;
+        }
+    }
+}
+
+/*****************************************************************************/
+/* Allocate an NV12 surface and export it as one dma-buf layer per plane.
+   use_list: restrict the driver to the modifiers EGL renders into. */
+static int
+xrdp_accel_assist_vaapi_alloc_surface(int buf_w, int buf_h, int use_list,
+                                      VASurfaceID *surface,
+                                      VADRMPRIMESurfaceDescriptor *desc)
+{
+    VASurfaceAttrib attribs[2];
+    VADRMFormatModifierList mod_list;
+    uint64_t mods[XH_MAX_MODIFIERS];
+    int nattribs;
+    VAStatus va_status;
 
     g_memset(attribs, 0, sizeof(attribs));
-    attribs[0].type = VASurfaceAttribMemoryType;
+    attribs[0].type = VASurfaceAttribPixelFormat;
     attribs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
     attribs[0].value.type = VAGenericValueTypeInteger;
-    attribs[0].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
-    attribs[1].type = VASurfaceAttribExternalBufferDescriptor;
-    attribs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
-    attribs[1].value.type = VAGenericValueTypePointer;
-    attribs[1].value.value.p = &desc;
-
-    va_status = vaCreateSurfaces(g_va_dpy, VA_RT_FORMAT_YUV420,
-                                 buf_w, buf_h,
-                                 &lei->input_surface[view], 1,
-                                 attribs, 2);
+    attribs[0].value.value.i = VA_FOURCC_NV12;
+    nattribs = 1;
+    if (use_list)
+    {
+        g_memset(&mod_list, 0, sizeof(mod_list));
+        mod_list.num_modifiers =
+            xrdp_accel_assist_vaapi_egl_modifiers(mods, XH_MAX_MODIFIERS);
+        mod_list.modifiers = mods;
+        attribs[1].type = VASurfaceAttribDRMFormatModifiers;
+        attribs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
+        attribs[1].value.type = VAGenericValueTypePointer;
+        attribs[1].value.value.p = &mod_list;
+        nattribs = 2;
+    }
+    va_status = vaCreateSurfaces(g_va_dpy, VA_RT_FORMAT_YUV420, buf_w, buf_h,
+                                 surface, 1, attribs, nattribs);
     if (va_status != VA_STATUS_SUCCESS)
     {
-        LOG(LOG_LEVEL_ERROR, "vaapi: vaCreateSurfaces(import) %dx%d "
-            "failed %d (%s)", buf_w, buf_h, va_status, vaErrorStr(va_status));
+        LOG(LOG_LEVEL_ERROR, "vaapi: vaCreateSurfaces(input%s) %dx%d "
+            "failed %d (%s)", use_list ? ", EGL modifiers" : "",
+            buf_w, buf_h, va_status, vaErrorStr(va_status));
+        *surface = VA_INVALID_ID;
+        return 1;
+    }
+    g_memset(desc, 0, sizeof(*desc));
+    va_status = vaExportSurfaceHandle(g_va_dpy, *surface,
+                                      VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                                      VA_EXPORT_SURFACE_READ_WRITE |
+                                      VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+                                      desc);
+    if (va_status != VA_STATUS_SUCCESS)
+    {
+        LOG(LOG_LEVEL_ERROR, "vaapi: vaExportSurfaceHandle failed %d (%s)",
+            va_status, vaErrorStr(va_status));
+        vaDestroySurfaces(g_va_dpy, surface, 1);
+        *surface = VA_INVALID_ID;
         return 1;
     }
     return 0;
+}
+
+/*****************************************************************************/
+/* Two single-plane layers, R8 then GR88, each in a modifier EGL renders
+   into. */
+static int
+xrdp_accel_assist_vaapi_layers_ok(const VADRMPRIMESurfaceDescriptor *desc)
+{
+    static const unsigned int formats[2] =
+    {
+        XH_DRM_FORMAT_R8, XH_DRM_FORMAT_GR88
+    };
+    unsigned int obj;
+    int plane;
+
+    if (desc->num_layers != 2)
+    {
+        return 0;
+    }
+    for (plane = 0; plane < 2; plane++)
+    {
+        obj = desc->layers[plane].object_index[0];
+        if (desc->layers[plane].drm_format != formats[plane] ||
+                desc->layers[plane].num_planes != 1 ||
+                obj >= desc->num_objects ||
+                !xrdp_accel_assist_vaapi_egl_modifier_ok(
+                    formats[plane], desc->objects[obj].drm_format_modifier))
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/*****************************************************************************/
+/* Wrap one layer of a view's input surface in a GL texture the shaders
+   can render into. A linear plane is imported as RGBA8 at a quarter of
+   its byte width, four bytes per fragment, since single-byte writes to a
+   linear buffer coalesce badly; any other layout keeps its own format,
+   which a modifier's tiling depends on. */
+static int
+xrdp_accel_assist_vaapi_import_plane(struct enc_info *lei, int view,
+                                     int plane,
+                                     const VADRMPRIMESurfaceDescriptor *desc,
+                                     int bytes_w, int rows)
+{
+    int *bpf = &lei->plane_bpf[view][plane];
+    EGLint attrs[32];
+    int nattr;
+    unsigned int fourcc;
+    unsigned int obj;
+    unsigned long long modifier;
+    int pitch;
+    int width;
+    GLuint fb;
+    GLenum status;
+    GLenum gl_err;
+
+    obj = desc->layers[plane].object_index[0];
+    modifier = desc->objects[obj].drm_format_modifier;
+    pitch = desc->layers[plane].pitch[0];
+    if (modifier == XH_DRM_FORMAT_MOD_LINEAR && (pitch % 4) == 0 &&
+            (bytes_w % 4) == 0 &&
+            xrdp_accel_assist_vaapi_egl_modifier_ok(XH_DRM_FORMAT_ABGR8888,
+                    modifier))
+    {
+        fourcc = XH_DRM_FORMAT_ABGR8888;
+        *bpf = 4;
+    }
+    else
+    {
+        fourcc = desc->layers[plane].drm_format;
+        *bpf = (plane == 0) ? 1 : 2;
+    }
+    width = bytes_w / *bpf;
+
+    nattr = 0;
+    attrs[nattr++] = EGL_WIDTH;
+    attrs[nattr++] = width;
+    attrs[nattr++] = EGL_HEIGHT;
+    attrs[nattr++] = rows;
+    attrs[nattr++] = EGL_LINUX_DRM_FOURCC_EXT;
+    attrs[nattr++] = (EGLint) fourcc;
+    attrs[nattr++] = EGL_DMA_BUF_PLANE0_FD_EXT;
+    attrs[nattr++] = desc->objects[obj].fd;
+    attrs[nattr++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;
+    attrs[nattr++] = (EGLint) desc->layers[plane].offset[0];
+    attrs[nattr++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
+    attrs[nattr++] = pitch;
+    if (epoxy_has_egl_extension(g_egl_display,
+                                "EGL_EXT_image_dma_buf_import_modifiers"))
+    {
+        attrs[nattr++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
+        attrs[nattr++] = (EGLint) (modifier & 0xffffffff);
+        attrs[nattr++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
+        attrs[nattr++] = (EGLint) (modifier >> 32);
+    }
+    attrs[nattr++] = EGL_NONE;
+
+    lei->egl_image[view][plane] = eglCreateImageKHR(g_egl_display,
+                                  EGL_NO_CONTEXT,
+                                  EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
+    if (lei->egl_image[view][plane] == EGL_NO_IMAGE_KHR)
+    {
+        LOG(LOG_LEVEL_ERROR, "vaapi: view %d plane %d: eglCreateImageKHR "
+            "(%.4s %dx%d, modifier 0x%llx) failed 0x%x", view, plane,
+            (const char *) &fourcc, width, rows, modifier, eglGetError());
+        return 1;
+    }
+    /* Clear errors left by earlier calls (glEnable(GL_TEXTURE_2D) is one
+       in a core profile context), so the check below sees only ours. */
+    while (glGetError() != GL_NO_ERROR)
+    {
+    }
+    glGenTextures(1, &lei->plane_tex[view][plane]);
+    glBindTexture(GL_TEXTURE_2D, lei->plane_tex[view][plane]);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D,
+                                 (GLeglImageOES) lei->egl_image[view][plane]);
+    gl_err = glGetError();
+    glBindTexture(GL_TEXTURE_2D, 0);
+    /* Imported is not the same as renderable. */
+    glGenFramebuffers(1, &fb);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, lei->plane_tex[view][plane], 0);
+    status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fb);
+    if (gl_err != GL_NO_ERROR || status != GL_FRAMEBUFFER_COMPLETE)
+    {
+        LOG(LOG_LEVEL_ERROR, "vaapi: view %d plane %d: cannot render into "
+            "the imported %.4s layer (modifier 0x%llx): GL error 0x%x, "
+            "framebuffer status 0x%x", view, plane, (const char *) &fourcc,
+            modifier, gl_err, status);
+        return 1;
+    }
+    LOG(LOG_LEVEL_INFO, "vaapi: view %d plane %d: %.4s %dx%d, modifier "
+        "0x%llx, offset %u pitch %d, %d byte(s) per fragment", view, plane,
+        (const char *) &fourcc, width, rows, modifier,
+        desc->layers[plane].offset[0], pitch, *bpf);
+    return 0;
+}
+
+/*****************************************************************************/
+/* A view's input surface: allocated by libva at the coded size, 16-aligned,
+   so its geometry is what the encoder expects (iHD fails vaEndPicture on
+   an external surface smaller than the coded size, intel/media-driver#738),
+   then handed to GL plane by plane. The SPS crops to the true size. */
+static int
+xrdp_accel_assist_vaapi_create_input(struct enc_info *lei, int view)
+{
+    VADRMPRIMESurfaceDescriptor desc;
+    int buf_w;
+    int buf_h;
+    int rv;
+
+    buf_w = (lei->width + 15) & ~15;
+    buf_h = (lei->height + 15) & ~15;
+    if (xrdp_accel_assist_vaapi_alloc_surface(buf_w, buf_h, 0,
+            &lei->input_surface[view], &desc) != 0)
+    {
+        return 1;
+    }
+    if (!xrdp_accel_assist_vaapi_layers_ok(&desc))
+    {
+        /* The driver's default layout is not one GL renders into; ask for
+           one that is. Not every driver honours the request (iHD 26.1
+           allocates NV12 Y-tiled whatever it is given), so check again. */
+        LOG(LOG_LEVEL_INFO, "vaapi: view %d: the driver's default surface "
+            "(%u layer(s), modifier 0x%llx) is not renderable here, "
+            "reallocating in a modifier EGL renders into", view,
+            desc.num_layers,
+            (unsigned long long) desc.objects[0].drm_format_modifier);
+        xrdp_accel_assist_vaapi_close_desc(&desc);
+        vaDestroySurfaces(g_va_dpy, &lei->input_surface[view], 1);
+        lei->input_surface[view] = VA_INVALID_ID;
+        if (xrdp_accel_assist_vaapi_alloc_surface(buf_w, buf_h, 1,
+                &lei->input_surface[view], &desc) != 0)
+        {
+            return 1;
+        }
+        if (!xrdp_accel_assist_vaapi_layers_ok(&desc))
+        {
+            LOG(LOG_LEVEL_ERROR, "vaapi: view %d: no NV12 surface layout "
+                "both libva and EGL support (%u layer(s), modifier 0x%llx)",
+                view, desc.num_layers,
+                (unsigned long long) desc.objects[0].drm_format_modifier);
+            xrdp_accel_assist_vaapi_close_desc(&desc);
+            return 1;
+        }
+    }
+    rv = xrdp_accel_assist_vaapi_import_plane(lei, view, 0, &desc,
+         buf_w, buf_h);
+    if (rv == 0)
+    {
+        rv = xrdp_accel_assist_vaapi_import_plane(lei, view, 1, &desc,
+             buf_w, buf_h / 2);
+    }
+    /* EGL holds its own references to the buffers. */
+    xrdp_accel_assist_vaapi_close_desc(&desc);
+    return rv;
 }
 
 /*****************************************************************************/
 int
-xrdp_accel_assist_vaapi_create_encoder(int width, int height, int tex,
-                                       int tex_aux, int tex_format,
-                                       struct enc_info **ei)
+xrdp_accel_assist_vaapi_create_encoder(int width, int height, int nviews,
+                                       struct enc_info **ei,
+                                       struct xh_enc_target *targets)
 {
     struct enc_info *lei;
     VAStatus va_status;
@@ -860,14 +1088,8 @@ xrdp_accel_assist_vaapi_create_encoder(int width, int height, int tex,
     char *qp_str;
     int qp_int;
     int view;
+    int plane;
     int nrt;
-
-    if (tex_format != XH_YUV420)
-    {
-        LOG(LOG_LEVEL_ERROR, "vaapi: only XH_YUV420 (NV12) supported, got %d",
-            tex_format);
-        return 1;
-    }
 
     lei = g_new0(struct enc_info, 1);
     if (lei == NULL)
@@ -876,11 +1098,14 @@ xrdp_accel_assist_vaapi_create_encoder(int width, int height, int tex,
     }
     lei->width = width;
     lei->height = height;
-    lei->nviews = (tex_aux != 0) ? 2 : 1;
+    lei->nviews = (nviews > 1) ? 2 : 1;
     for (view = 0; view < 2; view++)
     {
-        lei->egl_image[view] = EGL_NO_IMAGE_KHR;
-        lei->dmabuf_fd[view] = -1;
+        for (plane = 0; plane < 2; plane++)
+        {
+            lei->egl_image[view][plane] = EGL_NO_IMAGE_KHR;
+            lei->plane_tex[view][plane] = 0;
+        }
         lei->input_surface[view] = VA_INVALID_ID;
     }
     for (view = 0; view < XH_VAAPI_NUM_RECON; view++)
@@ -957,20 +1182,9 @@ xrdp_accel_assist_vaapi_create_encoder(int width, int height, int tex,
         lei->rc_mode == VA_RC_CQP ? "CQP" : "VBR",
         lei->bitrate_kbps, h264_level_for(width, height));
 
-    if (xrdp_accel_assist_vaapi_export_dmabuf(lei, 0, tex) != 0)
+    for (view = 0; view < lei->nviews; view++)
     {
-        g_free(lei);
-        return 1;
-    }
-    if (xrdp_accel_assist_vaapi_import_surface(lei, 0) != 0)
-    {
-        xrdp_accel_assist_vaapi_delete_encoder(lei);
-        return 1;
-    }
-    if (lei->nviews > 1)
-    {
-        if (xrdp_accel_assist_vaapi_export_dmabuf(lei, 1, tex_aux) != 0 ||
-                xrdp_accel_assist_vaapi_import_surface(lei, 1) != 0)
+        if (xrdp_accel_assist_vaapi_create_input(lei, view) != 0)
         {
             xrdp_accel_assist_vaapi_delete_encoder(lei);
             return 1;
@@ -1051,6 +1265,16 @@ xrdp_accel_assist_vaapi_create_encoder(int width, int height, int tex,
         }
     }
 
+    /* Only now: the textures go with the encoder on any failure above. */
+    g_memset(targets, 0, sizeof(struct xh_enc_target) * 2);
+    for (view = 0; view < lei->nviews; view++)
+    {
+        for (plane = 0; plane < 2; plane++)
+        {
+            targets[view].tex[plane] = lei->plane_tex[view][plane];
+            targets[view].bpf[plane] = lei->plane_bpf[view][plane];
+        }
+    }
     *ei = lei;
     return 0;
 }
@@ -1060,6 +1284,7 @@ int
 xrdp_accel_assist_vaapi_delete_encoder(struct enc_info *ei)
 {
     int view;
+    int plane;
 
     if (ei == NULL)
     {
@@ -1084,19 +1309,25 @@ xrdp_accel_assist_vaapi_delete_encoder(struct enc_info *ei)
     {
         vaDestroySurfaces(g_va_dpy, ei->recon_surfaces, XH_VAAPI_NUM_RECON);
     }
+    /* GL's views of the input surfaces first, then the surfaces. */
     for (view = 0; view < 2; view++)
     {
+        for (plane = 0; plane < 2; plane++)
+        {
+            if (ei->plane_tex[view][plane] != 0)
+            {
+                glDeleteTextures(1, &ei->plane_tex[view][plane]);
+            }
+            if (ei->egl_image[view][plane] != EGL_NO_IMAGE_KHR)
+            {
+                eglDestroyImageKHR(g_egl_display, ei->egl_image[view][plane]);
+            }
+        }
         if (ei->input_surface[view] != VA_INVALID_ID)
         {
             vaDestroySurfaces(g_va_dpy, &ei->input_surface[view], 1);
         }
-        if (ei->egl_image[view] != EGL_NO_IMAGE_KHR)
-        {
-            eglDestroyImageKHR(g_egl_display, ei->egl_image[view]);
-        }
     }
-    /* VA takes ownership of the dma-buf fds on import (PRIME_2), so do not
-       close ei->dmabuf_fd[] here. */
     g_free(ei);
     return 0;
 }
@@ -1406,7 +1637,9 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
     qp = ei->qp_view[view];
 
     /* glFlush, not glFinish: the dma-buf's implicit sync orders the GL
-       writes before the VA-API encode. */
+       writes before the encode, on a surface libva allocated too. Checked
+       on iHD 26.1.2 (xe) with a slow render each frame and every encoded
+       frame decoded and compared: no stale frames. */
     glFlush();
 
     w_mbs = (ei->width + 15) / 16;

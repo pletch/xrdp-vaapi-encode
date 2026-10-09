@@ -21,12 +21,14 @@
 
 int
 xrdp_accel_assist_vaapi_init(void);
-/* tex_aux is the AVC444 aux view's texture, 0 for AVC420; both views are
-   pictures of one H.264 sequence. */
+/* nviews: 1 for AVC420, 2 for AVC444 (main and aux, pictures of one H.264
+   sequence). The encoder allocates each view's input surface and fills
+   targets[view] with GL textures over its planes for the shaders to draw
+   into; they stay valid until delete_encoder. */
 int
-xrdp_accel_assist_vaapi_create_encoder(int width, int height, int tex,
-                                       int tex_aux, int tex_format,
-                                       struct enc_info **ei);
+xrdp_accel_assist_vaapi_create_encoder(int width, int height, int nviews,
+                                       struct enc_info **ei,
+                                       struct xh_enc_target *targets);
 int
 xrdp_accel_assist_vaapi_delete_encoder(struct enc_info *ei);
 /* Encode both AVC444 views, submitting each before waiting on either. */
