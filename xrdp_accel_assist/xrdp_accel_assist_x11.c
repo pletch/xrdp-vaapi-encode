@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -1976,6 +1977,59 @@ xrdp_accel_assist_x11_recreate_enc(struct mon_info *mi)
    it came, rather than send kilobytes of rects. */
 #define DD_MAX_RECTS 256
 
+/* Every DD_STATS_MS, one log line: frames checked, the average time a
+   check took (GPU wait included), and what became of the frames. */
+#define DD_STATS_MS 5000
+static struct
+{
+    unsigned int start_ms;
+    unsigned long long us;
+    int checked;
+    int skipped;
+    int filtered;
+    int passed;
+    int bypassed;
+    int aux_owed;
+} g_dd_stats;
+
+static unsigned long long
+dd_now_us(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long) ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
+}
+
+static void
+dd_stats_log(void)
+{
+    unsigned int now = g_get_elapsed_ms();
+
+    if (g_dd_stats.start_ms == 0)
+    {
+        g_dd_stats.start_ms = now;
+        return;
+    }
+    if (now - g_dd_stats.start_ms < DD_STATS_MS)
+    {
+        return;
+    }
+    if (g_dd_stats.checked + g_dd_stats.bypassed > 0)
+    {
+        LOG(LOG_LEVEL_INFO, "damage detection: %d frames checked, %.2f ms "
+            "each; %d unchanged (skipped), %d filtered, %d passed as "
+            "damaged, %d aux catch-ups, %d not checked (video)",
+            g_dd_stats.checked,
+            g_dd_stats.checked > 0 ?
+            g_dd_stats.us / 1000.0 / g_dd_stats.checked : 0.0,
+            g_dd_stats.skipped, g_dd_stats.filtered, g_dd_stats.passed,
+            g_dd_stats.aux_owed, g_dd_stats.bypassed);
+    }
+    g_memset(&g_dd_stats, 0, sizeof(g_dd_stats));
+    g_dd_stats.start_ms = now;
+}
+
 static int
 xrdp_accel_assist_x11_damage_detect_enabled(void)
 {
@@ -2394,6 +2448,9 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
     {
         int force_all = (flags & XH_ENC_FLAGS_FORCEIDR) != 0;
 
+        int bypass = mi->dd_bypass > 0;
+        unsigned long long t0 = dd_now_us();
+
         dd_rects = g_new(struct xh_rect, DD_MAX_RECTS);
         if (dd_rects != NULL)
         {
@@ -2401,15 +2458,35 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
                                  num_crects, crects, force_all,
                                  dd_rects, DD_MAX_RECTS);
         }
+        if (bypass)
+        {
+            g_dd_stats.bypassed++;
+        }
+        else
+        {
+            g_dd_stats.checked++;
+            g_dd_stats.us += dd_now_us() - t0;
+            if (dd_n > 0)
+            {
+                g_dd_stats.filtered++;
+            }
+            else if (dd_n < 0)
+            {
+                g_dd_stats.passed++;
+            }
+        }
+        dd_stats_log();
         if (dd_n == 0 && !force_all)
         {
             if (!mi->aux_dirty)
             {
                 /* Repainted, not changed: no frame at all. */
+                g_dd_stats.skipped++;
                 g_free(dd_rects);
                 *cdata_bytes = 0;
                 return FRAME_UNCHANGED;
             }
+            g_dd_stats.aux_owed++;
             /* Nothing changed, but luma-only frames left part of the
                screen at 4:2:0: send the aux view now, over that part. */
             dd_rects[0].x = MAX(mi->aux_x1, 0);
