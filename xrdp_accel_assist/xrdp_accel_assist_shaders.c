@@ -41,6 +41,8 @@ static const GLchar g_fs_rgb_to_yuv420[] = "\
 uniform sampler2D tex;\n\
 uniform vec2 tex_size;\n\
 uniform float pad_h;\n\
+uniform float bpf;\n\
+uniform float y_off;\n\
 uniform vec4 ymath;\n\
 uniform vec4 umath;\n\
 uniform vec4 vmath;\n\
@@ -55,14 +57,23 @@ void main(void)\n\
     float bx;\n\
     float y;\n\
     float sy;\n\
-    bx = floor(gl_FragCoord.x) * 4.0;\n\
-    y = gl_FragCoord.y;\n\
+    bx = floor(gl_FragCoord.x) * bpf;\n\
+    y = gl_FragCoord.y + y_off;\n\
     if (y < pad_h)\n\
     {\n\
         p0 = texture2D(tex, vec2(bx + 0.5, y) / tex_size); p0.a = 1.0;\n\
-        p1 = texture2D(tex, vec2(bx + 1.5, y) / tex_size); p1.a = 1.0;\n\
-        p2 = texture2D(tex, vec2(bx + 2.5, y) / tex_size); p2.a = 1.0;\n\
-        p3 = texture2D(tex, vec2(bx + 3.5, y) / tex_size); p3.a = 1.0;\n\
+        p1 = p0;\n\
+        p2 = p0;\n\
+        p3 = p0;\n\
+        if (bpf > 1.5)\n\
+        {\n\
+            p1 = texture2D(tex, vec2(bx + 1.5, y) / tex_size); p1.a = 1.0;\n\
+        }\n\
+        if (bpf > 3.0)\n\
+        {\n\
+            p2 = texture2D(tex, vec2(bx + 2.5, y) / tex_size); p2.a = 1.0;\n\
+            p3 = texture2D(tex, vec2(bx + 3.5, y) / tex_size); p3.a = 1.0;\n\
+        }\n\
         gl_FragColor = clamp(vec4(dot(ymath, p0), dot(ymath, p1),\n\
                                   dot(ymath, p2), dot(ymath, p3)),\n\
                              0.0, 1.0);\n\
@@ -167,15 +178,21 @@ MAIN VIEW - NV12
    views share one sequence, so both use the 16-aligned height the aux view
    requires (MS-RDPEGFX 2.2.4.4.2). Rows past the source are clamped and
    never read by the client. */
-/* The NV12 destination is written as RGBA8 over a quarter-width viewport,
-   four bytes per fragment: single-byte writes to the linear dma-buf
-   coalesce badly, and it removes the per-fragment U/V branch.
+/* A linear NV12 destination is written as RGBA8 over a quarter-width
+   viewport, four bytes per fragment: single-byte writes to a linear
+   dma-buf coalesce badly, and it removes the per-fragment U/V branch.
    gl_FragColor.r is the lowest address, so fragment x writes bytes
-   4x .. 4x+3. */
+   bpf * x onwards. A tiled destination keeps its planes' own formats, R8
+   and GR88, which store only the first one or two components; bpf (bytes
+   per fragment) is then 1 or 2 and the fetches for the rest are skipped.
+   y_off: the row of the plane drawn, in the target's Y-then-UV rows (see
+   xrdp_accel_assist_x11_run_shader). */
 static const GLchar g_fs_rgb_to_yuv420_mv[] = "\
 uniform sampler2D tex;\n\
 uniform vec2 tex_size;\n\
 uniform float pad_h;\n\
+uniform float bpf;\n\
+uniform float y_off;\n\
 uniform vec4 ymath;\n\
 uniform vec4 umath;\n\
 uniform vec4 vmath;\n\
@@ -190,15 +207,25 @@ void main(void)\n\
     float bx;\n\
     float y;\n\
     float sy;\n\
-    bx = floor(gl_FragCoord.x) * 4.0;\n\
-    y = gl_FragCoord.y;\n\
+    bx = floor(gl_FragCoord.x) * bpf;\n\
+    y = gl_FragCoord.y + y_off;\n\
     if (y < pad_h)\n\
     {\n\
-        /* four luma bytes from four consecutive source pixels */\n\
+        /* four luma bytes from four consecutive source pixels, or as\n\
+           many as the plane takes a fragment */\n\
         p0 = texture2D(tex, vec2(bx + 0.5, y) / tex_size); p0.a = 1.0;\n\
-        p1 = texture2D(tex, vec2(bx + 1.5, y) / tex_size); p1.a = 1.0;\n\
-        p2 = texture2D(tex, vec2(bx + 2.5, y) / tex_size); p2.a = 1.0;\n\
-        p3 = texture2D(tex, vec2(bx + 3.5, y) / tex_size); p3.a = 1.0;\n\
+        p1 = p0;\n\
+        p2 = p0;\n\
+        p3 = p0;\n\
+        if (bpf > 1.5)\n\
+        {\n\
+            p1 = texture2D(tex, vec2(bx + 1.5, y) / tex_size); p1.a = 1.0;\n\
+        }\n\
+        if (bpf > 3.0)\n\
+        {\n\
+            p2 = texture2D(tex, vec2(bx + 2.5, y) / tex_size); p2.a = 1.0;\n\
+            p3 = texture2D(tex, vec2(bx + 3.5, y) / tex_size); p3.a = 1.0;\n\
+        }\n\
         gl_FragColor = clamp(vec4(dot(ymath, p0), dot(ymath, p1),\n\
                                   dot(ymath, p2), dot(ymath, p3)),\n\
                              0.0, 1.0);\n\
@@ -215,11 +242,16 @@ void main(void)\n\
            + texture2D(tex, vec2(bx + 0.5, sy + 1.0) / tex_size)\n\
            + texture2D(tex, vec2(bx + 1.5, sy + 1.0) / tex_size);\n\
         ca *= 0.25; ca.a = 1.0;\n\
-        cb = texture2D(tex, vec2(bx + 2.5, sy) / tex_size)\n\
-           + texture2D(tex, vec2(bx + 3.5, sy) / tex_size)\n\
-           + texture2D(tex, vec2(bx + 2.5, sy + 1.0) / tex_size)\n\
-           + texture2D(tex, vec2(bx + 3.5, sy + 1.0) / tex_size);\n\
-        cb *= 0.25; cb.a = 1.0;\n\
+        /* a GR88 plane takes only the first pair */\n\
+        cb = ca;\n\
+        if (bpf > 3.0)\n\
+        {\n\
+            cb = texture2D(tex, vec2(bx + 2.5, sy) / tex_size)\n\
+               + texture2D(tex, vec2(bx + 3.5, sy) / tex_size)\n\
+               + texture2D(tex, vec2(bx + 2.5, sy + 1.0) / tex_size)\n\
+               + texture2D(tex, vec2(bx + 3.5, sy + 1.0) / tex_size);\n\
+            cb *= 0.25; cb.a = 1.0;\n\
+        }\n\
         gl_FragColor = clamp(vec4(dot(umath, ca), dot(vmath, ca),\n\
                                   dot(umath, cb), dot(vmath, cb)),\n\
                              0.0, 1.0);\n\
@@ -254,6 +286,8 @@ static const GLchar g_fs_rgb_to_yuv420_av[] = "\
 uniform sampler2D tex;\n\
 uniform vec2 tex_size;\n\
 uniform float pad_h;\n\
+uniform float bpf;\n\
+uniform float y_off;\n\
 uniform vec4 umath;\n\
 uniform vec4 vmath;\n\
 void main(void)\n\
@@ -268,8 +302,8 @@ void main(void)\n\
     float y;\n\
     float y1;\n\
     float sy;\n\
-    bx = floor(gl_FragCoord.x) * 4.0;\n\
-    y = gl_FragCoord.y;\n\
+    bx = floor(gl_FragCoord.x) * bpf;\n\
+    y = gl_FragCoord.y + y_off;\n\
     if (y < pad_h)\n\
     {\n\
         y1 = mod(y, 16.0);\n\
@@ -278,9 +312,18 @@ void main(void)\n\
             sy = floor(y / 16.0) * 8.0 + y1;\n\
             sy = floor(sy) * 2.0 + 1.5;\n\
             p0 = texture2D(tex, vec2(bx + 0.5, sy) / tex_size); p0.a = 1.0;\n\
-            p1 = texture2D(tex, vec2(bx + 1.5, sy) / tex_size); p1.a = 1.0;\n\
-            p2 = texture2D(tex, vec2(bx + 2.5, sy) / tex_size); p2.a = 1.0;\n\
-            p3 = texture2D(tex, vec2(bx + 3.5, sy) / tex_size); p3.a = 1.0;\n\
+            p1 = p0;\n\
+            p2 = p0;\n\
+            p3 = p0;\n\
+            if (bpf > 1.5)\n\
+            {\n\
+                p1 = texture2D(tex, vec2(bx + 1.5, sy) / tex_size); p1.a = 1.0;\n\
+            }\n\
+            if (bpf > 3.0)\n\
+            {\n\
+                p2 = texture2D(tex, vec2(bx + 2.5, sy) / tex_size); p2.a = 1.0;\n\
+                p3 = texture2D(tex, vec2(bx + 3.5, sy) / tex_size); p3.a = 1.0;\n\
+            }\n\
             gl_FragColor = clamp(vec4(dot(umath, p0), dot(umath, p1),\n\
                                       dot(umath, p2), dot(umath, p3)),\n\
                                  0.0, 1.0);\n\
@@ -290,9 +333,18 @@ void main(void)\n\
             sy = floor(y / 16.0) * 8.0 + (y1 - 8.0);\n\
             sy = floor(sy) * 2.0 + 1.5;\n\
             p0 = texture2D(tex, vec2(bx + 0.5, sy) / tex_size); p0.a = 1.0;\n\
-            p1 = texture2D(tex, vec2(bx + 1.5, sy) / tex_size); p1.a = 1.0;\n\
-            p2 = texture2D(tex, vec2(bx + 2.5, sy) / tex_size); p2.a = 1.0;\n\
-            p3 = texture2D(tex, vec2(bx + 3.5, sy) / tex_size); p3.a = 1.0;\n\
+            p1 = p0;\n\
+            p2 = p0;\n\
+            p3 = p0;\n\
+            if (bpf > 1.5)\n\
+            {\n\
+                p1 = texture2D(tex, vec2(bx + 1.5, sy) / tex_size); p1.a = 1.0;\n\
+            }\n\
+            if (bpf > 3.0)\n\
+            {\n\
+                p2 = texture2D(tex, vec2(bx + 2.5, sy) / tex_size); p2.a = 1.0;\n\
+                p3 = texture2D(tex, vec2(bx + 3.5, sy) / tex_size); p3.a = 1.0;\n\
+            }\n\
             gl_FragColor = clamp(vec4(dot(vmath, p0), dot(vmath, p1),\n\
                                       dot(vmath, p2), dot(vmath, p3)),\n\
                                  0.0, 1.0);\n\
@@ -300,12 +352,16 @@ void main(void)\n\
     }\n\
     else\n\
     {\n\
-        /* bx is a multiple of four, so the four destination bytes are\n\
-           even, odd, even, odd: U and V of source column bx + 1, then of\n\
-           bx + 3. Two fetches cover them. */\n\
+        /* bx is even (four or two bytes a fragment), so the destination\n\
+           bytes are even, odd, even, odd: U and V of source column bx + 1,\n\
+           then of bx + 3. Two fetches cover them, one for a GR88 plane. */\n\
         sy = floor(y - pad_h) * 2.0 + 0.5;\n\
         ca = texture2D(tex, vec2(bx + 1.5, sy) / tex_size); ca.a = 1.0;\n\
-        cb = texture2D(tex, vec2(bx + 3.5, sy) / tex_size); cb.a = 1.0;\n\
+        cb = ca;\n\
+        if (bpf > 3.0)\n\
+        {\n\
+            cb = texture2D(tex, vec2(bx + 3.5, sy) / tex_size); cb.a = 1.0;\n\
+        }\n\
         gl_FragColor = clamp(vec4(dot(umath, ca), dot(vmath, ca),\n\
                                   dot(umath, cb), dot(vmath, cb)),\n\
                              0.0, 1.0);\n\
@@ -335,6 +391,8 @@ static const GLchar g_fs_rgb_to_yuv420_av_v2[] = "\
 uniform sampler2D tex;\n\
 uniform vec2 tex_size;\n\
 uniform float pad_h;\n\
+uniform float bpf;\n\
+uniform float y_off;\n\
 uniform vec4 umath;\n\
 uniform vec4 vmath;\n\
 void main(void)\n\
@@ -350,11 +408,11 @@ void main(void)\n\
     float base;\n\
     float sx;\n\
     float sy;\n\
-    bx = floor(gl_FragCoord.x) * 4.0;\n\
-    y = gl_FragCoord.y;\n\
+    bx = floor(gl_FragCoord.x) * bpf;\n\
+    y = gl_FragCoord.y + y_off;\n\
     x1 = ceil(tex_size.x / 16.0) * 8.0;\n\
-    /* x1 is a multiple of eight, so a four-byte group never straddles the\n\
-       U/V split and one branch settles the whole fragment. */\n\
+    /* x1 is a multiple of eight, so a fragment's bytes (four, two or\n\
+       one) never straddle the U/V split and one branch settles them. */\n\
     if (bx < x1)\n\
     {\n\
         base = bx;\n\
@@ -376,9 +434,18 @@ void main(void)\n\
         sy = floor(y - pad_h) * 2.0 + 1.5;\n\
     }\n\
     p0 = texture2D(tex, vec2(sx,       sy) / tex_size); p0.a = 1.0;\n\
-    p1 = texture2D(tex, vec2(sx + 2.0, sy) / tex_size); p1.a = 1.0;\n\
-    p2 = texture2D(tex, vec2(sx + 4.0, sy) / tex_size); p2.a = 1.0;\n\
-    p3 = texture2D(tex, vec2(sx + 6.0, sy) / tex_size); p3.a = 1.0;\n\
+    p1 = p0;\n\
+    p2 = p0;\n\
+    p3 = p0;\n\
+    if (bpf > 1.5)\n\
+    {\n\
+        p1 = texture2D(tex, vec2(sx + 2.0, sy) / tex_size); p1.a = 1.0;\n\
+    }\n\
+    if (bpf > 3.0)\n\
+    {\n\
+        p2 = texture2D(tex, vec2(sx + 4.0, sy) / tex_size); p2.a = 1.0;\n\
+        p3 = texture2D(tex, vec2(sx + 6.0, sy) / tex_size); p3.a = 1.0;\n\
+    }\n\
     gl_FragColor = clamp(vec4(dot(m, p0), dot(m, p1),\n\
                               dot(m, p2), dot(m, p3)),\n\
                          0.0, 1.0);\n\
