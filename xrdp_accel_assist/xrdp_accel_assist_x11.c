@@ -219,6 +219,7 @@ struct mon_info
     /* Damage detection (see damage_detect): the source as last encoded,
        a cell map the compare pass renders, and its CPU copy. */
     GLuint dd_prev_texture;       /* RGBA8, dd_w x dd_h */
+    GLuint dd_mask_texture;       /* R8, dd_w x dd_h: 1.0 where different */
     GLuint dd_cell_texture;       /* RGBA8, one texel per 16x16 cell */
     int dd_w;
     int dd_h;
@@ -250,9 +251,10 @@ static GLuint g_fb = 0;
 #define XH_SHADERRGB2YUV420MV   4
 #define XH_SHADERRGB2YUV420AV   5
 #define XH_SHADERRGB2YUV420AVV2 6
-#define XH_SHADERCELLDIFF       7
+#define XH_SHADERMASKDIFF       7
+#define XH_SHADERCELLMAX        8
 
-#define XH_NUM_SHADERS 8
+#define XH_NUM_SHADERS 9
 
 struct shader_info
 {
@@ -415,8 +417,11 @@ xrdp_accel_assist_x11_init(void)
     vsource[XH_SHADERRGB2YUV420AVV2] = g_vs;
     fsource[XH_SHADERRGB2YUV420AVV2] = g_fs_rgb_to_yuv420_av_v2;
 
-    vsource[XH_SHADERCELLDIFF] = g_vs;
-    fsource[XH_SHADERCELLDIFF] = g_fs_cell_diff;
+    vsource[XH_SHADERMASKDIFF] = g_vs;
+    fsource[XH_SHADERMASKDIFF] = g_fs_mask_diff;
+
+    vsource[XH_SHADERCELLMAX] = g_vs;
+    fsource[XH_SHADERCELLMAX] = g_fs_cell_max;
 
     for (index = 0; index < XH_NUM_SHADERS; index++)
     {
@@ -555,8 +560,10 @@ xrdp_accel_assist_x11_delete_all_pixmaps(void)
         if (mi->dd_prev_texture != 0)
         {
             glDeleteTextures(1, &(mi->dd_prev_texture));
+            glDeleteTextures(1, &(mi->dd_mask_texture));
             glDeleteTextures(1, &(mi->dd_cell_texture));
             mi->dd_prev_texture = 0;
+            mi->dd_mask_texture = 0;
             mi->dd_cell_texture = 0;
         }
         g_free(mi->dd_map);
@@ -2057,6 +2064,7 @@ dd_alloc(struct mon_info *mi, int width, int height)
     if (mi->dd_prev_texture != 0)
     {
         glDeleteTextures(1, &(mi->dd_prev_texture));
+        glDeleteTextures(1, &(mi->dd_mask_texture));
         glDeleteTextures(1, &(mi->dd_cell_texture));
     }
     g_free(mi->dd_map);
@@ -2073,6 +2081,12 @@ dd_alloc(struct mon_info *mi, int width, int height)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenTextures(1, &(mi->dd_mask_texture));
+    glBindTexture(GL_TEXTURE_2D, mi->dd_mask_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0,
+                 GL_RED, GL_UNSIGNED_BYTE, NULL);
     glGenTextures(1, &(mi->dd_cell_texture));
     glBindTexture(GL_TEXTURE_2D, mi->dd_cell_texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -2239,7 +2253,7 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
               struct xh_rect *crects, int force_all,
               struct xh_rect *out, int out_max)
 {
-    struct shader_info *si = g_si + XH_SHADERCELLDIFF;
+    struct shader_info *si;
     unsigned char *changed;
     int cells;
     int index;
@@ -2289,13 +2303,50 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
     changed = mi->dd_cand;
     if (!force_all && mi->dd_prev_valid)
     {
-        /* compare pass: one fragment per cell */
+        struct xh_rect *cand_rects;
+        int num_cand_rects = -1;
+        GLfloat *vertices;
+        GLuint vertices_bytes;
+        GLuint vertices_pointes;
+
+        /* mask pass, over the damaged cells only (every cell there gets a
+           fresh mask; the rest of the mask is never read) */
+        cand_rects = g_new(struct xh_rect, DD_MAX_RECTS);
+        if (cand_rects != NULL)
+        {
+            num_cand_rects = dd_cells_to_rects(mi, mi->dd_cand, cand_rects,
+                                               DD_MAX_RECTS);
+        }
+        vertices = get_vertices444(&vertices_bytes, &vertices_pointes,
+                                   num_cand_rects > 0 ? num_cand_rects : 0,
+                                   cand_rects, 0, 0, mi->dd_w, mi->dd_h);
+        g_free(cand_rects);
+        if (vertices == NULL)
+        {
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            g_inf_funcs[g_inf].release_tex_image(mi->inf_image[cur_buf]);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            return -1;
+        }
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, mi->dd_prev_texture);
         glActiveTexture(GL_TEXTURE0);
+        si = g_si + XH_SHADERMASKDIFF;
         glUseProgram(si->program);
         glUniform1i(si->tex_loc, 0);
         glUniform1i(si->prev_loc, 1);
+        glUniform2f(si->tex_size_loc, mi->dd_w, mi->dd_h);
+        dd_draw(mi->dd_mask_texture, mi->dd_w, mi->dd_h, vertices,
+                vertices_bytes, vertices_pointes);
+        g_free(vertices);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
+        /* cell pass: one fragment per 16x16 cell, over the whole map */
+        glBindTexture(GL_TEXTURE_2D, mi->dd_mask_texture);
+        si = g_si + XH_SHADERCELLMAX;
+        glUseProgram(si->program);
+        glUniform1i(si->tex_loc, 0);
         glUniform2f(si->tex_size_loc, mi->dd_w, mi->dd_h);
         glBindFramebuffer(GL_FRAMEBUFFER, g_fb);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
@@ -2317,9 +2368,8 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
         glBindVertexArray(0);
         glDeleteBuffers(1, &vbo);
         glDeleteVertexArrays(1, &vao);
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        glActiveTexture(GL_TEXTURE0);
+        /* the source again on unit 0, for the copy below */
+        glBindTexture(GL_TEXTURE_2D, mi->bmp_texture[cur_buf]);
         /* changed = damaged and different; reuse dd_cand in place */
         for (index = 0; index < cells; index++)
         {

@@ -35,33 +35,42 @@ void main(void)\n\
     gl_FragColor = texture2D(tex, gl_FragCoord.xy / tex_size);\n\
 }\n";
 
-/* Damage detection: one fragment per 16x16 cell of the source, 1.0 in red
-   if any pixel of the cell differs from the copy of the previous frame. */
-static const GLchar g_fs_cell_diff[] = "\
+/* Damage detection, two passes. The source is usually a linear dma-buf,
+   which a fragment walking a 16x16 block reads slowly, so first one
+   fragment per pixel: 1.0 where the source differs from the copy of the
+   previous frame, into a mask of our own. */
+static const GLchar g_fs_mask_diff[] = "\
 uniform sampler2D tex;\n\
 uniform sampler2D prev;\n\
 uniform vec2 tex_size;\n\
 void main(void)\n\
 {\n\
-    vec2 base;\n\
     vec2 p;\n\
-    float diff;\n\
+    p = gl_FragCoord.xy / tex_size;\n\
+    gl_FragColor = vec4(any(notEqual(texture2D(tex, p).rgb,\n\
+                                     texture2D(prev, p).rgb)) ? 1.0 : 0.0,\n\
+                        0.0, 0.0, 1.0);\n\
+}\n";
+
+/* Then one fragment per 16x16 cell: the most any mask pixel says. */
+static const GLchar g_fs_cell_max[] = "\
+uniform sampler2D tex;\n\
+uniform vec2 tex_size;\n\
+void main(void)\n\
+{\n\
+    vec2 base;\n\
+    float d;\n\
     base = floor(gl_FragCoord.xy) * 16.0;\n\
-    diff = 0.0;\n\
+    d = 0.0;\n\
     for (int j = 0; j < 16; j++)\n\
     {\n\
         for (int i = 0; i < 16; i++)\n\
         {\n\
-            p = base + vec2(float(i) + 0.5, float(j) + 0.5);\n\
-            if (p.x < tex_size.x && p.y < tex_size.y &&\n\
-                    any(notEqual(texture2D(tex, p / tex_size).rgb,\n\
-                                 texture2D(prev, p / tex_size).rgb)))\n\
-            {\n\
-                diff = 1.0;\n\
-            }\n\
+            d = max(d, texture2D(tex, (base + vec2(float(i) + 0.5,\n\
+                                       float(j) + 0.5)) / tex_size).r);\n\
         }\n\
     }\n\
-    gl_FragColor = vec4(diff, 0.0, 0.0, 1.0);\n\
+    gl_FragColor = vec4(d, 0.0, 0.0, 1.0);\n\
 }\n";
 
 /* Four bytes per fragment, as in the MV shader below; 2x2 chroma mean.
