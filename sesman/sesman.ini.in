@@ -285,6 +285,13 @@ PULSE_SCRIPT=@sesmansysconfdir@/pulse/default.pa
 ; During motion the interval always fires first and this costs nothing. Set
 ; to 0 to disable the deadline and count frames only.
 ;XRDP_AVC444_CHROMA_MAX_MS=200
+; Damage detection: compare what xorgxrdp reports as damaged with the frame
+; last encoded, and send only what actually changed. Toolkits repaint
+; unchanged pixels (Chrome redraws its page when the pointer crosses the
+; address bar), and each such luma-only frame showed the area at 4:2:0 until
+; the next chroma frame, so text flickered. Frames with nothing changed are
+; skipped. Costs about 1 ms a frame on the GPU; 0 turns it off.
+;XRDP_AVC444_DAMAGE_DETECT=1
 ; A synchronised IDR on both views at most this often, in milliseconds. Some
 ; clients' decoders -- mstsc's hardware-decoding path on at least some Intel
 ; GPUs -- occasionally get the two views into a bad state that shows as pink
