@@ -239,7 +239,7 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
                     | (((unsigned char *) addr)[1] << 8)
                     | (((unsigned char *) addr)[2] << 16)
                     | (((unsigned char *) addr)[3] << 24);
-        LOG(LOG_LEVEL_INFO, "gfx_wiretosurface1: AVC444 codec_id 0x%4.4x "
+        LOG(LOG_LEVEL_DEBUG, "gfx_wiretosurface1: AVC444 codec_id 0x%4.4x "
             "rv %d cdata_bytes %d (len1 %d)", codec_id, rv, cdata_bytes, alen1);
     }
 

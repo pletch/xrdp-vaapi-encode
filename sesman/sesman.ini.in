@@ -290,7 +290,8 @@ PULSE_SCRIPT=@sesmansysconfdir@/pulse/default.pa
 ; unchanged pixels (Chrome redraws its page when the pointer crosses the
 ; address bar), and each such luma-only frame showed the area at 4:2:0 until
 ; the next chroma frame, so text flickered. Frames with nothing changed are
-; skipped. Costs about 1 ms a frame on the GPU; 0 turns it off.
+; skipped. Costs about 1 ms a frame on the GPU; 0 turns it off. Its
+; statistics come with XRDP_VAAPI_TIMING=1 (below).
 ;XRDP_AVC444_DAMAGE_DETECT=1
 ; A synchronised IDR on both views at most this often, in milliseconds. Some
 ; clients' decoders -- mstsc's hardware-decoding path on at least some Intel
@@ -376,8 +377,10 @@ PULSE_SCRIPT=@sesmansysconfdir@/pulse/default.pa
 ; pays for that in latency rather than frames. Default 50, range 1-240.
 ;XORGXRDP_VFREQ=50
 ;
-; Diagnostics, off in production. The SPS and the audio round trip are also
-; logged at debug level (XRDP_ACCEL_ASSIST_LOG_LEVEL, chansrv's log level).
+; Diagnostics, off in production. XRDP_VAAPI_TIMING logs GL and encode
+; times, and every 5 s what damage detection did and what it cost. The SPS,
+; each AVC444 frame and the audio round trip are logged at debug level
+; (XRDP_ACCEL_ASSIST_LOG_LEVEL, chansrv's log level).
 ;XRDP_VAAPI_TIMING=1
 ;XORGXRDP_TIMING=1
 ;XRDP_AVC444_DUMP_DIR=/tmp/avc444
