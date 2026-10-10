@@ -356,6 +356,17 @@ persistent corruption that looks like a chroma bug but is not.
   stale until an auxiliary picture covers it, and each one covers the cells that
   need it plus every stale cell. Moving cells are stale on every frame, so while
   something moves the auxiliary picture goes at most every 250 ms.
+* **Under load, moving areas wait for 4:4:4.** xrdp measures each frame's
+  send-to-ack round trip and appends it to the ack, which passes through the helper.
+  A smoothed round trip more than 40 ms above its recent minimum means frames queue:
+  the link or the client's decoder is the bottleneck. Then, as GNOME Remote Desktop
+  drops to the main view, no auxiliary picture goes while anything moves, and the
+  motion window follows the capture interval (at a few frames a second, changes on
+  consecutive captures are still motion). One-off changes still get 4:4:4 at once,
+  and everything catches up once motion stops. It ends below 15 ms. The minimum
+  rather than a fixed figure is the baseline, so a long but uncongested path is not
+  load. Throttled to 3 Mbit/s, the test video went from 4.5 to 5.8 fps, its round
+  trip from about 340 to 100 ms, and its auxiliary bytes from 2.09 to 0.89 MB.
 * **A catch-up carries the auxiliary picture alone (`LC=2`).** When nothing changed
   but owed cells have settled, the main view is current already. Only the
   auxiliary picture is encoded, and xrdp sends it with `cbAvc420EncodedBitstream1`

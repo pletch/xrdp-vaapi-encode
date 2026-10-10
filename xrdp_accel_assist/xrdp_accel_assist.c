@@ -753,6 +753,20 @@ xrdp_process_message(struct xorgxrdp_info *xi, struct stream *s)
             LOG(LOG_LEVEL_DEBUG, "Resize 302 found (len: %d, msg1: %d, msg2: %d)", len, msg_type1, msg_type2);
         }
     }
+    else if (msg_type1 == 106 && s_check_rem(s, 12)) /* client region ex */
+    {
+        int flags;
+        int ack;
+        int rtt;
+
+        /* a frame ack; newer xrdp appends its send-to-ack round trip */
+        in_uint32_le(s, flags);
+        in_uint32_le(s, ack);
+        in_uint32_le(s, rtt);
+        (void)flags;
+        (void)ack;
+        xrdp_accel_assist_x11_note_rtt(rtt);
+    }
     /* Reset read pointer */
     s->p = s->data;
     return trans_write_copy_s(xi->xorg_trans, s);

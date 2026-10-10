@@ -58,6 +58,8 @@ xrdp_accel_assist_x11_encoder_avc444_v2(void);
 int
 xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
                                     int con_id, int mon_id);
+void
+xrdp_accel_assist_x11_note_rtt(int rtt_ms);
 enum encoder_result
 xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
                                     int mon_id, int num_crects,
