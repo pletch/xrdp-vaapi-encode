@@ -55,6 +55,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 
@@ -851,9 +852,17 @@ helper_start(struct be *b)
                 b->ops->render_node(b->ad, gpu, sizeof(gpu)) == 0);
     if (have_gpu && g_getenv("XRDP_VAAPI_DEVICE") != NULL)
     {
-        LOG(LOG_LEVEL_INFO, "the compositor renders on %s; the helper "
-            "would follow it, but XRDP_VAAPI_DEVICE (%s) overrides that",
-            gpu, g_getenv("XRDP_VAAPI_DEVICE"));
+        const char *dev = g_getenv("XRDP_VAAPI_DEVICE");
+        struct stat a;
+        struct stat b2;
+
+        /* when they differ, the adapter has warned already */
+        if (stat(gpu, &a) == 0 && stat(dev, &b2) == 0 &&
+                a.st_rdev == b2.st_rdev)
+        {
+            LOG(LOG_LEVEL_INFO, "the compositor renders on %s, as "
+                "XRDP_VAAPI_DEVICE names", gpu);
+        }
     }
     else if (have_gpu)
     {
