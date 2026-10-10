@@ -343,10 +343,24 @@ persistent corruption that looks like a chroma bug but is not.
   This replaced a fixed interval (every fourth frame, plus a 200 ms deadline),
   which both cost more and, because the deadline was only checked on the next
   frame, could leave a one-off change at 4:2:0 indefinitely: the hover flicker.
-  Measured at 1728x1024 v2 on FreeRDP 3.32, against the interval of 4: video 4.40
-  against 5.03 Mbit/s, coloured scrolling 2.80 against 3.18, with 4:4:4 back within
+  Measured at 1728x1024 v2 on FreeRDP 3.32, against the interval of 4: video 4.24
+  against 5.03 Mbit/s, colored scrolling 1.9-2.8 against 3.18, with 4:4:4 back within
   0.3-0.5 s of motion stopping, and no change in frame rate. Without damage
   detection the auxiliary picture goes with every frame.
+* **Each auxiliary picture covers every cell changed since the last one.** mstsc
+  completes the regions that luma-only frames updated with the next auxiliary
+  picture, wherever that picture was rendered, so a cell that changed without
+  needing 4:4:4 (gray, flat) must still be brought up to date in it, or mstsc
+  combines the new main view with stale chroma: pink halos and trails. FreeRDP
+  copies only the declared rects and never shows it. So every changed cell is
+  stale until an auxiliary picture covers it, and each one covers the cells that
+  need it plus every stale cell. Moving cells are stale on every frame, so while
+  something moves the auxiliary picture goes at most every 250 ms.
+* **A catch-up carries the auxiliary picture alone (`LC=2`).** When nothing changed
+  but owed cells have settled, the main view is current already. Only the
+  auxiliary picture is encoded, and xrdp sends it with `cbAvc420EncodedBitstream1`
+  zero, as MS-RDPEGFX 2.2.4.5 requires: mstsc drops the connection on any other
+  value, though FreeRDP does not check.
 * **Packed shaders**: the RGB->NV12 conversion writes four destination bytes per
   fragment as RGBA8 over a quarter-width viewport, for both the main and auxiliary
   views.
