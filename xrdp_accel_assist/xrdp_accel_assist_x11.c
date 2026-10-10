@@ -207,8 +207,6 @@ struct mon_info
     int aux_dirty;                /* 0 = nothing accumulated */
     int aux_x1, aux_y1, aux_x2, aux_y2;
     /* When the aux view last went out (monotonic ms). */
-    unsigned int aux_last_ms;
-    int aux_last_valid;           /* 0 until the first aux frame */
     /* When the last IDR went out, for any reason (monotonic ms). Set at
        creation, since the first picture is an IDR. */
     unsigned int idr_last_ms;
@@ -237,7 +235,7 @@ struct mon_info
     /* Damage detection (see damage_detect): the source as last encoded,
        a cell map the compare pass renders, and its CPU copy. */
     GLuint dd_prev_texture;       /* RGBA8, dd_w x dd_h */
-    GLuint dd_mask_texture;       /* R8, dd_w x dd_h: 1.0 where different */
+    GLuint dd_mask_texture;       /* RG8, dd_w x dd_h: changed, needs aux */
     GLuint dd_cell_texture;       /* RGBA8, one texel per 16x16 cell */
     int dd_w;
     int dd_h;
@@ -246,9 +244,23 @@ struct mon_info
     unsigned char *dd_map;        /* dd_cells_w x dd_cells_h RGBA */
     unsigned char *dd_cand;       /* cells the damage touches */
     int dd_prev_valid;            /* 0: dd_prev_texture holds nothing */
-    int dd_busy_frames;           /* consecutive frames almost all changed */
-    int dd_bypass;                /* frames left without comparing */
     int force_aux;                /* send the aux view with the next frame */
+    /* From damage detection, for this frame only: whether its cells say
+       which changed areas need the aux view, and their bounding box. */
+    int dd_need_valid;
+    int dd_need_any;
+    int dd_need_x1, dd_need_y1, dd_need_x2, dd_need_y2;
+    /* Per cell: frames in a row it changed, whether it still owes the aux
+       view (it needed it while moving), and whether it gets it now. */
+    unsigned char *dd_streak;     /* 1 once the cell has changed */
+    unsigned int *dd_changed_ms;  /* when the cell last changed */
+    unsigned char *dd_owe;
+    unsigned char *dd_auxc;
+    /* The cells getting the aux view this frame as rects; -1: too many,
+       use the dd_need box */
+    struct xh_rect *dd_aux_rects;
+    int dd_aux_n;
+    int dd_aux_declare;           /* the aux view went out over that list */
 };
 
 #define MAX_MON 16
@@ -285,6 +297,7 @@ struct shader_info
     GLint bpf_loc;         /* bytes per fragment, NV12 shaders only */
     GLint y_off_loc;       /* row offset of the plane drawn, NV12 only */
     GLint prev_loc;        /* only present in the mask diff shader */
+    GLint thr_loc;         /* only present in the mask diff shader */
     GLint ymath_loc;
     GLint umath_loc;
     GLint vmath_loc;
@@ -515,6 +528,8 @@ xrdp_accel_assist_gl_init(void)
             glGetUniformLocation(g_si[index].program, "y_off");
         g_si[index].prev_loc =
             glGetUniformLocation(g_si[index].program, "prev");
+        g_si[index].thr_loc =
+            glGetUniformLocation(g_si[index].program, "thr");
         g_si[index].ymath_loc =
             glGetUniformLocation(g_si[index].program, "ymath");
         g_si[index].umath_loc =
@@ -639,6 +654,16 @@ xrdp_accel_assist_x11_delete_all_pixmaps(void)
         g_free(mi->dd_cand);
         mi->dd_map = NULL;
         mi->dd_cand = NULL;
+        g_free(mi->dd_streak);
+        g_free(mi->dd_changed_ms);
+        g_free(mi->dd_owe);
+        g_free(mi->dd_auxc);
+        g_free(mi->dd_aux_rects);
+        mi->dd_streak = NULL;
+        mi->dd_changed_ms = NULL;
+        mi->dd_owe = NULL;
+        mi->dd_auxc = NULL;
+        mi->dd_aux_rects = NULL;
         mi->dd_w = 0;
         mi->dd_h = 0;
         mi->dd_prev_valid = 0;
@@ -971,56 +996,6 @@ xrdp_accel_assist_x11_avc444_v2(void)
 }
 
 /*****************************************************************************/
-/* Send the aux (chroma) view every Nth frame; the others carry luma only
-   (LC=1, MS-RDPEGFX 2.2.4.5), as a Windows host does. Picture count is
-   the binding cost. A long-term aux reference keeps skipped frames cheap.
-   Larger intervals add chroma lag and let the aux damage box grow toward
-   the full-frame fallback. XRDP_AVC444_CHROMA_INTERVAL, default 4. */
-static int
-xrdp_accel_assist_x11_chroma_interval(void)
-{
-    static int interval = -1;
-    const char *env;
-
-    if (interval < 0)
-    {
-        env = g_getenv("XRDP_AVC444_CHROMA_INTERVAL");
-        interval = (env != NULL) ? g_atoi(env) : 4;
-        if (interval < 1)
-        {
-            interval = 1;
-        }
-        LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11: AVC444 chroma interval "
-            "%d (1 = send the aux view every frame)", interval);
-    }
-    return interval;
-}
-
-/* Upper bound on chroma lag in ms. Frames are damage-driven, so on a quiet
-   desktop "every Nth frame" can be seconds; the aux also goes out once this
-   much time has passed. XRDP_AVC444_CHROMA_MAX_MS, default 200; 0
-   disables. */
-static int
-xrdp_accel_assist_x11_chroma_max_ms(void)
-{
-    static int max_ms = -1;
-    const char *env;
-
-    if (max_ms < 0)
-    {
-        env = g_getenv("XRDP_AVC444_CHROMA_MAX_MS");
-        max_ms = (env != NULL) ? g_atoi(env) : 200;
-        if (max_ms < 0)
-        {
-            max_ms = 0;
-        }
-        LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11: AVC444 chroma deadline "
-            "%d ms (0 = off, frame interval only)", max_ms);
-    }
-    return max_ms;
-}
-
-/*****************************************************************************/
 /* Period of a synchronised IDR on both views, in ms. Some clients'
    decoders get stuck in a bad state (mstsc with hardware decoding on some
    Intel drivers combines the views wrongly until the next IDR). Timed, not
@@ -1201,8 +1176,6 @@ create_encode_surface(struct mon_info *mi, int width, int height)
         mi->tex_format = XH_YUV420;
         /* A new surface invalidates the accumulated damage box. */
         mi->aux_dirty = 0;
-        mi->aux_last_valid = 0;
-        mi->aux_last_ms = 0;
         mi->idr_last_ms = g_get_elapsed_ms();
         mi->idr_bytes_since = 0;
         mi->idr_pending = 0;
@@ -1726,6 +1699,23 @@ flush_gl(void)
 }
 
 /*****************************************************************************/
+/* With XRDP_VAAPI_TIMING, every DD_STATS_MS one log line: frames checked,
+   the average time a check took (GPU wait included), and what became of
+   the frames. */
+#define DD_STATS_MS 5000
+static struct
+{
+    unsigned int start_ms;
+    unsigned long long us;
+    int checked;
+    int skipped;
+    int filtered;
+    int passed;
+    int aux_owed;
+    int aux_sent;                 /* frames that carried the aux view */
+    int frames;                   /* AVC444 frames encoded */
+} g_dd_stats;
+
 static enum encoder_result
 encode_pixmap(int left, int top, int width, int height,
               int mon_id, int num_crects, struct xh_rect *crects,
@@ -1788,7 +1778,6 @@ encode_pixmap(int left, int top, int width, int height,
         int aux_stage;
         unsigned int t_copy;
         unsigned int now_ms;
-        int max_ms;
         int idr_ms;
         int idr_frame;
 
@@ -1841,19 +1830,21 @@ encode_pixmap(int left, int top, int width, int height,
 
         /* Decide now whether this frame carries chroma, so both views can
            be submitted before either is waited on. */
-        max_ms = xrdp_accel_assist_x11_chroma_max_ms();
-        send_aux = ((frame_no % xrdp_accel_assist_x11_chroma_interval()) == 0)
-                   || mi->force_aux
-                   || ((flags & XH_ENC_FLAGS_FORCEIDR) != 0)
-                   || (max_ms > 0 && (!mi->aux_last_valid
-                                      || now_ms - mi->aux_last_ms
-                                      >= (unsigned int) max_ms));
-        mi->force_aux = 0;
-        if (send_aux)
+        if (mi->dd_need_valid)
         {
-            mi->aux_last_ms = now_ms;
-            mi->aux_last_valid = 1;
+            /* Damage detection says where the change needs the aux view;
+               an area luma-only frames left behind (aux_dirty) goes too. */
+            send_aux = mi->dd_need_any || mi->aux_dirty || mi->force_aux
+                       || ((flags & XH_ENC_FLAGS_FORCEIDR) != 0);
         }
+        else
+        {
+            /* Without its verdict (damage detection off): every frame. */
+            send_aux = 1;
+        }
+        mi->force_aux = 0;
+        g_dd_stats.frames++;
+        g_dd_stats.aux_sent += send_aux != 0;
 
         /* main view (MV shader) */
         if (frame_no == 0)
@@ -1875,40 +1866,74 @@ encode_pixmap(int left, int top, int width, int height,
                                              1);
         }
 
-        /* Aux view, on the chroma interval, deadline or an IDR; otherwise
+        /* Aux view where a change needs it, or on an IDR; otherwise
            len2 stays 0 and xrdp sends LC=1. v1 renders full-frame (its
-           tiling scatters rects); v2 renders the accumulated damage box,
-           which is also what the metablock declares. */
-        /* Accumulate damage for the aux view whether or not it goes out. */
-        for (aux_i = 0; aux_i < num_crects; aux_i++)
+           tiling scatters rects); v2 renders the cells that get it, or the
+           accumulated box; the metablock declares the same. */
+        /* Accumulate damage for the aux view whether or not it goes out.
+           With damage detection's verdict only the part that needs it:
+           the rest is right at 4:2:0. */
+        if (mi->dd_need_valid)
         {
-            struct xh_rect *r = crects + aux_i;
+            /* With the cells as a list, the aux view goes out over just
+               them (below); the box is for a list that overflowed. */
+            if (mi->dd_need_any && mi->dd_aux_n < 0)
+            {
+                struct xh_rect r;
 
-            if (!mi->aux_dirty)
-            {
-                mi->aux_dirty = 1;
-                mi->aux_x1 = r->x;
-                mi->aux_y1 = r->y;
-                mi->aux_x2 = r->x + r->w;
-                mi->aux_y2 = r->y + r->h;
+                r.x = mi->dd_need_x1;
+                r.y = mi->dd_need_y1;
+                r.w = mi->dd_need_x2 - mi->dd_need_x1;
+                r.h = mi->dd_need_y2 - mi->dd_need_y1;
+                if (!mi->aux_dirty)
+                {
+                    mi->aux_dirty = 1;
+                    mi->aux_x1 = r.x;
+                    mi->aux_y1 = r.y;
+                    mi->aux_x2 = r.x + r.w;
+                    mi->aux_y2 = r.y + r.h;
+                }
+                else
+                {
+                    mi->aux_x1 = MIN(mi->aux_x1, r.x);
+                    mi->aux_y1 = MIN(mi->aux_y1, r.y);
+                    mi->aux_x2 = MAX(mi->aux_x2, r.x + r.w);
+                    mi->aux_y2 = MAX(mi->aux_y2, r.y + r.h);
+                }
             }
-            else
+        }
+        else
+        {
+            for (aux_i = 0; aux_i < num_crects; aux_i++)
             {
-                if (r->x < mi->aux_x1)
+                struct xh_rect *r = crects + aux_i;
+
+                if (!mi->aux_dirty)
                 {
+                    mi->aux_dirty = 1;
                     mi->aux_x1 = r->x;
-                }
-                if (r->y < mi->aux_y1)
-                {
                     mi->aux_y1 = r->y;
-                }
-                if (r->x + r->w > mi->aux_x2)
-                {
                     mi->aux_x2 = r->x + r->w;
-                }
-                if (r->y + r->h > mi->aux_y2)
-                {
                     mi->aux_y2 = r->y + r->h;
+                }
+                else
+                {
+                    if (r->x < mi->aux_x1)
+                    {
+                        mi->aux_x1 = r->x;
+                    }
+                    if (r->y < mi->aux_y1)
+                    {
+                        mi->aux_y1 = r->y;
+                    }
+                    if (r->x + r->w > mi->aux_x2)
+                    {
+                        mi->aux_x2 = r->x + r->w;
+                    }
+                    if (r->y + r->h > mi->aux_y2)
+                    {
+                        mi->aux_y2 = r->y + r->h;
+                    }
                 }
             }
         }
@@ -1922,7 +1947,24 @@ encode_pixmap(int left, int top, int width, int height,
             full_rect.h = mi->pad_h;     /* v1: include the pad rows */
             si = g_si + (mi->avc444_v2 ? XH_SHADERRGB2YUV420AVV2
                          : XH_SHADERRGB2YUV420AV);
-            if (mi->avc444_v2)
+            mi->dd_aux_declare = 0;
+            if (mi->avc444_v2 && mi->dd_need_valid && mi->dd_aux_n > 0 &&
+                    !mi->aux_dirty && (flags & XH_ENC_FLAGS_FORCEIDR) == 0)
+            {
+                /* Just the cells that get it now; xrdp declares the list. */
+                xrdp_accel_assist_x11_run_shader(0, 0, width, height,
+                                                 mi, si, &mi->tgt[1],
+                                                 mi->dd_aux_n,
+                                                 mi->dd_aux_rects,
+                                                 mi->buf_h, mi->enc_w4, 1);
+                mi->dd_aux_declare = 1;
+                have_aux_rect = 1;
+                aux_x1 = mi->dd_need_x1;
+                aux_y1 = mi->dd_need_y1;
+                aux_x2 = mi->dd_need_x2;
+                aux_y2 = mi->dd_need_y2;
+            }
+            else if (mi->avc444_v2)
             {
                 /* Past half the frame, render it all. */
                 aux_rect.x = mi->aux_x1;
@@ -1954,6 +1996,10 @@ encode_pixmap(int left, int top, int width, int height,
                                                  &mi->tgt[1], 1,
                                                  &full_rect, mi->buf_h,
                                                  mi->enc_w4, 0);
+                /* v1 renders everything, but declares only what changed */
+                mi->dd_aux_declare = mi->dd_need_valid && mi->dd_aux_n > 0 &&
+                                     !mi->aux_dirty &&
+                                     (flags & XH_ENC_FLAGS_FORCEIDR) == 0;
             }
             mi->aux_dirty = 0;
             if (frame_no == 0)
@@ -2118,28 +2164,19 @@ xrdp_accel_assist_x11_recreate_enc(struct mon_info *mi)
    encoded, in 16x16 cells on the GPU, and pass on only the cells that
    changed. XRDP_AVC444_DAMAGE_DETECT=0 turns it off. */
 #define DD_CELL 16
-/* Frames almost all changed (video) before comparing stops for a while. */
-#define DD_BUSY_FRAMES 8
-#define DD_BYPASS_FRAMES 60
 /* More changed rects than this (scattered changes): declare the damage as
    it came, rather than send kilobytes of rects. */
 #define DD_MAX_RECTS 256
+/* A cell that changes again within this long of its previous change is
+   moving (video, scrolling, a drag): it goes luma-only and gets the aux
+   view once it settles. Typing at a normal pace stays a run of one-off
+   changes, each of which gets the aux view at once. */
+#define DD_MOTION_MS 150
+/* An owing cell gets the aux view once it has not changed for this long:
+   a cell that changes on every other capture (video at a rate the capture
+   does not match) is still moving. The idle flush comes later than this. */
+#define DD_SETTLE_MS 120
 
-/* With XRDP_VAAPI_TIMING, every DD_STATS_MS one log line: frames checked,
-   the average time a check took (GPU wait included), and what became of
-   the frames. */
-#define DD_STATS_MS 5000
-static struct
-{
-    unsigned int start_ms;
-    unsigned long long us;
-    int checked;
-    int skipped;
-    int filtered;
-    int passed;
-    int bypassed;
-    int aux_owed;
-} g_dd_stats;
 
 static unsigned long long
 dd_now_us(void)
@@ -2170,16 +2207,18 @@ dd_stats_log(void)
     {
         return;
     }
-    if (g_dd_stats.checked + g_dd_stats.bypassed > 0)
+    if (g_dd_stats.checked > 0)
     {
         LOG(LOG_LEVEL_INFO, "damage detection: %d frames checked, %.2f ms "
             "each; %d unchanged (skipped), %d filtered, %d passed as "
-            "damaged, %d aux catch-ups, %d not checked (video)",
+            "damaged, %d aux catch-ups; aux view "
+            "on %d of %d frames",
             g_dd_stats.checked,
             g_dd_stats.checked > 0 ?
             g_dd_stats.us / 1000.0 / g_dd_stats.checked : 0.0,
             g_dd_stats.skipped, g_dd_stats.filtered, g_dd_stats.passed,
-            g_dd_stats.aux_owed, g_dd_stats.bypassed);
+            g_dd_stats.aux_owed,
+            g_dd_stats.aux_sent, g_dd_stats.frames);
     }
     g_memset(&g_dd_stats, 0, sizeof(g_dd_stats));
     g_dd_stats.start_ms = now;
@@ -2199,6 +2238,33 @@ xrdp_accel_assist_x11_damage_detect_enabled(void)
             "%s", enabled ? "on" : "off (XRDP_AVC444_DAMAGE_DETECT=0)");
     }
     return enabled;
+}
+
+/*****************************************************************************/
+/* The AVC444 aux view goes only where a change needs it: where the 4:2:0
+   main view alone (the 2x2 chroma mean) would be off by more than
+   XRDP_AVC444_AUX_THRESHOLD (0-255, default 30, the threshold MS-RDPEGFX
+   3.3.8.3.3 gives the client's reverse filter). Grey and flat content goes
+   without; coloured detail gets 4:4:4 on the frame it changes, or, while it
+   moves, once it settles. */
+static float
+xrdp_accel_assist_x11_aux_threshold(void)
+{
+    static int thr = -1;
+
+    if (thr < 0)
+    {
+        const char *env = g_getenv("XRDP_AVC444_AUX_THRESHOLD");
+
+        thr = (env != NULL) ? g_atoi(env) : 30;
+        if (thr < 0 || thr > 255)
+        {
+            thr = 30;
+        }
+        LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11: AVC444 aux threshold %d",
+            thr);
+    }
+    return thr / 255.0f;
 }
 
 /*****************************************************************************/
@@ -2223,6 +2289,16 @@ dd_alloc(struct mon_info *mi, int width, int height)
     mi->dd_cells_h = (height + DD_CELL - 1) / DD_CELL;
     mi->dd_map = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h * 4);
     mi->dd_cand = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
+    g_free(mi->dd_streak);
+    g_free(mi->dd_changed_ms);
+    g_free(mi->dd_owe);
+    g_free(mi->dd_auxc);
+    g_free(mi->dd_aux_rects);
+    mi->dd_streak = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
+    mi->dd_changed_ms = g_new0(unsigned int, mi->dd_cells_w * mi->dd_cells_h);
+    mi->dd_owe = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
+    mi->dd_auxc = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
+    mi->dd_aux_rects = g_new(struct xh_rect, DD_MAX_RECTS);
     glGenTextures(1, &(mi->dd_prev_texture));
     glBindTexture(GL_TEXTURE_2D, mi->dd_prev_texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -2233,8 +2309,8 @@ dd_alloc(struct mon_info *mi, int width, int height)
     glBindTexture(GL_TEXTURE_2D, mi->dd_mask_texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0,
-                 GL_RED, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, width, height, 0,
+                 GL_RG, GL_UNSIGNED_BYTE, NULL);
     glGenTextures(1, &(mi->dd_cell_texture));
     glBindTexture(GL_TEXTURE_2D, mi->dd_cell_texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -2243,7 +2319,10 @@ dd_alloc(struct mon_info *mi, int width, int height)
                  0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     glBindTexture(GL_TEXTURE_2D, 0);
     mi->dd_prev_valid = 0;
-    if (mi->dd_map == NULL || mi->dd_cand == NULL)
+    if (mi->dd_map == NULL || mi->dd_cand == NULL || mi->dd_streak == NULL ||
+            mi->dd_changed_ms == NULL ||
+            mi->dd_owe == NULL || mi->dd_auxc == NULL ||
+            mi->dd_aux_rects == NULL)
     {
         return 1;
     }
@@ -2417,14 +2496,6 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
     {
         return -1;
     }
-    if (mi->dd_bypass > 0)
-    {
-        /* Video: everything changes. Stop comparing for a while; the copy
-           of the previous frame goes stale, so start over afterwards. */
-        mi->dd_bypass--;
-        mi->dd_prev_valid = 0;
-        return -1;
-    }
     cells = mi->dd_cells_w * mi->dd_cells_h;
     g_memset(mi->dd_cand, 0, cells);
     for (index = 0; index < num_crects; index++)
@@ -2484,6 +2555,7 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
         glUniform1i(si->tex_loc, 0);
         glUniform1i(si->prev_loc, 1);
         glUniform2f(si->tex_size_loc, mi->dd_w, mi->dd_h);
+        glUniform1f(si->thr_loc, xrdp_accel_assist_x11_aux_threshold());
         dd_draw(mi->dd_mask_texture, mi->dd_w, mi->dd_h, vertices,
                 vertices_bytes, vertices_pointes);
         g_free(vertices);
@@ -2518,35 +2590,87 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
         glDeleteVertexArrays(1, &vao);
         /* the source again on unit 0, for the copy below */
         glBindTexture(GL_TEXTURE_2D, mi->bmp_texture[cur_buf]);
-        /* changed = damaged and different; reuse dd_cand in place */
+        /* changed = damaged and different; reuse dd_cand in place. Then,
+           per cell: a change that needs the aux view gets it now, unless the
+           cell is moving; a moving one owes it, and an owing cell gets it
+           once it stops changing. Those cells give the aux view's rects. */
+        unsigned int now_ms = g_get_elapsed_ms();
+
+        mi->dd_need_valid = 1;
+        mi->dd_need_any = 0;
         for (index = 0; index < cells; index++)
         {
+            int changed_now = 0;
+            int need = 0;
+            int moving;
+            int aux_now;
+
             if (mi->dd_cand[index])
             {
                 num_cand++;
-                mi->dd_cand[index] = mi->dd_map[index * 4] > 127;
-                num_changed += mi->dd_cand[index];
+                changed_now = mi->dd_map[index * 4] > 127;
+                need = changed_now && mi->dd_map[index * 4 + 1] > 127;
+                mi->dd_cand[index] = changed_now;
+                num_changed += changed_now;
             }
-        }
-        if (num_cand > 0 && num_changed * 10 >= num_cand * 9 &&
-                num_changed * 2 >= cells)
-        {
-            if (++mi->dd_busy_frames >= DD_BUSY_FRAMES)
+            moving = 0;
+            if (changed_now)
             {
-                mi->dd_busy_frames = 0;
-                mi->dd_bypass = DD_BYPASS_FRAMES;
+                /* dd_streak: the cell has changed before, so its time is
+                   meaningful */
+                moving = mi->dd_streak[index] &&
+                         now_ms - mi->dd_changed_ms[index] < DD_MOTION_MS;
+                mi->dd_changed_ms[index] = now_ms;
+                mi->dd_streak[index] = 1;
+            }
+            if (need && moving)
+            {
+                mi->dd_owe[index] = 1;
+            }
+            aux_now = (need && !moving) ||
+                      (mi->dd_owe[index] && !changed_now &&
+                       now_ms - mi->dd_changed_ms[index] >= DD_SETTLE_MS);
+            mi->dd_auxc[index] = aux_now;
+            if (aux_now)
+            {
+                int x1 = (index % mi->dd_cells_w) * DD_CELL;
+                int y1 = (index / mi->dd_cells_w) * DD_CELL;
+                int x2 = MIN(x1 + DD_CELL, mi->dd_w);
+                int y2 = MIN(y1 + DD_CELL, mi->dd_h);
+
+                mi->dd_owe[index] = 0;
+                if (!mi->dd_need_any)
+                {
+                    mi->dd_need_any = 1;
+                    mi->dd_need_x1 = x1;
+                    mi->dd_need_y1 = y1;
+                    mi->dd_need_x2 = x2;
+                    mi->dd_need_y2 = y2;
+                }
+                else
+                {
+                    mi->dd_need_x1 = MIN(mi->dd_need_x1, x1);
+                    mi->dd_need_y1 = MIN(mi->dd_need_y1, y1);
+                    mi->dd_need_x2 = MAX(mi->dd_need_x2, x2);
+                    mi->dd_need_y2 = MAX(mi->dd_need_y2, y2);
+                }
             }
         }
-        else
-        {
-            mi->dd_busy_frames = 0;
-        }
+        mi->dd_aux_n = mi->dd_need_any ?
+                       dd_cells_to_rects(mi, mi->dd_auxc, mi->dd_aux_rects,
+                                         DD_MAX_RECTS) : 0;
     }
     else
     {
         for (index = 0; index < cells; index++)
         {
             num_changed += mi->dd_cand[index];
+        }
+        if (force_all)
+        {
+            /* an IDR sends the aux view over everything */
+            g_memset(mi->dd_owe, 0, cells);
+            g_memset(mi->dd_streak, 0, cells);
         }
     }
 
@@ -2575,7 +2699,7 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
 /*****************************************************************************/
 /* Appends the changed-rects trailer after whatever encode_pixmap wrote. */
 static void
-dd_append_rects(void *cdata, int *cdata_bytes, int avail,
+dd_append_rects(void *cdata, int *cdata_bytes, int avail, unsigned int magic,
                 int num_rects, const struct xh_rect *rects)
 {
     unsigned char *t = (unsigned char *) cdata + *cdata_bytes;
@@ -2588,7 +2712,7 @@ dd_append_rects(void *cdata, int *cdata_bytes, int avail,
     {
         return;
     }
-    head[0] = XH_AVC444_RECTS_MAGIC;
+    head[0] = magic;
     head[1] = (unsigned int) num_rects;
     for (k = 0; k < 2; k++)
     {
@@ -2641,12 +2765,12 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
     {
         flags |= XH_ENC_FLAGS_FORCEIDR;
     }
+    mi->dd_need_valid = 0;
+    mi->dd_aux_declare = 0;
     if ((codec_id == XH_CODECID_AVC444 || codec_id == XH_CODECID_AVC444V2) &&
             mi->avc444 && xrdp_accel_assist_x11_damage_detect_enabled())
     {
         int force_all = (flags & XH_ENC_FLAGS_FORCEIDR) != 0;
-
-        int bypass = mi->dd_bypass > 0;
         unsigned long long t0 = dd_now_us();
 
         dd_rects = g_new(struct xh_rect, DD_MAX_RECTS);
@@ -2659,25 +2783,28 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
                                  num_crects, crects, force_all,
                                  dd_rects, DD_MAX_RECTS);
         }
-        if (bypass)
+        g_dd_stats.checked++;
+        g_dd_stats.us += dd_now_us() - t0;
+        if (dd_n > 0)
         {
-            g_dd_stats.bypassed++;
+            g_dd_stats.filtered++;
         }
-        else
+        else if (dd_n < 0)
         {
-            g_dd_stats.checked++;
-            g_dd_stats.us += dd_now_us() - t0;
-            if (dd_n > 0)
-            {
-                g_dd_stats.filtered++;
-            }
-            else if (dd_n < 0)
-            {
-                g_dd_stats.passed++;
-            }
+            g_dd_stats.passed++;
         }
         dd_stats_log();
-        if (dd_n == 0 && !force_all)
+        if (dd_n == 0 && !force_all && mi->dd_need_valid && mi->dd_need_any &&
+                mi->dd_aux_n > 0 && !mi->aux_dirty)
+        {
+            /* Nothing changed, but cells that were moving have settled:
+               their aux view now, declared for both views. */
+            g_dd_stats.aux_owed++;
+            g_memcpy(dd_rects, mi->dd_aux_rects,
+                     mi->dd_aux_n * sizeof(struct xh_rect));
+            dd_n = mi->dd_aux_n;
+        }
+        else if (dd_n == 0 && !force_all)
         {
             if (!mi->aux_dirty)
             {
@@ -2706,7 +2833,14 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
                            cdata, cdata_bytes, codec_id, flags);
         if (rv != ENCODER_ERROR)
         {
-            dd_append_rects(cdata, cdata_bytes, avail, dd_n, dd_rects);
+            dd_append_rects(cdata, cdata_bytes, avail, XH_AVC444_RECTS_MAGIC,
+                            dd_n, dd_rects);
+            if (mi->dd_aux_declare)
+            {
+                dd_append_rects(cdata, cdata_bytes, avail,
+                                XH_AVC444_AUX_RECTS_MAGIC,
+                                mi->dd_aux_n, mi->dd_aux_rects);
+            }
         }
     }
     else

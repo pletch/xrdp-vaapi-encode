@@ -56,6 +56,10 @@ struct xh_rect
 #define XH_AVC444_RECTS_MAGIC 0x54434552  /* "RECT" */
 #define XH_AVC444_RECTS_HEAD_BYTES 8
 #define XH_AVC444_RECTS_MAX 4096
+/* Optional trailer after that: the rects the aux view covers this frame,
+   which xrdp declares for the aux view instead of the single aux rect.
+   Same layout as XH_AVC444_RECTS_MAGIC. */
+#define XH_AVC444_AUX_RECTS_MAGIC 0x52585541  /* "AUXR" */
 
 /* Control batch (message type 100) sub-message from a frame source that
    is not Xorg (the Wayland backend, which starts the helper with -w): one

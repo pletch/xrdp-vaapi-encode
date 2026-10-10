@@ -813,6 +813,69 @@ gfx_send_done(struct xrdp_encoder *self, XRDP_ENC_DATA *enc,
 }
 
 /*****************************************************************************/
+/* Reads a rects trailer (see XH_AVC444_RECTS_MAGIC) at pos, if one with this
+   magic is there, into *rects (clamped to the surface). Returns the position
+   after it, or pos if there was none. */
+static int
+gfx_rects_trailer(const unsigned char *d, int avail, int pos,
+                  unsigned int want_magic, int width, int height,
+                  struct xrdp_egfx_rect **rects, int *num_rects)
+{
+    const unsigned char *t;
+    unsigned int magic;
+    unsigned int count;
+    unsigned int ri;
+    struct xrdp_egfx_rect *r;
+    int n = 0;
+
+    *rects = NULL;
+    *num_rects = 0;
+    if (avail - pos < XH_AVC444_RECTS_HEAD_BYTES)
+    {
+        return pos;
+    }
+    t = d + pos;
+    magic = t[0] | (t[1] << 8) | (t[2] << 16) | ((unsigned int) t[3] << 24);
+    count = t[4] | (t[5] << 8) | (t[6] << 16) | ((unsigned int) t[7] << 24);
+    if (magic != want_magic || count < 1 || count > XH_AVC444_RECTS_MAX ||
+            (int) (XH_AVC444_RECTS_HEAD_BYTES + count * 8) > avail - pos)
+    {
+        return pos;
+    }
+    r = g_new0(struct xrdp_egfx_rect, count);
+    if (r == NULL)
+    {
+        return pos;
+    }
+    t += XH_AVC444_RECTS_HEAD_BYTES;
+    for (ri = 0; ri < count; ri++, t += 8)
+    {
+        /* From shared memory: clamp. */
+        int x1 = MIN(t[0] | (t[1] << 8), width);
+        int y1 = MIN(t[2] | (t[3] << 8), height);
+        int x2 = MIN(t[4] | (t[5] << 8), width);
+        int y2 = MIN(t[6] | (t[7] << 8), height);
+
+        if ((x2 > x1) && (y2 > y1))
+        {
+            r[n].x1 = x1;
+            r[n].y1 = y1;
+            r[n].x2 = x2;
+            r[n].y2 = y2;
+            n++;
+        }
+    }
+    if (n == 0)
+    {
+        g_free(r);
+        r = NULL;
+    }
+    *rects = r;
+    *num_rects = n;
+    return pos + XH_AVC444_RECTS_HEAD_BYTES + count * 8;
+}
+
+/*****************************************************************************/
 static struct stream *
 gfx_wiretosurface1(struct xrdp_encoder *self,
                    struct xrdp_egfx_bulk *bulk, struct stream *in_s,
@@ -1076,56 +1139,24 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
                 }
             }
         }
-        /* Optional trailer: the rects that actually changed (the helper's
-           damage detection, see xrdp_accel_assist.h). Declared for both
+        /* Optional trailers: the rects that actually changed (the helper's
+           damage detection, see xrdp_accel_assist.h), declared for both
            views in place of xorgxrdp's damage, so repainted but unchanged
-           areas are not shown at 4:2:0 again. */
+           areas are not shown at 4:2:0 again; then the rects the aux view
+           covers, when it covers less than that. */
         struct xrdp_egfx_rect *chg_rects = NULL;
         int num_chg_rects = 0;
+        struct xrdp_egfx_rect *auxl_rects = NULL;
+        int num_auxl_rects = 0;
 
-        if (avail - trailer_pos >= XH_AVC444_RECTS_HEAD_BYTES)
+        trailer_pos = gfx_rects_trailer(d, avail, trailer_pos,
+                                        XH_AVC444_RECTS_MAGIC, width, height,
+                                        &chg_rects, &num_chg_rects);
+        if (chg_rects != NULL && len2 > 0)
         {
-            const unsigned char *t = d + trailer_pos;
-            unsigned int magic = t[0] | (t[1] << 8) | (t[2] << 16) |
-                                 ((unsigned int) t[3] << 24);
-            unsigned int count = t[4] | (t[5] << 8) | (t[6] << 16) |
-                                 ((unsigned int) t[7] << 24);
-
-            if (magic == XH_AVC444_RECTS_MAGIC && count >= 1 &&
-                    count <= XH_AVC444_RECTS_MAX &&
-                    (int) (XH_AVC444_RECTS_HEAD_BYTES + count * 8) <=
-                    avail - trailer_pos)
-            {
-                chg_rects = g_new0(struct xrdp_egfx_rect, count);
-            }
-            if (chg_rects != NULL)
-            {
-                unsigned int ri;
-
-                t += XH_AVC444_RECTS_HEAD_BYTES;
-                for (ri = 0; ri < count; ri++, t += 8)
-                {
-                    /* From shared memory: clamp. */
-                    int x1 = MIN(t[0] | (t[1] << 8), width);
-                    int y1 = MIN(t[2] | (t[3] << 8), height);
-                    int x2 = MIN(t[4] | (t[5] << 8), width);
-                    int y2 = MIN(t[6] | (t[7] << 8), height);
-
-                    if ((x2 > x1) && (y2 > y1))
-                    {
-                        chg_rects[num_chg_rects].x1 = x1;
-                        chg_rects[num_chg_rects].y1 = y1;
-                        chg_rects[num_chg_rects].x2 = x2;
-                        chg_rects[num_chg_rects].y2 = y2;
-                        num_chg_rects++;
-                    }
-                }
-                if (num_chg_rects == 0)
-                {
-                    g_free(chg_rects);
-                    chg_rects = NULL;
-                }
-            }
+            gfx_rects_trailer(d, avail, trailer_pos,
+                              XH_AVC444_AUX_RECTS_MAGIC, width, height,
+                              &auxl_rects, &num_auxl_rects);
         }
         char *info_p = s->p;
         char *str1_start;
@@ -1181,6 +1212,7 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
                 g_free(c_rects);
                 g_free(d_rects);
                 g_free(chg_rects);
+                g_free(auxl_rects);
                 g_free(crects);
                 return NULL;
             }
@@ -1191,7 +1223,13 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
                 struct xrdp_egfx_rect *aux_rects = meta_rects;
                 int aux_num_rects = meta_num_rects;
 
-                if (have_aux_rect)
+                if (auxl_rects != NULL)
+                {
+                    /* The cells the helper rendered the aux view over. */
+                    aux_rects = auxl_rects;
+                    aux_num_rects = num_auxl_rects;
+                }
+                else if (have_aux_rect)
                 {
                     /* Exactly what the helper rendered. */
                     aux_rects = &wire_aux_rect;
@@ -1212,6 +1250,7 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
                     g_free(c_rects);
                     g_free(d_rects);
                     g_free(chg_rects);
+                    g_free(auxl_rects);
                     g_free(crects);
                     return NULL;
                 }
@@ -1234,6 +1273,7 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
         g_free(c_rects);
         g_free(d_rects);
         g_free(chg_rects);
+        g_free(auxl_rects);
         s_mark_end(s);
         bitmap_data_length = (int) (s->end - s->data);
         if (self->frame_log)
