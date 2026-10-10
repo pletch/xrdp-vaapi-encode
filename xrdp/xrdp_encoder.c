@@ -1162,6 +1162,7 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
         char *str1_start;
         char *save_p;
         int size1;
+        int lc;
         int emitted_rects = 0;
         int emitted_aux_rects = 0;
 
@@ -1200,9 +1201,33 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
                 meta_num_rects = num_chg_rects;
             }
             align_y = (codec_id == XR_RDPGFX_CODECID_AVC444V2) ? 2 : 16;
+            lc = (len2 == 0) ? 1 : (len1 == 0) ? 2 : 0;
 
             out_uint32_le(s, 0); /* cbAvc420EncodedBitstreamInfo, backfilled */
             str1_start = s->p;
+            if (lc == 2)
+            {
+                /* The aux view alone (a catch-up after motion): it takes
+                   the first bitstream's place, MS-RDPEGFX 2.2.4.5. */
+                meta_rects = (auxl_rects != NULL) ? auxl_rects : meta_rects;
+                meta_num_rects = (auxl_rects != NULL) ? num_auxl_rects
+                                 : meta_num_rects;
+                if (auxl_rects == NULL && have_aux_rect)
+                {
+                    meta_rects = &wire_aux_rect;
+                    meta_num_rects = 1;
+                }
+                else if (auxl_rects == NULL &&
+                         self->avc444_luma_only_run[mon_index] > 0)
+                {
+                    meta_rects = &full;
+                    meta_num_rects = 1;
+                }
+                self->avc444_luma_only_run[mon_index] = 0;
+                s1 = s2;
+                len1 = len2;
+                len2 = 0;
+            }
             if (out_RFX_AVC420_METABLOCK(&dst_rect, s, meta_rects,
                                          meta_num_rects, 4, align_y,
                                          &emitted_rects) != 0 ||
@@ -1218,7 +1243,11 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
             }
             out_uint8a(s, s1, len1);
             size1 = (int) (s->p - str1_start);
-            if (len2 > 0)
+            if (lc == 2)
+            {
+                emitted_aux_rects = emitted_rects;
+            }
+            else if (len2 > 0)
             {
                 struct xrdp_egfx_rect *aux_rects = meta_rects;
                 int aux_num_rects = meta_num_rects;
@@ -1262,12 +1291,16 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
             }
         }
         /* cbAvc420EncodedBitstreamInfo: LC in bits 30-31, and in bits 0-29
-           the size of metablock1 plus bitstream1. For LC=1 nothing follows
-           bitstream1. */
+           the size of metablock1 plus bitstream1. For LC=1 and LC=2 nothing
+           follows bitstream1. */
         save_p = s->p;
         s->p = info_p;
-        out_uint32_le(s, (((unsigned int) (len2 > 0 ? 0 : 1)) << 30) |
-                      (((unsigned int) size1) & 0x3FFFFFFF));
+        /* cbAvc420EncodedBitstream1 counts a YUV420 (main) frame only:
+           for LC=2 it MUST be zero (MS-RDPEGFX 2.2.4.5), and the Chroma420
+           frame runs to the end. mstsc drops the connection otherwise;
+           FreeRDP reads the size only for LC=0. */
+        out_uint32_le(s, (((unsigned int) lc) << 30) |
+                      (lc == 2 ? 0 : (((unsigned int) size1) & 0x3FFFFFFF)));
         s->p = save_p;
 
         g_free(c_rects);
@@ -1281,7 +1314,7 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
             LOG(LOG_LEVEL_INFO, "gfx_wiretosurface1: AVC444 codec_id 0x%4.4x "
                 "LC %d len1 %d len2 %d size1(bs1+meta) %d total %d "
                 "rects %d/%d aux_rects %d pack %d ms",
-                codec_id, len2 > 0 ? 0 : 1, len1, len2, size1,
+                codec_id, lc, len1, len2, size1,
                 bitmap_data_length, emitted_rects, num_rects_d,
                 emitted_aux_rects,
                 (int) (g_get_elapsed_ms() - t_pack));

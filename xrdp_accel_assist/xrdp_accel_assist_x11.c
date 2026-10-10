@@ -228,6 +228,7 @@ struct mon_info
     unsigned char *dd_cand;       /* cells the damage touches */
     int dd_prev_valid;            /* 0: dd_prev_texture holds nothing */
     int force_aux;                /* send the aux view with the next frame */
+    int aux_only;                 /* this frame is a catch-up: aux view only */
     /* From damage detection, for this frame only: whether its cells say
        which changed areas need the aux view, and their bounding box. */
     int dd_need_valid;
@@ -1639,6 +1640,7 @@ encode_pixmap(int left, int top, int width, int height,
         int aux_x2 = 0;
         int aux_y2 = 0;
         int send_aux;
+        int aux_only;
         int aux_i;
         int aux_stage;
         unsigned int t_copy;
@@ -1708,6 +1710,10 @@ encode_pixmap(int left, int top, int width, int height,
             send_aux = 1;
         }
         mi->force_aux = 0;
+        /* A catch-up (nothing changed; owed cells settled) carries the aux
+           view alone, as LC=2: the main view is current already. Never an
+           IDR, which must start with the main view. */
+        aux_only = mi->aux_only && send_aux && !idr_frame;
         g_dd_stats.frames++;
         g_dd_stats.aux_sent += send_aux != 0;
 
@@ -1718,9 +1724,12 @@ encode_pixmap(int left, int top, int width, int height,
         }
         t_copy = xrdp_accel_assist_x11_time_copy();
         si = g_si + XH_SHADERRGB2YUV420MV;
-        xrdp_accel_assist_x11_run_shader(left, top, width, height, mi, si,
-                                         &mi->tgt[0], num_crects, crects,
-                                         mi->buf_h, mi->enc_w4, 0);
+        if (!aux_only)
+        {
+            xrdp_accel_assist_x11_run_shader(left, top, width, height, mi, si,
+                                             &mi->tgt[0], num_crects, crects,
+                                             mi->buf_h, mi->enc_w4, 0);
+        }
         /* Split the GL time into xorgxrdp's copy and our conversion. */
         xrdp_accel_assist_x11_time_gl(t_copy);
         if (frame_no == 0)
@@ -1879,7 +1888,23 @@ encode_pixmap(int left, int top, int width, int height,
 
         len2 = 0;
         rv2 = INCREMENTAL_FRAME_ENCODED;
-        if (!send_aux)
+        if (aux_only)
+        {
+            /* LC=2: no main picture, so its chain and frame_num stay as
+               they are; the aux picture predicts from the last aux one */
+            len1 = 0;
+            len2 = avail - 8;
+            rv = g_enc_funcs[g_enc].encode(mi->ei, mi->tgt[1].tex[0],
+                                           p + 4 + 4, &len2,
+                                           (flags & ~XH_ENC_FLAGS_FORCEIDR) |
+                                           XH_ENC_FLAGS_AUXVIEW,
+                                           mi->idr_seq);
+            if (rv == ENCODER_ERROR)
+            {
+                return ENCODER_ERROR;
+            }
+        }
+        else if (!send_aux)
         {
             len1 = avail - 8;
             rv = g_enc_funcs[g_enc].encode(mi->ei, mi->tgt[0].tex[0],
@@ -2727,6 +2752,7 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
         flags |= XH_ENC_FLAGS_FORCEIDR;
     }
     mi->dd_need_valid = 0;
+    mi->aux_only = 0;
     mi->dd_aux_declare = 0;
     if ((codec_id == XH_CODECID_AVC444 || codec_id == XH_CODECID_AVC444V2) &&
             mi->avc444 && xrdp_accel_assist_x11_damage_detect_enabled())
@@ -2761,6 +2787,7 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
             g_memcpy(dd_rects, mi->dd_aux_rects,
                      mi->dd_aux_n * sizeof(struct xh_rect));
             dd_n = mi->dd_aux_n;
+            mi->aux_only = 1;
         }
         else if (dd_n == 0 && !force_all)
         {
@@ -2781,6 +2808,7 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
             dd_rects[0].h = MIN(mi->aux_y2, mi->height) - dd_rects[0].y;
             dd_n = (dd_rects[0].w > 0 && dd_rects[0].h > 0) ? 1 : -1;
             mi->force_aux = 1;
+            mi->aux_only = dd_n > 0;
         }
     }
     if (dd_n > 0)
@@ -2807,6 +2835,7 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
                            crects, cdata, cdata_bytes, codec_id, flags);
     }
     g_free(dd_rects);
+    mi->aux_only = 0;
     if (rv == ENCODER_ERROR)
     {
         /* The encoder may be left unusable (iHD: a picture too big for the
