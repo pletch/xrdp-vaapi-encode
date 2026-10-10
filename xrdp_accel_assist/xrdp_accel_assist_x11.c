@@ -241,6 +241,14 @@ struct mon_info
     unsigned int *dd_moving_ms;   /* when it last moved on its own */
     unsigned char *dd_owe;
     unsigned char *dd_auxc;
+    /* Cells changed since the aux view last covered them: the client's
+       aux picture is stale there. Whenever the aux view goes, it covers
+       these too, so the aux picture is current everywhere (mstsc combines
+       it with the main view beyond the declared aux rects). */
+    unsigned char *dd_stale;
+    unsigned char *dd_auxu;       /* what the aux view covers if it goes */
+    int dd_motion;                /* a cell is moving in this frame */
+    unsigned int dd_aux_last_ms;  /* when the aux view last went */
     /* The cells getting the aux view this frame as rects; -1: too many,
        use the dd_need box */
     struct xh_rect *dd_aux_rects;
@@ -596,6 +604,10 @@ xrdp_accel_assist_x11_delete_all_pixmaps(void)
         mi->dd_moving_ms = NULL;
         g_free(mi->dd_owe);
         g_free(mi->dd_auxc);
+        g_free(mi->dd_stale);
+        g_free(mi->dd_auxu);
+        mi->dd_stale = NULL;
+        mi->dd_auxu = NULL;
         g_free(mi->dd_aux_rects);
         mi->dd_streak = NULL;
         mi->dd_changed_ms = NULL;
@@ -1566,6 +1578,11 @@ save_pixmap_to_file(Pixmap pix, int width, int height)
 #endif
 
 /*****************************************************************************/
+/* While something moves, the aux view goes at most this often: each time it
+   also refreshes the moving cells (stale, see dd_stale), and video would
+   otherwise pay for that on nearly every frame. */
+#define DD_MOTION_AUX_MS 250
+
 /* With XRDP_VAAPI_TIMING, every DD_STATS_MS one log line: frames checked,
    the average time a check took (GPU wait included), and what became of
    the frames. */
@@ -1703,6 +1720,21 @@ encode_pixmap(int left, int top, int width, int height,
                an area luma-only frames left behind (aux_dirty) goes too. */
             send_aux = mi->dd_need_any || mi->aux_dirty || mi->force_aux
                        || ((flags & XH_ENC_FLAGS_FORCEIDR) != 0);
+            if (send_aux && mi->dd_motion && !mi->force_aux && !idr_frame &&
+                    now_ms - mi->dd_aux_last_ms < DD_MOTION_AUX_MS)
+            {
+                /* Not yet: the cells that wanted it owe it instead. */
+                int ci;
+
+                for (ci = 0; ci < mi->dd_cells_w * mi->dd_cells_h; ci++)
+                {
+                    if (mi->dd_auxc[ci])
+                    {
+                        mi->dd_owe[ci] = 1;
+                    }
+                }
+                send_aux = 0;
+            }
         }
         else
         {
@@ -1716,6 +1748,15 @@ encode_pixmap(int left, int top, int width, int height,
         aux_only = mi->aux_only && send_aux && !idr_frame;
         g_dd_stats.frames++;
         g_dd_stats.aux_sent += send_aux != 0;
+        if (send_aux)
+        {
+            /* everything stale is covered: the list, or the whole frame */
+            mi->dd_aux_last_ms = now_ms;
+            if (mi->dd_stale != NULL)
+            {
+                g_memset(mi->dd_stale, 0, mi->dd_cells_w * mi->dd_cells_h);
+            }
+        }
 
         /* main view (MV shader) */
         if (frame_no == 0)
@@ -1755,10 +1796,12 @@ encode_pixmap(int left, int top, int width, int height,
             {
                 struct xh_rect r;
 
-                r.x = mi->dd_need_x1;
-                r.y = mi->dd_need_y1;
-                r.w = mi->dd_need_x2 - mi->dd_need_x1;
-                r.h = mi->dd_need_y2 - mi->dd_need_y1;
+                /* too many cells for a list: all of it, which also covers
+                   the stale cells */
+                r.x = 0;
+                r.y = 0;
+                r.w = mi->width;
+                r.h = mi->height;
                 if (!mi->aux_dirty)
                 {
                     mi->aux_dirty = 1;
@@ -1825,7 +1868,8 @@ encode_pixmap(int left, int top, int width, int height,
             if (mi->avc444_v2 && mi->dd_need_valid && mi->dd_aux_n > 0 &&
                     !mi->aux_dirty && (flags & XH_ENC_FLAGS_FORCEIDR) == 0)
             {
-                /* Just the cells that get it now; xrdp declares the list. */
+                /* The cells that get it now and every stale one; xrdp
+                   declares the list. */
                 xrdp_accel_assist_x11_run_shader(0, 0, width, height,
                                                  mi, si, &mi->tgt[1],
                                                  mi->dd_aux_n,
@@ -2187,12 +2231,16 @@ dd_alloc(struct mon_info *mi, int width, int height)
     g_free(mi->dd_moving_ms);
     g_free(mi->dd_owe);
     g_free(mi->dd_auxc);
+    g_free(mi->dd_stale);
+    g_free(mi->dd_auxu);
     g_free(mi->dd_aux_rects);
     mi->dd_moving_ms = g_new0(unsigned int, mi->dd_cells_w * mi->dd_cells_h);
     mi->dd_streak = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
     mi->dd_changed_ms = g_new0(unsigned int, mi->dd_cells_w * mi->dd_cells_h);
     mi->dd_owe = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
     mi->dd_auxc = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
+    mi->dd_stale = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
+    mi->dd_auxu = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
     mi->dd_aux_rects = g_new(struct xh_rect, DD_MAX_RECTS);
     glGenTextures(1, &(mi->dd_prev_texture));
     glBindTexture(GL_TEXTURE_2D, mi->dd_prev_texture);
@@ -2227,6 +2275,7 @@ dd_alloc(struct mon_info *mi, int width, int height)
     if (mi->dd_map == NULL || mi->dd_cand == NULL || mi->dd_streak == NULL ||
             mi->dd_changed_ms == NULL || mi->dd_moving_ms == NULL ||
             mi->dd_owe == NULL || mi->dd_auxc == NULL ||
+            mi->dd_stale == NULL || mi->dd_auxu == NULL ||
             mi->dd_aux_rects == NULL)
     {
         return 1;
@@ -2544,6 +2593,7 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
 
         mi->dd_need_valid = 1;
         mi->dd_need_any = 0;
+        mi->dd_motion = 0;
         /* first what changed, and which cells move on their own (changed
            again within DD_MOTION_MS); dd_moving_ms keeps when each last
            did */
@@ -2617,6 +2667,12 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
                        now_ms - mi->dd_changed_ms[index] >= DD_SETTLE_MS &&
                        area_settle < DD_AREA_MIN);
             mi->dd_auxc[index] = aux_now;
+            if (changed_now)
+            {
+                mi->dd_stale[index] = 1;
+            }
+            mi->dd_auxu[index] = aux_now || mi->dd_stale[index];
+            mi->dd_motion |= moving;
             if (aux_now)
             {
                 int x1 = (index % mi->dd_cells_w) * DD_CELL;
@@ -2643,7 +2699,7 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
             }
         }
         mi->dd_aux_n = mi->dd_need_any ?
-                       dd_cells_to_rects(mi, mi->dd_auxc, mi->dd_aux_rects,
+                       dd_cells_to_rects(mi, mi->dd_auxu, mi->dd_aux_rects,
                                          DD_MAX_RECTS) : 0;
     }
     else
