@@ -19,6 +19,10 @@
 #ifndef _XRDP_ACCEL_ASSIST_VAAPI_H
 #define _XRDP_ACCEL_ASSIST_VAAPI_H
 
+/* The render node to encode on, in xrdp_accel_assist.c. */
+const char *
+xrdp_accel_assist_render_node(void);
+/* Called again once EGL is up, it checks GL and the encoder share a GPU. */
 int
 xrdp_accel_assist_vaapi_init(void);
 /* nviews: 1 for AVC420, 2 for AVC444 (main and aux, pictures of one H.264
