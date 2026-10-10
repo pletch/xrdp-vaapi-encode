@@ -266,6 +266,8 @@ struct mon_info
     unsigned char *dd_stale;
     unsigned char *dd_auxu;       /* what the aux view covers if it goes */
     int dd_motion;                /* a cell is moving in this frame */
+    unsigned int dd_frame_ms;     /* when the last frame was compared */
+    unsigned int dd_gap_ms;       /* ...and the smoothed gap between them */
     unsigned int dd_aux_last_ms;  /* when the aux view last went */
     /* The cells getting the aux view this frame as rects; -1: too many,
        use the dd_need box */
@@ -1723,6 +1725,77 @@ flush_gl(void)
    otherwise pay for that on nearly every frame. */
 #define DD_MOTION_AUX_MS 250
 
+/* Load. xrdp measures each frame's send-to-ack round trip and appends it to
+   the ack, which passes through here on its way to the backend. A round
+   trip well above its recent minimum means frames queue: the link or the
+   client's decoder is the bottleneck. Then, as GNOME Remote Desktop drops
+   to the main view, the aux view waits while anything moves (one-off
+   changes still get it, and the rest catches up once motion stops). The
+   minimum, not a fixed figure, is the baseline, so a long but uncongested
+   path (a VPN) is not load. */
+#define LOAD_ENTER_MS 40        /* queueing delay that enters the state */
+#define LOAD_LEAVE_MS 15        /* ...and that leaves it */
+#define LOAD_MIN_WINDOW_MS 10000
+#define LOAD_MIN_WINDOW_LOADED_MS 60000
+static struct
+{
+    int srtt8;                  /* smoothed round trip, ms * 8 */
+    int min_cur;                /* minimum this window */
+    int min_prev;               /* ...and the last */
+    unsigned int window_ms;
+    int loaded;
+} g_load;
+
+/*****************************************************************************/
+void
+xrdp_accel_assist_x11_note_rtt(int rtt_ms)
+{
+    unsigned int now = g_get_elapsed_ms();
+    int base;
+    int q;
+
+    if (rtt_ms <= 0)
+    {
+        return;
+    }
+    if (g_load.srtt8 == 0)
+    {
+        g_load.srtt8 = rtt_ms * 8;
+        g_load.min_cur = rtt_ms;
+        g_load.min_prev = rtt_ms;
+        g_load.window_ms = now;
+    }
+    else
+    {
+        g_load.srtt8 += rtt_ms - g_load.srtt8 / 8;
+    }
+    /* While frames queue, the round trip is high by definition: the
+       minimum must not climb to it, so its window is longer then. */
+    if (now - g_load.window_ms >=
+            (g_load.loaded ? LOAD_MIN_WINDOW_LOADED_MS : LOAD_MIN_WINDOW_MS))
+    {
+        g_load.min_prev = g_load.min_cur;
+        g_load.min_cur = rtt_ms;
+        g_load.window_ms = now;
+    }
+    g_load.min_cur = MIN(g_load.min_cur, rtt_ms);
+    base = MIN(g_load.min_cur, g_load.min_prev);
+    q = g_load.srtt8 / 8 - base;
+    if (!g_load.loaded && q > LOAD_ENTER_MS)
+    {
+        g_load.loaded = 1;
+        LOG(LOG_LEVEL_INFO, "AVC444: frames queue (round trip %d ms, "
+            "minimum %d): the aux view waits while anything moves",
+            g_load.srtt8 / 8, base);
+    }
+    else if (g_load.loaded && q < LOAD_LEAVE_MS)
+    {
+        g_load.loaded = 0;
+        LOG(LOG_LEVEL_INFO, "AVC444: frames no longer queue (round trip "
+            "%d ms, minimum %d)", g_load.srtt8 / 8, base);
+    }
+}
+
 /* With XRDP_VAAPI_TIMING, every DD_STATS_MS one log line: frames checked,
    the average time a check took (GPU wait included), and what became of
    the frames. */
@@ -1862,7 +1935,8 @@ encode_pixmap(int left, int top, int width, int height,
             send_aux = mi->dd_need_any || mi->aux_dirty || mi->force_aux
                        || ((flags & XH_ENC_FLAGS_FORCEIDR) != 0);
             if (send_aux && mi->dd_motion && !mi->force_aux && !idr_frame &&
-                    now_ms - mi->dd_aux_last_ms < DD_MOTION_AUX_MS)
+                    (g_load.loaded ||
+                     now_ms - mi->dd_aux_last_ms < DD_MOTION_AUX_MS))
             {
                 /* Not yet: the cells that wanted it owe it instead. */
                 int ci;
@@ -2289,13 +2363,15 @@ dd_stats_log(void)
         LOG(LOG_LEVEL_INFO, "damage detection: %d frames checked, %.2f ms "
             "each; %d unchanged (skipped), %d filtered, %d passed as "
             "damaged, %d aux catch-ups; aux view "
-            "on %d of %d frames",
+            "on %d of %d frames; round trip %d ms (minimum %d)%s",
             g_dd_stats.checked,
             g_dd_stats.checked > 0 ?
             g_dd_stats.us / 1000.0 / g_dd_stats.checked : 0.0,
             g_dd_stats.skipped, g_dd_stats.filtered, g_dd_stats.passed,
             g_dd_stats.aux_owed,
-            g_dd_stats.aux_sent, g_dd_stats.frames);
+            g_dd_stats.aux_sent, g_dd_stats.frames,
+            g_load.srtt8 / 8, MIN(g_load.min_cur, g_load.min_prev),
+            g_load.loaded ? ", frames queue" : "");
     }
     g_memset(&g_dd_stats, 0, sizeof(g_dd_stats));
     g_dd_stats.start_ms = now;
@@ -2732,6 +2808,29 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
            once it stops changing. Those cells give the aux view's rects. */
         unsigned int now_ms = g_get_elapsed_ms();
 
+        unsigned int motion_ms = DD_MOTION_MS;
+
+        /* When frames queue, captures come further apart than
+           DD_MOTION_MS: a change on consecutive captures is still motion. */
+        if (mi->dd_frame_ms != 0 && now_ms - mi->dd_frame_ms < 2000)
+        {
+            /* (a pause in the content is not a capture interval) */
+            unsigned int gap = now_ms - mi->dd_frame_ms;
+
+            if (mi->dd_gap_ms == 0)
+            {
+                mi->dd_gap_ms = gap;
+            }
+            else
+            {
+                mi->dd_gap_ms = (mi->dd_gap_ms * 3 + gap) / 4;
+            }
+        }
+        mi->dd_frame_ms = now_ms;
+        if (g_load.loaded)
+        {
+            motion_ms = MAX(motion_ms, MIN(mi->dd_gap_ms * 2, 2000));
+        }
         mi->dd_need_valid = 1;
         mi->dd_need_any = 0;
         mi->dd_motion = 0;
@@ -2750,7 +2849,7 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
                 num_changed += changed_now;
             }
             if (changed_now && mi->dd_streak[index] &&
-                    now_ms - mi->dd_changed_ms[index] < DD_MOTION_MS)
+                    now_ms - mi->dd_changed_ms[index] < motion_ms)
             {
                 mi->dd_moving_ms[index] = now_ms;
             }
@@ -2786,7 +2885,7 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
                         unsigned int since = now_ms - mi->dd_moving_ms[k];
                         int mv = mi->dd_streak[k] && mi->dd_moving_ms[k] != 0;
 
-                        area += mv && since < DD_MOTION_MS;
+                        area += mv && since < motion_ms;
                         area_settle += mv && since < DD_SETTLE_MS;
                     }
                 }
