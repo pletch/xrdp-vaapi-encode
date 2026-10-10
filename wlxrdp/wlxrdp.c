@@ -83,6 +83,10 @@
 #endif
 /* frames in flight, per monitor */
 #define MAX_IN_FLIGHT 2
+/* AVC444: this long after the last capture, the newest frame goes once
+   more (a 16x16 corner) so the helper can send the 4:4:4 detail that
+   moving areas were sent without; as xorgxrdp's idle flush */
+#define IDLE_FLUSH_MS 150
 #define IN_MAX (128 * 1024)
 /* spare keycodes for characters not on the client's layout */
 #define UNI_SLOTS 8
@@ -155,6 +159,9 @@ struct be
     int frame_id;
     int acked_id;
     int suppress;
+    /* AVC444 idle flush: a capture is due this long after the last one */
+    int idle_flush;
+    uint32_t idle_flush_ms;
 
     /* keyboard */
     struct xkb_context *xkb_ctx;
@@ -2097,9 +2104,68 @@ core_frame(void *core, int mon, int buf, const struct xh_rect *damage,
         if (!b->cpu)
         {
             m->sent_id[buf] = b->frame_id;
+            if (b->codec_id != 0x000B)
+            {
+                b->idle_flush = 1;
+                b->idle_flush_ms = now_ms32() + IDLE_FLUSH_MS;
+            }
         }
     }
     core_release(b, m);
+}
+
+/*****************************************************************************/
+/* The AVC444 idle flush, once captures stop: each monitor's newest capture
+   once more, as a 16x16 corner. The helper sends the aux view for the
+   areas that have settled, or nothing. Returns the ms until it is due, -1
+   if none is. */
+static int
+core_idle_flush(struct be *b)
+{
+    int left;
+    int i;
+
+    if (!b->idle_flush)
+    {
+        return -1;
+    }
+    if (b->client_fd < 0 || !b->have_ci || b->cpu || !b->helper_ready)
+    {
+        b->idle_flush = 0;
+        return -1;
+    }
+    left = (int) (b->idle_flush_ms - now_ms32());
+    if (left > 0)
+    {
+        return left;
+    }
+    if (b->suppress || b->frame_id - b->acked_id >= MAX_IN_FLIGHT * b->active)
+    {
+        return 20; /* the client is behind: try again shortly */
+    }
+    b->idle_flush = 0;
+    for (i = 0; i < b->num_mons; i++)
+    {
+        struct mon *m = b->mons + i;
+        struct xh_rect r;
+
+        if (m->num_wb == 0 || m->core_last < 0)
+        {
+            continue;
+        }
+        r.x = 0;
+        r.y = 0;
+        r.w = m->wb[m->core_last].width < 16 ? m->wb[m->core_last].width : 16;
+        r.h = m->wb[m->core_last].height < 16 ? m->wb[m->core_last].height
+              : 16;
+        if (send_frame(m, m->core_last, &r, 1) != 0)
+        {
+            drop_client(b);
+            return -1;
+        }
+        m->sent_id[m->core_last] = b->frame_id;
+    }
+    return -1;
 }
 
 /*****************************************************************************/
@@ -2410,6 +2476,11 @@ main(int argc, char **argv)
         {
             timeout = 1000;
         }
+        if (pace >= 0 && pace < timeout)
+        {
+            timeout = pace;
+        }
+        pace = core_idle_flush(b);
         if (pace >= 0 && pace < timeout)
         {
             timeout = pace;
