@@ -2125,8 +2125,9 @@ xrdp_accel_assist_x11_recreate_enc(struct mon_info *mi)
    it came, rather than send kilobytes of rects. */
 #define DD_MAX_RECTS 256
 
-/* Every DD_STATS_MS, one log line: frames checked, the average time a
-   check took (GPU wait included), and what became of the frames. */
+/* With XRDP_VAAPI_TIMING, every DD_STATS_MS one log line: frames checked,
+   the average time a check took (GPU wait included), and what became of
+   the frames. */
 #define DD_STATS_MS 5000
 static struct
 {
@@ -2153,6 +2154,12 @@ static void
 dd_stats_log(void)
 {
     unsigned int now = g_get_elapsed_ms();
+
+    if (!xrdp_accel_assist_x11_gl_timing())
+    {
+        g_memset(&g_dd_stats, 0, sizeof(g_dd_stats));
+        return;
+    }
 
     if (g_dd_stats.start_ms == 0)
     {
