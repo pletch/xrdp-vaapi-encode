@@ -237,6 +237,7 @@ struct mon_info
        view (it needed it while moving), and whether it gets it now. */
     unsigned char *dd_streak;     /* 1 once the cell has changed */
     unsigned int *dd_changed_ms;  /* when the cell last changed */
+    unsigned int *dd_moving_ms;   /* when it last moved on its own */
     unsigned char *dd_owe;
     unsigned char *dd_auxc;
     /* The cells getting the aux view this frame as rects; -1: too many,
@@ -590,6 +591,8 @@ xrdp_accel_assist_x11_delete_all_pixmaps(void)
         mi->dd_cand = NULL;
         g_free(mi->dd_streak);
         g_free(mi->dd_changed_ms);
+        g_free(mi->dd_moving_ms);
+        mi->dd_moving_ms = NULL;
         g_free(mi->dd_owe);
         g_free(mi->dd_auxc);
         g_free(mi->dd_aux_rects);
@@ -2038,6 +2041,8 @@ xrdp_accel_assist_x11_recreate_enc(struct mon_info *mi)
    a cell that changes on every other capture (video at a rate the capture
    does not match) is still moving. The idle flush comes later than this. */
 #define DD_SETTLE_MS 120
+/* Moving cells, of the 3x3 around one, that make the area moving. */
+#define DD_AREA_MIN 3
 
 
 static unsigned long long
@@ -2154,9 +2159,11 @@ dd_alloc(struct mon_info *mi, int width, int height)
     mi->dd_cand = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
     g_free(mi->dd_streak);
     g_free(mi->dd_changed_ms);
+    g_free(mi->dd_moving_ms);
     g_free(mi->dd_owe);
     g_free(mi->dd_auxc);
     g_free(mi->dd_aux_rects);
+    mi->dd_moving_ms = g_new0(unsigned int, mi->dd_cells_w * mi->dd_cells_h);
     mi->dd_streak = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
     mi->dd_changed_ms = g_new0(unsigned int, mi->dd_cells_w * mi->dd_cells_h);
     mi->dd_owe = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
@@ -2193,7 +2200,7 @@ dd_alloc(struct mon_info *mi, int width, int height)
     glBindTexture(GL_TEXTURE_2D, 0);
     mi->dd_prev_valid = 0;
     if (mi->dd_map == NULL || mi->dd_cand == NULL || mi->dd_streak == NULL ||
-            mi->dd_changed_ms == NULL ||
+            mi->dd_changed_ms == NULL || mi->dd_moving_ms == NULL ||
             mi->dd_owe == NULL || mi->dd_auxc == NULL ||
             mi->dd_aux_rects == NULL)
     {
@@ -2512,28 +2519,67 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
 
         mi->dd_need_valid = 1;
         mi->dd_need_any = 0;
+        /* first what changed, and which cells move on their own (changed
+           again within DD_MOTION_MS); dd_moving_ms keeps when each last
+           did */
         for (index = 0; index < cells; index++)
         {
             int changed_now = 0;
-            int need = 0;
-            int moving;
-            int aux_now;
 
             if (mi->dd_cand[index])
             {
                 num_cand++;
                 changed_now = mi->dd_map[index * 4] > 127;
-                need = changed_now && mi->dd_map[index * 4 + 1] > 127;
                 mi->dd_cand[index] = changed_now;
                 num_changed += changed_now;
+            }
+            if (changed_now && mi->dd_streak[index] &&
+                    now_ms - mi->dd_changed_ms[index] < DD_MOTION_MS)
+            {
+                mi->dd_moving_ms[index] = now_ms;
+            }
+        }
+        for (index = 0; index < cells; index++)
+        {
+            int changed_now = mi->dd_cand[index];
+            int need = changed_now && mi->dd_map[index * 4 + 1] > 127;
+            int moving;
+            int aux_now;
+            int area = 0;
+            int area_settle = 0;
+            int cx0 = index % mi->dd_cells_w;
+            int cy0 = index / mi->dd_cells_w;
+            int nx;
+            int ny;
+
+            /* The 3x3 around the cell: an area moves when enough of it
+               moved lately (video, scrolling), which a typed character
+               does not. Inside a moving area, a cell that changes only now
+               and then is moving too, and none settles until the area
+               has. Settling looks back no further than DD_SETTLE_MS: the
+               idle flush, which may be the last capture, comes 150 ms on. */
+            if (changed_now || mi->dd_owe[index])
+            {
+                for (ny = MAX(cy0 - 1, 0);
+                        ny <= MIN(cy0 + 1, mi->dd_cells_h - 1); ny++)
+                {
+                    for (nx = MAX(cx0 - 1, 0);
+                            nx <= MIN(cx0 + 1, mi->dd_cells_w - 1); nx++)
+                    {
+                        int k = ny * mi->dd_cells_w + nx;
+                        unsigned int since = now_ms - mi->dd_moving_ms[k];
+                        int mv = mi->dd_streak[k] && mi->dd_moving_ms[k] != 0;
+
+                        area += mv && since < DD_MOTION_MS;
+                        area_settle += mv && since < DD_SETTLE_MS;
+                    }
+                }
             }
             moving = 0;
             if (changed_now)
             {
-                /* dd_streak: the cell has changed before, so its time is
-                   meaningful */
-                moving = mi->dd_streak[index] &&
-                         now_ms - mi->dd_changed_ms[index] < DD_MOTION_MS;
+                moving = mi->dd_moving_ms[index] == now_ms ||
+                         area >= DD_AREA_MIN;
                 mi->dd_changed_ms[index] = now_ms;
                 mi->dd_streak[index] = 1;
             }
@@ -2543,7 +2589,8 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
             }
             aux_now = (need && !moving) ||
                       (mi->dd_owe[index] && !changed_now &&
-                       now_ms - mi->dd_changed_ms[index] >= DD_SETTLE_MS);
+                       now_ms - mi->dd_changed_ms[index] >= DD_SETTLE_MS &&
+                       area_settle < DD_AREA_MIN);
             mi->dd_auxc[index] = aux_now;
             if (aux_now)
             {
