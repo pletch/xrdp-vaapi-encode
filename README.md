@@ -359,10 +359,9 @@ persistent corruption that looks like a chroma bug but is not.
   changes what the client copies, not the bitrate or the quality.
 
 * **The auxiliary view declares the rect the helper actually rendered.** Under
-  `XRDP_AVC444_CHROMA_INTERVAL > 1` the auxiliary picture carries the damage
-  accumulated across the frames it skipped, which is more than the current frame's
-  rects; declaring only those would leave a region that changed during the skipped
-  frames holding its odd-row chroma from the last auxiliary frame. accel-assist has
+  motion the auxiliary picture carries the damage accumulated across the luma-only
+  frames before it, which is more than the current frame's rects; declaring only
+  those would leave a region that changed during those frames holding its odd-row chroma from the last auxiliary frame. accel-assist has
   that rectangle - it is what the v2 shader pass was scissored to - and appends it
   to the shared-memory payload as an optional 20-byte trailer after
   `[len1][stream1][len2][stream2]`. The trailer is optional in both directions, so a
@@ -445,8 +444,7 @@ All of these are `[SessionVariables]` in `sesman.ini`, documented there as well:
 | -------- | ------- | ------ |
 | `XRDP_USE_ACCEL_ASSIST` | off | required for any of the below |
 | `XRDP_ACCEL_AVC444` | negotiated | `0` forces AVC420; otherwise follows what the client advertised |
-| `XRDP_AVC444_CHROMA_INTERVAL` | 4 | frames between auxiliary (chroma) pictures |
-| `XRDP_AVC444_CHROMA_MAX_MS` | 200 | upper bound on chroma staleness; `0` for frame counting only |
+| `XRDP_AVC444_AUX_THRESHOLD` | 30 | chroma error (0-255) beyond which a change gets the auxiliary picture |
 | `XRDP_AVC444_IDR_MS` | 10000 | synchronised IDR on both views at most this often; `0` off |
 | `XRDP_AVC444_IDR_MIN_KB` | 100 | ...and only after this much has been sent since the last; `0` purely timed |
 | `XRDP_AVC444_IDR_PERIOD` | unset | overrides the two above with an IDR every Nth frame, ungated (A/B testing) |
@@ -537,8 +535,9 @@ headroom, and at 36 sessions memory (~0.8 GB per session) runs out before the
 GPU does. An office page's ~18 fps is its own update rate.
 
 AVC420 (`XRDP_ACCEL_AVC444=0`) is only about 20 % cheaper to encode, not half:
-the auxiliary view goes out every fourth frame by default
-(`XRDP_AVC444_CHROMA_INTERVAL`), so AVC444 costs about 1.25 pictures a frame.
+these figures were taken with the auxiliary view on every fourth frame (about
+1.25 pictures a frame); it now goes out during video only where the picture
+settles, which costs less again.
 It moves the full-screen video limit from about 20 sessions to about 23, while
 the decoding share stays the same - a knob for servers that are truly
 video-bound, not a reason to give up 4:4:4 text.

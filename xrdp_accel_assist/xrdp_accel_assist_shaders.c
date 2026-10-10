@@ -43,34 +43,61 @@ static const GLchar g_fs_mask_diff[] = "\
 uniform sampler2D tex;\n\
 uniform sampler2D prev;\n\
 uniform vec2 tex_size;\n\
+uniform vec4 umath;\n\
+uniform vec4 vmath;\n\
+uniform float thr;\n\
 void main(void)\n\
 {\n\
     vec2 p;\n\
+    vec2 b;\n\
+    vec4 c;\n\
+    vec4 c0;\n\
+    vec4 c1;\n\
+    vec4 c2;\n\
+    vec4 c3;\n\
+    vec2 uv;\n\
+    vec2 m;\n\
+    float need;\n\
     p = gl_FragCoord.xy / tex_size;\n\
-    gl_FragColor = vec4(any(notEqual(texture2D(tex, p).rgb,\n\
-                                     texture2D(prev, p).rgb)) ? 1.0 : 0.0,\n\
-                        0.0, 0.0, 1.0);\n\
+    c = texture2D(tex, p);\n\
+    /* Green: the 4:2:0 view alone (the 2x2 chroma mean) would be off by\n\
+       more than thr here, so this pixel needs the auxiliary view. */\n\
+    b = floor(gl_FragCoord.xy * 0.5) * 2.0;\n\
+    c0 = texture2D(tex, (b + vec2(0.5, 0.5)) / tex_size); c0.a = 1.0;\n\
+    c1 = texture2D(tex, (b + vec2(1.5, 0.5)) / tex_size); c1.a = 1.0;\n\
+    c2 = texture2D(tex, (b + vec2(0.5, 1.5)) / tex_size); c2.a = 1.0;\n\
+    c3 = texture2D(tex, (b + vec2(1.5, 1.5)) / tex_size); c3.a = 1.0;\n\
+    m = vec2(dot(umath, c0) + dot(umath, c1) + dot(umath, c2) +\n\
+             dot(umath, c3),\n\
+             dot(vmath, c0) + dot(vmath, c1) + dot(vmath, c2) +\n\
+             dot(vmath, c3)) * 0.25;\n\
+    c.a = 1.0;\n\
+    uv = vec2(dot(umath, c), dot(vmath, c));\n\
+    need = any(greaterThan(abs(uv - m), vec2(thr))) ? 1.0 : 0.0;\n\
+    gl_FragColor = vec4(any(notEqual(c.rgb, texture2D(prev, p).rgb)) ?\n\
+                        1.0 : 0.0, need, 0.0, 1.0);\n\
 }\n";
 
-/* Then one fragment per 16x16 cell: the most any mask pixel says. */
+/* Then one fragment per 16x16 cell: the most any mask pixel says, for
+   both channels (changed, needs the auxiliary view). */
 static const GLchar g_fs_cell_max[] = "\
 uniform sampler2D tex;\n\
 uniform vec2 tex_size;\n\
 void main(void)\n\
 {\n\
     vec2 base;\n\
-    float d;\n\
+    vec2 d;\n\
     base = floor(gl_FragCoord.xy) * 16.0;\n\
-    d = 0.0;\n\
+    d = vec2(0.0);\n\
     for (int j = 0; j < 16; j++)\n\
     {\n\
         for (int i = 0; i < 16; i++)\n\
         {\n\
             d = max(d, texture2D(tex, (base + vec2(float(i) + 0.5,\n\
-                                       float(j) + 0.5)) / tex_size).r);\n\
+                                       float(j) + 0.5)) / tex_size).rg);\n\
         }\n\
     }\n\
-    gl_FragColor = vec4(d, 0.0, 0.0, 1.0);\n\
+    gl_FragColor = vec4(d, 0.0, 1.0);\n\
 }\n";
 
 /* Four bytes per fragment, as in the MV shader below; 2x2 chroma mean.

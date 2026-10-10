@@ -272,19 +272,14 @@ PULSE_SCRIPT=@sesmansysconfdir@/pulse/default.pa
 ; separates them and a client that cannot parse codec id 0x000F has no way
 ; to say so. Set to 1 to force v2 or 0 to force v1.
 ;XRDP_ACCEL_AVC444_V2=1
-; How often the auxiliary chroma picture is sent, in frames. 1 sends it every
-; frame, which is correct but roughly doubles the encode cost. Higher values
-; refresh chroma less often; luma still updates every frame, so the cost is
-; brief colour lag on fast motion.
-;XRDP_AVC444_CHROMA_INTERVAL=4
-; Upper bound on that colour lag, in milliseconds. The interval above is a
-; rate limit, not a deadline: frames are damage-driven, so a quiet desktop
-; emitting a frame a second stretches "every fourth frame" to four seconds,
-; and a change is then drawn with chroma from seconds earlier. The auxiliary
-; picture also goes out whenever this long has passed since the last one.
-; During motion the interval always fires first and this costs nothing. Set
-; to 0 to disable the deadline and count frames only.
-;XRDP_AVC444_CHROMA_MAX_MS=200
+; The auxiliary chroma picture goes only where a change needs it: where the
+; 4:2:0 main picture alone would be off by more than this (0-255, the
+; threshold MS-RDPEGFX gives the client's reverse filter). Grey and flat
+; content goes without; coloured detail and subpixel-antialiased text get
+; full chroma on the frame they change. Areas in motion (video, scrolling,
+; a drag) are sent luma-only and get it once they settle. Lower sends it
+; for subtler colour, 0 for any difference at all.
+;XRDP_AVC444_AUX_THRESHOLD=30
 ; A synchronised IDR on both views at most this often, in milliseconds. Some
 ; clients' decoders -- mstsc's hardware-decoding path on at least some Intel
 ; GPUs -- occasionally get the two views into a bad state that shows as pink
