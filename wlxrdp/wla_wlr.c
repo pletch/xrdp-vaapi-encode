@@ -199,6 +199,9 @@ struct wlr
     struct ext_output_image_capture_source_manager_v1 *source_mgr;
     struct ext_image_copy_capture_manager_v1 *copy_mgr;
     struct zwp_linux_dmabuf_v1 *dmabuf;
+    /* the compositor's main GPU (linux-dmabuf v4 default feedback) */
+    dev_t main_dev;
+    int have_main_dev;
     struct zwlr_virtual_pointer_manager_v1 *vptr_mgr;
     struct zwp_virtual_keyboard_manager_v1 *vkbd_mgr;
     struct zwlr_virtual_pointer_v1 *vptr;
@@ -748,8 +751,11 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name,
     else if (g_strcmp(iface, zwp_linux_dmabuf_v1_interface.name) == 0 &&
              version >= 3)
     {
+        /* v4 for the default feedback's main device; v3 is enough to
+           capture */
         b->dmabuf = wl_registry_bind(reg, name,
-                                     &zwp_linux_dmabuf_v1_interface, 3);
+                                     &zwp_linux_dmabuf_v1_interface,
+                                     version >= 4 ? 4 : 3);
     }
     else if (g_strcmp(iface,
                       zwlr_virtual_pointer_manager_v1_interface.name) == 0)
@@ -1853,13 +1859,24 @@ render_node(dev_t dev, char *path, int size)
 }
 
 /*****************************************************************************/
-/* The device the encoder (the accel-assist helper) imports frames on */
+/* The device the encoder (the accel-assist helper) imports frames on, as
+   the helper picks it: XRDP_VAAPI_DEVICE, else the compositor's GPU, which
+   the core passes to it, else renderD128 */
 static const char *
-encoder_node(void)
+encoder_node(struct wlr *b)
 {
+    static char node[256];
     const char *dev = g_getenv("XRDP_VAAPI_DEVICE");
 
-    return dev != NULL ? dev : "/dev/dri/renderD128";
+    if (dev != NULL)
+    {
+        return dev;
+    }
+    if (b->have_main_dev && render_node(b->main_dev, node, sizeof(node)) == 0)
+    {
+        return node;
+    }
+    return "/dev/dri/renderD128";
 }
 
 /*****************************************************************************/
@@ -1871,7 +1888,7 @@ static int
 open_gbm(struct wlr *b, const struct wlr_mon *m)
 {
     const char *env = g_getenv("WLXRDP_DRM");
-    const char *enc = encoder_node();
+    const char *enc = encoder_node(b);
     char node[256];
     const char *path;
     struct stat st_enc;
@@ -1926,9 +1943,8 @@ open_gbm(struct wlr *b, const struct wlr_mon *m)
             st.st_rdev != st_enc.st_rdev)
     {
         LOG(LOG_LEVEL_WARNING, "wlr: the compositor renders on %s but the "
-            "encoder uses %s (XRDP_VAAPI_DEVICE); set "
-            "XRDP_WAYLAND_RENDER_NODE and XRDP_VAAPI_DEVICE to the same "
-            "GPU", path, enc);
+            "encoder uses %s; unset XRDP_VAAPI_DEVICE, or point it at the "
+            "compositor's GPU", path, enc);
     }
     return 0;
 }
@@ -2351,6 +2367,85 @@ mon_cmp(const void *a, const void *b)
 }
 
 /*****************************************************************************/
+/* linux-dmabuf default feedback: only its main device is of interest */
+static void
+feedback_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *fb)
+{
+}
+
+static void
+feedback_format_table(void *data, struct zwp_linux_dmabuf_feedback_v1 *fb,
+                      int32_t fd, uint32_t size)
+{
+    g_file_close(fd);
+}
+
+static void
+feedback_main_device(void *data, struct zwp_linux_dmabuf_feedback_v1 *fb,
+                     struct wl_array *device)
+{
+    struct wlr *b = data;
+
+    if (device->size == sizeof(dev_t))
+    {
+        memcpy(&b->main_dev, device->data, sizeof(dev_t));
+        b->have_main_dev = 1;
+    }
+}
+
+static void
+feedback_tranche_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *fb)
+{
+}
+
+static void
+feedback_tranche_target_device(void *data,
+                               struct zwp_linux_dmabuf_feedback_v1 *fb,
+                               struct wl_array *device)
+{
+}
+
+static void
+feedback_tranche_formats(void *data, struct zwp_linux_dmabuf_feedback_v1 *fb,
+                         struct wl_array *indices)
+{
+}
+
+static void
+feedback_tranche_flags(void *data, struct zwp_linux_dmabuf_feedback_v1 *fb,
+                       uint32_t flags)
+{
+}
+
+static const struct zwp_linux_dmabuf_feedback_v1_listener g_feedback_listener =
+{
+    feedback_done, feedback_format_table, feedback_main_device,
+    feedback_tranche_done, feedback_tranche_target_device,
+    feedback_tranche_formats, feedback_tranche_flags
+};
+
+/*****************************************************************************/
+/* Ask for the compositor's main GPU, which the core hands to the
+   accel-assist helper before any capture session can name its device. */
+static void
+query_main_device(struct wlr *b)
+{
+    struct zwp_linux_dmabuf_feedback_v1 *fb;
+
+    if (zwp_linux_dmabuf_v1_get_version(b->dmabuf) < 4)
+    {
+        LOG(LOG_LEVEL_INFO, "wlr: linux-dmabuf v%d has no default "
+            "feedback; the compositor's GPU is unknown",
+            zwp_linux_dmabuf_v1_get_version(b->dmabuf));
+        return;
+    }
+    fb = zwp_linux_dmabuf_v1_get_default_feedback(b->dmabuf);
+    zwp_linux_dmabuf_feedback_v1_add_listener(fb, &g_feedback_listener, b);
+    wl_display_roundtrip(b->display);
+    zwp_linux_dmabuf_feedback_v1_destroy(fb);
+}
+
+/*****************************************************************************/
 /* connect, and check the compositor has what we need */
 static void *
 wlr_create(const struct wla_events *ev, void *core)
@@ -2409,6 +2504,7 @@ wlr_create(const struct wla_events *ev, void *core)
     }
     LOG(LOG_LEVEL_INFO, "wlr: %d output(s): first %s", b->num_mons,
         b->mons[0].name);
+    query_main_device(b);
     b->vptr = zwlr_virtual_pointer_manager_v1_create_virtual_pointer(
                   b->vptr_mgr, b->seat);
     b->vkbd = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(
@@ -2513,6 +2609,20 @@ wlr_dispatch(void *a, const struct pollfd *p, int n)
 }
 
 /*****************************************************************************/
+/*****************************************************************************/
+static int
+wlr_render_node(void *a, char *path, int size)
+{
+    struct wlr *b = a;
+
+    if (!b->have_main_dev)
+    {
+        return 1;
+    }
+    return render_node(b->main_dev, path, size);
+}
+
+/*****************************************************************************/
 const struct wla_ops wla_wlr =
 {
     .name = "wlr",
@@ -2520,6 +2630,7 @@ const struct wla_ops wla_wlr =
     .create = wlr_create,
     .destroy = wlr_destroy,
     .max_monitors = wlr_max_monitors,
+    .render_node = wlr_render_node,
     .set_layout = wlr_set_layout,
     .start = wlr_start,
     .stop = wlr_stop,

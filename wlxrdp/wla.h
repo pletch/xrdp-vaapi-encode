@@ -195,6 +195,19 @@ struct wla_ops
     int (*max_monitors)(void *a);
 
     /**
+     * The render node of the GPU the compositor renders on, as the
+     * compositor reports it. The core passes it to the accel-assist
+     * helper, whose GL and encoder must be on the same GPU. Optional:
+     * NULL, or nonzero, when the adapter cannot tell.
+     *
+     * @param a Adapter object
+     * @param path Filled with the node's path
+     * @param size Size of path
+     * @return 0 if path was filled
+     */
+    int (*render_node)(void *a, char *path, int size);
+
+    /**
      * Apply a layout
      *
      * @param a Adapter object

@@ -127,10 +127,13 @@ If any required protocol is missing, wlxrdp logs
 - **Device.** On the GPU path wlxrdp allocates its buffers with GBM on
   the render node the capture session names (`dmabuf_device`), so the
   compositor can always write to them. `WLXRDP_DRM` overrides it; a
-  compositor that names none gets the encoder's device
-  (`XRDP_VAAPI_DEVICE`). The encoder imports the same buffers, so it must
-  be on that GPU too. wlxrdp logs a warning naming both devices when it
-  is not. The CPU path opens no device.
+  compositor that names none gets the encoder's device. The encoder
+  imports the same buffers, so it must be on that GPU too: wlxrdp reads
+  the compositor's main device from the linux-dmabuf v4 default feedback
+  at startup, before any capture session exists, and passes it to the
+  accel-assist helper (`XRDP_ACCEL_ASSIST_DRM_DEVICE`), which encodes
+  there. `XRDP_VAAPI_DEVICE` overrides that, and wlxrdp logs a warning
+  naming both devices when they differ. The CPU path opens no device.
 - **Formats.** On the GPU path wlxrdp takes only `DRM_FORMAT_XRGB8888`
   dma-bufs. It allocates them with GBM on the render node, preferring
   Intel Y-tiled, then X-tiled, then linear, then any other modifier the
