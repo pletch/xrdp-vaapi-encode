@@ -319,13 +319,31 @@ persistent corruption that looks like a chroma bug but is not.
   reference chain without reporting an error - a deliberately corrupted control
   stream decoded clean on Chrome's hardware path - so "it looks right" is not
   evidence here; comparing decoded pictures is.
-* **Chroma interval**: the auxiliary picture only needs to be sent periodically.
-  The default of 4 refreshes chroma every fourth frame while luma updates every
-  frame, and measures far smoother than every-frame chroma with no visible penalty
-  on desktop content. Frames without it carry `LC=1` (luma only). Larger intervals
-  work - 8 was the previous default - but chroma then lags luma by up to
-  interval-1 frames, and the auxiliary view's accumulated damage box reaches its
-  full-frame fallback sooner, so the saving falls off.
+* **Damage detection**: an application that repaints without changing anything
+  (a hover redraw, a blinking caret's whole line) still reports damage. The helper
+  compares each damaged 16x16 cell with the source as last encoded, on the GPU (a
+  per-pixel mask, then a per-cell maximum, then one small readback), and passes on
+  only the cells that changed; a frame where nothing did is not sent at all. About
+  1 ms a frame. `XRDP_AVC444_DAMAGE_DETECT=0` turns it off, for diagnosis only.
+* **The auxiliary picture goes only where a change needs it.** The same pass
+  marks the cells whose chroma is off by more than `XRDP_AVC444_AUX_THRESHOLD` (30,
+  the threshold MS-RDPEGFX gives the client's reverse filter) from the 2x2 mean the
+  main view carries. Grey and flat content goes without; coloured detail and
+  subpixel-antialiased text get it on the frame they change. Frames without it
+  carry `LC=1` (luma only).
+* **Moving areas get it once they settle.** A cell that changes again within
+  150 ms is moving (video, scrolling, a drag): it goes luma-only and owes the
+  auxiliary picture, which it gets once it has been still for 120 ms. Typing stays
+  a run of one-off changes and gets 4:4:4 at once. When captures stop altogether,
+  the capture side sends one more 150 ms later (xorgxrdp and wlxrdp both, as a
+  16x16 corner) so the owed cells go out instead of waiting for the next change.
+  This replaced a fixed interval (every fourth frame, plus a 200 ms deadline),
+  which both cost more and, because the deadline was only checked on the next
+  frame, could leave a one-off change at 4:2:0 indefinitely: the hover flicker.
+  Measured at 1728x1024 v2 on FreeRDP 3.32, against the interval of 4: video 4.40
+  against 5.03 Mbit/s, coloured scrolling 2.80 against 3.18, with 4:4:4 back within
+  0.3-0.5 s of motion stopping, and no change in frame rate. Without damage
+  detection the auxiliary picture goes with every frame.
 * **Packed shaders**: the RGB->NV12 conversion writes four destination bytes per
   fragment as RGBA8 over a quarter-width viewport, for both the main and auxiliary
   views.
@@ -358,13 +376,15 @@ persistent corruption that looks like a chroma bug but is not.
   aligned. This is metadata only - both views still encode a full picture - so it
   changes what the client copies, not the bitrate or the quality.
 
-* **The auxiliary view declares the rect the helper actually rendered.** Under
-  motion the auxiliary picture carries the damage accumulated across the luma-only
-  frames before it, which is more than the current frame's rects; declaring only
-  those would leave a region that changed during those frames holding its odd-row chroma from the last auxiliary frame. accel-assist has
-  that rectangle - it is what the v2 shader pass was scissored to - and appends it
-  to the shared-memory payload as an optional 20-byte trailer after
-  `[len1][stream1][len2][stream2]`. The trailer is optional in both directions, so a
+* **The auxiliary view declares the rects the helper actually rendered.** After
+  motion the auxiliary picture carries cells that changed during the luma-only
+  frames before it, which are not the current frame's rects; declaring only those
+  would leave the settled cells holding their odd-row chroma from the last
+  auxiliary frame. accel-assist has those rects - they are what the shader pass
+  was scissored to - and appends them to the shared-memory payload after
+  `[len1][stream1][len2][stream2]`: the changed cells as a `RECT` list (both
+  views), the auxiliary cells as an `AUXR` list, and failing those the rendered
+  box as a 20-byte trailer. The trailer is optional in both directions, so a
   mismatched pair of binaries falls back to declaring the whole frame rather than to
   stale chroma. Measured on a 2992x1648 desktop at interval 8, the auxiliary view
   went from a full-plane copy every time (29.3 ms a picture) to 37% of the plane
