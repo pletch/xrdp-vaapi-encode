@@ -287,8 +287,13 @@ struct xrdp_client_info
        xrdp_mm_egfx_caps_advertise(); read by xorgxrdp to pick the codec id.
        Appended at the end: xorgxrdp is built separately against this
        header. */
-    /* 0 none, 1 v1 chroma layout, 2 v2 */
+    /* 0 none, 1 v1 chroma layout, 2 v2, 3 v2 and the client sent no
+       clientDigProductId (see xup_client_info.h) */
     int gfx_avc444;
+
+    /* TS_UD_CS_CORE clientDigProductId is not empty (mstsc fills it,
+       FreeRDP does not) */
+    int client_dig_product_id;
 };
 
 /*

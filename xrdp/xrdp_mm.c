@@ -1331,6 +1331,13 @@ xrdp_mm_egfx_caps_advertise(void *user, int caps_count,
             self->wm->client_info->gfx_avc444 =
                 xrdp_mm_egfx_caps_avc444(ver_flags[best_index].version,
                                          ver_flags[best_index].flags);
+            /* Level 3 tells the session which client family it serves:
+               it decides where the v2 auxiliary view may be split. */
+            if (self->wm->client_info->gfx_avc444 == 2 &&
+                    !self->wm->client_info->client_dig_product_id)
+            {
+                self->wm->client_info->gfx_avc444 = 3;
+            }
         }
         else
         {
@@ -1338,6 +1345,8 @@ xrdp_mm_egfx_caps_advertise(void *user, int caps_count,
         }
         LOG(LOG_LEVEL_INFO, "xrdp_mm_egfx_caps_advertise: AVC444 %s by the "
             "confirmed capability set 0x%8.8x flags 0x%8.8x",
+            self->wm->client_info->gfx_avc444 == 3 ? "v2 supported "
+            "(client without clientDigProductId)" :
             self->wm->client_info->gfx_avc444 == 2 ? "v2 supported" :
             self->wm->client_info->gfx_avc444 == 1 ? "v1 supported" :
             "not supported",

@@ -60,6 +60,9 @@ struct xh_rect
 /* Session capability bits from xorgxrdp's control batch. */
 #define XH_CAPS_AVC444        (1 << 0)
 #define XH_CAPS_AVC444_V2     (1 << 1)
+/* The client sent no clientDigProductId: FreeRDP, which splits the v2 aux
+   view at half the 16-aligned width even at an odd macroblock count. */
+#define XH_CAPS_NO_DIG_PRODUCT_ID (1 << 2)
 
 enum encoder_result
 {

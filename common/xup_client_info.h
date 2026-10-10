@@ -73,7 +73,11 @@ struct xup_client_info
 
     /* The confirmed EGFX capability set permits AVC444. xorgxrdp uses it to
        pick the codec id and size the helper's encoder. */
-    /* 0 none, 1 AVC444 v1 chroma layout, 2 v2 */
+    /* 0 none, 1 AVC444 v1 chroma layout, 2 v2, 3 v2 and the client sent
+       no clientDigProductId. FreeRDP sends none and mstsc does; the two
+       split v2's auxiliary view at different places when the width is an
+       odd number of macroblocks. A reader that knows only 0-2 takes 3 as
+       v2, which it is. */
     int gfx_avc444;
 };
 

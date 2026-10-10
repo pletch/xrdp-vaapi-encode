@@ -1629,6 +1629,7 @@ xrdp_sec_process_mcs_data_CS_CORE(struct xrdp_sec *self, struct stream *s)
     int highColorDepth;
     int supportedColorDepths;
     int earlyCapabilityFlags;
+    int i;
 
     UNUSED_VAR(version);
     struct xrdp_client_info *client_info = &self->rdp_layer->client_info;
@@ -1817,9 +1818,15 @@ xrdp_sec_process_mcs_data_CS_CORE(struct xrdp_sec *self, struct stream *s)
     {
         return 0;
     }
-    in_uint8s(s, 64); /* clientDigProductId */
+    /* clientDigProductId: only whether it is empty. mstsc fills it,
+       FreeRDP leaves it zero, and the two place AVC444v2's chroma split
+       differently at an odd macroblock width (see xrdp_mm.c). */
+    in_uint16_le(s, i);
+    client_info->client_dig_product_id = (i != 0);
+    in_uint8s(s, 62);
     LOG_DEVEL(LOG_LEVEL_TRACE, "Received [MS-RDPBCGR] TS_UD_CS_CORE "
-              "<Optional Field> clientDigProductId (ignored)");
+              "<Optional Field> clientDigProductId %s",
+              client_info->client_dig_product_id ? "set" : "empty");
 
     if (!s_check_rem(s, 1))
     {

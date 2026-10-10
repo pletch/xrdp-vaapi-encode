@@ -872,6 +872,28 @@ xrdp_accel_assist_x11_encoder_avc444_v2(void)
 }
 
 /*****************************************************************************/
+/* Whether to keep AVC444v2 for a monitor whose width is an odd number of
+   macroblocks. The v2 layout then suits FreeRDP but not mstsc, which drops
+   such pictures. XRDP_AVC444_V2_ODD_WIDTH: unset or "0" never, "auto" for
+   a client that sent no clientDigProductId (FreeRDP does not, mstsc does),
+   anything else always. */
+int
+xrdp_accel_assist_x11_avc444_v2_odd_width(void)
+{
+    const char *env = g_getenv("XRDP_AVC444_V2_ODD_WIDTH");
+
+    if (env == NULL)
+    {
+        return 0;
+    }
+    if (g_strcmp(env, "auto") == 0)
+    {
+        return (g_session_caps & XH_CAPS_NO_DIG_PRODUCT_ID) != 0;
+    }
+    return g_strcmp(env, "0") != 0;
+}
+
+/*****************************************************************************/
 /* Whether a monitor's surface uses the v2 layout: the session's choice,
    unless its width rules v2 out (see create_encode_surface). */
 int
@@ -1089,10 +1111,22 @@ xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
            macroblocks). v1 has no split, so it serves such a surface. */
         if (mi->avc444_v2 && (((width + 15) / 16) & 1) != 0)
         {
-            LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_create_pixmap: "
-                "width %d is an odd number of macroblocks; AVC444v1 for this "
-                "monitor", width);
-            mi->avc444_v2 = 0;
+            if (xrdp_accel_assist_x11_avc444_v2_odd_width())
+            {
+                /* The layout below splits at half the 16-aligned width,
+                   which is where FreeRDP looks. Not for mstsc: it drops
+                   such pictures. */
+                LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_create_pixmap: "
+                    "width %d is an odd number of macroblocks; keeping "
+                    "AVC444v2 (XRDP_AVC444_V2_ODD_WIDTH)", width);
+            }
+            else
+            {
+                LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_create_pixmap: "
+                    "width %d is an odd number of macroblocks; AVC444v1 for "
+                    "this monitor", width);
+                mi->avc444_v2 = 0;
+            }
         }
         /* v2 splits the aux plane into U and V halves at half the
            16-aligned width (FreeRDP's nTotalWidth; mstsc agrees), so encode
