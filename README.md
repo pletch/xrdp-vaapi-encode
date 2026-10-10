@@ -487,8 +487,11 @@ persistent corruption that looks like a chroma bug but is not.
   carry `LC=1` (luma only).
 * **Moving areas get it once they settle.** A cell that changes again within
   150 ms is moving (video, scrolling, a drag): it goes luma-only and owes the
-  auxiliary picture, which it gets once it has been still for 120 ms. Typing stays
-  a run of one-off changes and gets 4:4:4 at once. When captures stop altogether,
+  auxiliary picture, which it gets once it has been still for 120 ms. Motion is
+  judged over the 3x3 cells around each one: inside a video, a cell that changes
+  only now and then is moving too, and none settles until the area has (on a test
+  video, 60% fewer auxiliary bytes). Typing stays a run of one-off changes and
+  gets 4:4:4 at once. When captures stop altogether,
   the capture side sends one more 150 ms later (xorgxrdp and wlxrdp both, as a
   16x16 corner) so the owed cells go out instead of waiting for the next change.
   This replaced a fixed interval (every fourth frame, plus a 200 ms deadline),

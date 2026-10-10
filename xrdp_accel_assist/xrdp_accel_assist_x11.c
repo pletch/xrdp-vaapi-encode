@@ -237,6 +237,7 @@ struct mon_info
     GLuint dd_prev_texture;       /* RGBA8, dd_w x dd_h */
     GLuint dd_mask_texture;       /* RG8, dd_w x dd_h: changed, needs aux */
     GLuint dd_cell_texture;       /* RGBA8, one texel per 16x16 cell */
+    GLuint dd_m4_texture;         /* RG8, one texel per 4x4 of the mask */
     int dd_w;
     int dd_h;
     int dd_cells_w;
@@ -254,6 +255,7 @@ struct mon_info
        view (it needed it while moving), and whether it gets it now. */
     unsigned char *dd_streak;     /* 1 once the cell has changed */
     unsigned int *dd_changed_ms;  /* when the cell last changed */
+    unsigned int *dd_moving_ms;   /* when it last moved on its own */
     unsigned char *dd_owe;
     unsigned char *dd_auxc;
     /* The cells getting the aux view this frame as rects; -1: too many,
@@ -646,6 +648,8 @@ xrdp_accel_assist_x11_delete_all_pixmaps(void)
             glDeleteTextures(1, &(mi->dd_prev_texture));
             glDeleteTextures(1, &(mi->dd_mask_texture));
             glDeleteTextures(1, &(mi->dd_cell_texture));
+            glDeleteTextures(1, &(mi->dd_m4_texture));
+            mi->dd_m4_texture = 0;
             mi->dd_prev_texture = 0;
             mi->dd_mask_texture = 0;
             mi->dd_cell_texture = 0;
@@ -656,6 +660,8 @@ xrdp_accel_assist_x11_delete_all_pixmaps(void)
         mi->dd_cand = NULL;
         g_free(mi->dd_streak);
         g_free(mi->dd_changed_ms);
+        g_free(mi->dd_moving_ms);
+        mi->dd_moving_ms = NULL;
         g_free(mi->dd_owe);
         g_free(mi->dd_auxc);
         g_free(mi->dd_aux_rects);
@@ -2176,6 +2182,8 @@ xrdp_accel_assist_x11_recreate_enc(struct mon_info *mi)
    a cell that changes on every other capture (video at a rate the capture
    does not match) is still moving. The idle flush comes later than this. */
 #define DD_SETTLE_MS 120
+/* Moving cells, of the 3x3 around one, that make the area moving. */
+#define DD_AREA_MIN 3
 
 
 static unsigned long long
@@ -2280,6 +2288,7 @@ dd_alloc(struct mon_info *mi, int width, int height)
         glDeleteTextures(1, &(mi->dd_prev_texture));
         glDeleteTextures(1, &(mi->dd_mask_texture));
         glDeleteTextures(1, &(mi->dd_cell_texture));
+        glDeleteTextures(1, &(mi->dd_m4_texture));
     }
     g_free(mi->dd_map);
     g_free(mi->dd_cand);
@@ -2291,9 +2300,11 @@ dd_alloc(struct mon_info *mi, int width, int height)
     mi->dd_cand = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
     g_free(mi->dd_streak);
     g_free(mi->dd_changed_ms);
+    g_free(mi->dd_moving_ms);
     g_free(mi->dd_owe);
     g_free(mi->dd_auxc);
     g_free(mi->dd_aux_rects);
+    mi->dd_moving_ms = g_new0(unsigned int, mi->dd_cells_w * mi->dd_cells_h);
     mi->dd_streak = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
     mi->dd_changed_ms = g_new0(unsigned int, mi->dd_cells_w * mi->dd_cells_h);
     mi->dd_owe = g_new0(unsigned char, mi->dd_cells_w * mi->dd_cells_h);
@@ -2309,8 +2320,18 @@ dd_alloc(struct mon_info *mi, int width, int height)
     glBindTexture(GL_TEXTURE_2D, mi->dd_mask_texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, width, height, 0,
                  GL_RG, GL_UNSIGNED_BYTE, NULL);
+    glGenTextures(1, &(mi->dd_m4_texture));
+    glBindTexture(GL_TEXTURE_2D, mi->dd_m4_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, (width + 3) / 4, (height + 3) / 4,
+                 0, GL_RG, GL_UNSIGNED_BYTE, NULL);
     glGenTextures(1, &(mi->dd_cell_texture));
     glBindTexture(GL_TEXTURE_2D, mi->dd_cell_texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -2320,7 +2341,7 @@ dd_alloc(struct mon_info *mi, int width, int height)
     glBindTexture(GL_TEXTURE_2D, 0);
     mi->dd_prev_valid = 0;
     if (mi->dd_map == NULL || mi->dd_cand == NULL || mi->dd_streak == NULL ||
-            mi->dd_changed_ms == NULL ||
+            mi->dd_changed_ms == NULL || mi->dd_moving_ms == NULL ||
             mi->dd_owe == NULL || mi->dd_auxc == NULL ||
             mi->dd_aux_rects == NULL)
     {
@@ -2562,28 +2583,69 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, 0);
         glActiveTexture(GL_TEXTURE0);
-        /* cell pass: one fragment per 16x16 cell, over the whole map */
-        glBindTexture(GL_TEXTURE_2D, mi->dd_mask_texture);
-        si = g_si + XH_SHADERCELLMAX;
-        glUseProgram(si->program);
-        glUniform1i(si->tex_loc, 0);
-        glUniform2f(si->tex_size_loc, mi->dd_w, mi->dd_h);
-        glBindFramebuffer(GL_FRAMEBUFFER, g_fb);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_2D, mi->dd_cell_texture, 0);
-        glGenVertexArrays(1, &vao);
-        glGenBuffers(1, &vbo);
-        glBindVertexArray(vao);
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(g_vertices), g_vertices,
-                     GL_STATIC_DRAW);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 2,
-                              NULL);
-        glViewport(0, 0, mi->dd_cells_w, mi->dd_cells_h);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        glReadPixels(0, 0, mi->dd_cells_w, mi->dd_cells_h, GL_RGBA,
-                     GL_UNSIGNED_BYTE, mi->dd_map);
+        /* cell passes: 4x4 of the mask per fragment, then 4x4 of those,
+           so each cell's max takes two short loops rather than one of 256
+           (1.7 ms down to 0.95 ms here); over the damaged cells' box only,
+           and only that box read back */
+        {
+            int bx1 = mi->dd_cells_w;
+            int by1 = mi->dd_cells_h;
+            int bx2 = 0;
+            int by2 = 0;
+            int m4_w = (mi->dd_w + 3) / 4;
+            int m4_h = (mi->dd_h + 3) / 4;
+
+            for (index = 0; index < cells; index++)
+            {
+                if (mi->dd_cand[index])
+                {
+                    cx = index % mi->dd_cells_w;
+                    cy = index / mi->dd_cells_w;
+                    bx1 = MIN(bx1, cx);
+                    by1 = MIN(by1, cy);
+                    bx2 = MAX(bx2, cx + 1);
+                    by2 = MAX(by2, cy + 1);
+                }
+            }
+            si = g_si + XH_SHADERCELLMAX;
+            glUseProgram(si->program);
+            glUniform1i(si->tex_loc, 0);
+            glGenVertexArrays(1, &vao);
+            glGenBuffers(1, &vbo);
+            glBindVertexArray(vao);
+            glBindBuffer(GL_ARRAY_BUFFER, vbo);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(g_vertices), g_vertices,
+                         GL_STATIC_DRAW);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
+                                  sizeof(float) * 2, NULL);
+            glBindFramebuffer(GL_FRAMEBUFFER, g_fb);
+            glEnable(GL_SCISSOR_TEST);
+            if (bx2 > bx1 && by2 > by1)
+            {
+                glBindTexture(GL_TEXTURE_2D, mi->dd_mask_texture);
+                glUniform2f(si->tex_size_loc, mi->dd_w, mi->dd_h);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                       GL_TEXTURE_2D, mi->dd_m4_texture, 0);
+                glViewport(0, 0, m4_w, m4_h);
+                glScissor(bx1 * 4, by1 * 4, (bx2 - bx1) * 4,
+                          (by2 - by1) * 4);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                glBindTexture(GL_TEXTURE_2D, mi->dd_m4_texture);
+                glUniform2f(si->tex_size_loc, m4_w, m4_h);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                       GL_TEXTURE_2D, mi->dd_cell_texture, 0);
+                glViewport(0, 0, mi->dd_cells_w, mi->dd_cells_h);
+                glScissor(bx1, by1, bx2 - bx1, by2 - by1);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                glPixelStorei(GL_PACK_ROW_LENGTH, mi->dd_cells_w);
+                glReadPixels(bx1, by1, bx2 - bx1, by2 - by1, GL_RGBA,
+                             GL_UNSIGNED_BYTE,
+                             mi->dd_map + (by1 * mi->dd_cells_w + bx1) * 4);
+                glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+            }
+            glDisable(GL_SCISSOR_TEST);
+        }
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glBindVertexArray(0);
         glDeleteBuffers(1, &vbo);
@@ -2598,28 +2660,67 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
 
         mi->dd_need_valid = 1;
         mi->dd_need_any = 0;
+        /* first what changed, and which cells move on their own (changed
+           again within DD_MOTION_MS); dd_moving_ms keeps when each last
+           did */
         for (index = 0; index < cells; index++)
         {
             int changed_now = 0;
-            int need = 0;
-            int moving;
-            int aux_now;
 
             if (mi->dd_cand[index])
             {
                 num_cand++;
                 changed_now = mi->dd_map[index * 4] > 127;
-                need = changed_now && mi->dd_map[index * 4 + 1] > 127;
                 mi->dd_cand[index] = changed_now;
                 num_changed += changed_now;
+            }
+            if (changed_now && mi->dd_streak[index] &&
+                    now_ms - mi->dd_changed_ms[index] < DD_MOTION_MS)
+            {
+                mi->dd_moving_ms[index] = now_ms;
+            }
+        }
+        for (index = 0; index < cells; index++)
+        {
+            int changed_now = mi->dd_cand[index];
+            int need = changed_now && mi->dd_map[index * 4 + 1] > 127;
+            int moving;
+            int aux_now;
+            int area = 0;
+            int area_settle = 0;
+            int cx0 = index % mi->dd_cells_w;
+            int cy0 = index / mi->dd_cells_w;
+            int nx;
+            int ny;
+
+            /* The 3x3 around the cell: an area moves when enough of it
+               moved lately (video, scrolling), which a typed character
+               does not. Inside a moving area, a cell that changes only now
+               and then is moving too, and none settles until the area
+               has. Settling looks back no further than DD_SETTLE_MS: the
+               idle flush, which may be the last capture, comes 150 ms on. */
+            if (changed_now || mi->dd_owe[index])
+            {
+                for (ny = MAX(cy0 - 1, 0);
+                        ny <= MIN(cy0 + 1, mi->dd_cells_h - 1); ny++)
+                {
+                    for (nx = MAX(cx0 - 1, 0);
+                            nx <= MIN(cx0 + 1, mi->dd_cells_w - 1); nx++)
+                    {
+                        int k = ny * mi->dd_cells_w + nx;
+                        unsigned int since = now_ms - mi->dd_moving_ms[k];
+                        int mv = mi->dd_streak[k] && mi->dd_moving_ms[k] != 0;
+
+                        area += mv && since < DD_MOTION_MS;
+                        area_settle += mv && since < DD_SETTLE_MS;
+                    }
+                }
             }
             moving = 0;
             if (changed_now)
             {
-                /* dd_streak: the cell has changed before, so its time is
-                   meaningful */
-                moving = mi->dd_streak[index] &&
-                         now_ms - mi->dd_changed_ms[index] < DD_MOTION_MS;
+                moving = mi->dd_moving_ms[index] == now_ms ||
+                         area >= DD_AREA_MIN;
                 mi->dd_changed_ms[index] = now_ms;
                 mi->dd_streak[index] = 1;
             }
@@ -2629,7 +2730,8 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
             }
             aux_now = (need && !moving) ||
                       (mi->dd_owe[index] && !changed_now &&
-                       now_ms - mi->dd_changed_ms[index] >= DD_SETTLE_MS);
+                       now_ms - mi->dd_changed_ms[index] >= DD_SETTLE_MS &&
+                       area_settle < DD_AREA_MIN);
             mi->dd_auxc[index] = aux_now;
             if (aux_now)
             {
