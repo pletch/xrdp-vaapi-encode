@@ -78,8 +78,9 @@ void main(void)\n\
                         1.0 : 0.0, need, 0.0, 1.0);\n\
 }\n";
 
-/* Then one fragment per 16x16 cell: the most any mask pixel says, for
-   both channels (changed, needs the auxiliary view). */
+/* Then the most any mask pixel says, for both channels (changed, needs the
+   auxiliary view): 4x4 texels per fragment, run twice (mask to quarter
+   size, then to one texel per 16x16 cell). */
 static const GLchar g_fs_cell_max[] = "\
 uniform sampler2D tex;\n\
 uniform vec2 tex_size;\n\
@@ -87,11 +88,11 @@ void main(void)\n\
 {\n\
     vec2 base;\n\
     vec2 d;\n\
-    base = floor(gl_FragCoord.xy) * 16.0;\n\
+    base = floor(gl_FragCoord.xy) * 4.0;\n\
     d = vec2(0.0);\n\
-    for (int j = 0; j < 16; j++)\n\
+    for (int j = 0; j < 4; j++)\n\
     {\n\
-        for (int i = 0; i < 16; i++)\n\
+        for (int i = 0; i < 4; i++)\n\
         {\n\
             d = max(d, texture2D(tex, (base + vec2(float(i) + 0.5,\n\
                                        float(j) + 0.5)) / tex_size).rg);\n\

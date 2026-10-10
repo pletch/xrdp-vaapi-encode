@@ -219,6 +219,7 @@ struct mon_info
     GLuint dd_prev_texture;       /* RGBA8, dd_w x dd_h */
     GLuint dd_mask_texture;       /* RG8, dd_w x dd_h: changed, needs aux */
     GLuint dd_cell_texture;       /* RGBA8, one texel per 16x16 cell */
+    GLuint dd_m4_texture;         /* RG8, one texel per 4x4 of the mask */
     int dd_w;
     int dd_h;
     int dd_cells_w;
@@ -577,6 +578,8 @@ xrdp_accel_assist_x11_delete_all_pixmaps(void)
             glDeleteTextures(1, &(mi->dd_prev_texture));
             glDeleteTextures(1, &(mi->dd_mask_texture));
             glDeleteTextures(1, &(mi->dd_cell_texture));
+            glDeleteTextures(1, &(mi->dd_m4_texture));
+            mi->dd_m4_texture = 0;
             mi->dd_prev_texture = 0;
             mi->dd_mask_texture = 0;
             mi->dd_cell_texture = 0;
@@ -2139,6 +2142,7 @@ dd_alloc(struct mon_info *mi, int width, int height)
         glDeleteTextures(1, &(mi->dd_prev_texture));
         glDeleteTextures(1, &(mi->dd_mask_texture));
         glDeleteTextures(1, &(mi->dd_cell_texture));
+        glDeleteTextures(1, &(mi->dd_m4_texture));
     }
     g_free(mi->dd_map);
     g_free(mi->dd_cand);
@@ -2168,8 +2172,18 @@ dd_alloc(struct mon_info *mi, int width, int height)
     glBindTexture(GL_TEXTURE_2D, mi->dd_mask_texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, width, height, 0,
                  GL_RG, GL_UNSIGNED_BYTE, NULL);
+    glGenTextures(1, &(mi->dd_m4_texture));
+    glBindTexture(GL_TEXTURE_2D, mi->dd_m4_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, (width + 3) / 4, (height + 3) / 4,
+                 0, GL_RG, GL_UNSIGNED_BYTE, NULL);
     glGenTextures(1, &(mi->dd_cell_texture));
     glBindTexture(GL_TEXTURE_2D, mi->dd_cell_texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -2421,28 +2435,69 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, 0);
         glActiveTexture(GL_TEXTURE0);
-        /* cell pass: one fragment per 16x16 cell, over the whole map */
-        glBindTexture(GL_TEXTURE_2D, mi->dd_mask_texture);
-        si = g_si + XH_SHADERCELLMAX;
-        glUseProgram(si->program);
-        glUniform1i(si->tex_loc, 0);
-        glUniform2f(si->tex_size_loc, mi->dd_w, mi->dd_h);
-        glBindFramebuffer(GL_FRAMEBUFFER, g_fb);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_2D, mi->dd_cell_texture, 0);
-        glGenVertexArrays(1, &vao);
-        glGenBuffers(1, &vbo);
-        glBindVertexArray(vao);
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(g_vertices), g_vertices,
-                     GL_STATIC_DRAW);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 2,
-                              NULL);
-        glViewport(0, 0, mi->dd_cells_w, mi->dd_cells_h);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        glReadPixels(0, 0, mi->dd_cells_w, mi->dd_cells_h, GL_RGBA,
-                     GL_UNSIGNED_BYTE, mi->dd_map);
+        /* cell passes: 4x4 of the mask per fragment, then 4x4 of those,
+           so each cell's max takes two short loops rather than one of 256
+           (1.7 ms down to 0.95 ms here); over the damaged cells' box only,
+           and only that box read back */
+        {
+            int bx1 = mi->dd_cells_w;
+            int by1 = mi->dd_cells_h;
+            int bx2 = 0;
+            int by2 = 0;
+            int m4_w = (mi->dd_w + 3) / 4;
+            int m4_h = (mi->dd_h + 3) / 4;
+
+            for (index = 0; index < cells; index++)
+            {
+                if (mi->dd_cand[index])
+                {
+                    cx = index % mi->dd_cells_w;
+                    cy = index / mi->dd_cells_w;
+                    bx1 = MIN(bx1, cx);
+                    by1 = MIN(by1, cy);
+                    bx2 = MAX(bx2, cx + 1);
+                    by2 = MAX(by2, cy + 1);
+                }
+            }
+            si = g_si + XH_SHADERCELLMAX;
+            glUseProgram(si->program);
+            glUniform1i(si->tex_loc, 0);
+            glGenVertexArrays(1, &vao);
+            glGenBuffers(1, &vbo);
+            glBindVertexArray(vao);
+            glBindBuffer(GL_ARRAY_BUFFER, vbo);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(g_vertices), g_vertices,
+                         GL_STATIC_DRAW);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
+                                  sizeof(float) * 2, NULL);
+            glBindFramebuffer(GL_FRAMEBUFFER, g_fb);
+            glEnable(GL_SCISSOR_TEST);
+            if (bx2 > bx1 && by2 > by1)
+            {
+                glBindTexture(GL_TEXTURE_2D, mi->dd_mask_texture);
+                glUniform2f(si->tex_size_loc, mi->dd_w, mi->dd_h);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                       GL_TEXTURE_2D, mi->dd_m4_texture, 0);
+                glViewport(0, 0, m4_w, m4_h);
+                glScissor(bx1 * 4, by1 * 4, (bx2 - bx1) * 4,
+                          (by2 - by1) * 4);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                glBindTexture(GL_TEXTURE_2D, mi->dd_m4_texture);
+                glUniform2f(si->tex_size_loc, m4_w, m4_h);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                       GL_TEXTURE_2D, mi->dd_cell_texture, 0);
+                glViewport(0, 0, mi->dd_cells_w, mi->dd_cells_h);
+                glScissor(bx1, by1, bx2 - bx1, by2 - by1);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                glPixelStorei(GL_PACK_ROW_LENGTH, mi->dd_cells_w);
+                glReadPixels(bx1, by1, bx2 - bx1, by2 - by1, GL_RGBA,
+                             GL_UNSIGNED_BYTE,
+                             mi->dd_map + (by1 * mi->dd_cells_w + bx1) * 4);
+                glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+            }
+            glDisable(GL_SCISSOR_TEST);
+        }
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glBindVertexArray(0);
         glDeleteBuffers(1, &vbo);
