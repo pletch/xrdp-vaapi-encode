@@ -91,7 +91,8 @@ fi
 # is disconnected by the compositor. But a second desktop session on the
 # user's bus would clash with the first (session manager and settings
 # daemons claim fixed bus names), so with one already there, or with
-# XRDP_WAYLAND_PRIVATE_BUS=1, the desktop gets its own bus, as before.
+# XRDP_WAYLAND_PRIVATE_BUS=1, the desktop gets its own bus, as before,
+# and waylandsession.sh lends it the user's keyring (waylandsecrets.py).
 user_bus_busy() {
     for name in org.xfce.SessionManager org.gnome.SessionManager \
             org.kde.ksmserver; do
@@ -107,7 +108,7 @@ if [ "$XRDP_WAYLAND_PRIVATE_BUS" != 1 ] && \
     export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
     if user_bus_busy; then
         echo "startwayland.sh: a desktop session is already on the user's" \
-            "D-Bus; this one gets its own bus (no keyring)" >&2
+            "D-Bus; this one gets its own bus" >&2
     else
         export XRDP_WAYLAND_USER_BUS=1
         SESSION_CMD=$XRDP_CFG_DIR/waylandsession.sh

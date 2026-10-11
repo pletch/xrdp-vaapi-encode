@@ -80,6 +80,24 @@ if [ "$XRDP_WAYLAND_REMOTEAPP" = 1 ]; then
     exit 0
 fi
 
+# On a private D-Bus (startwayland.sh): the keyring is on the user's bus,
+# and the private bus cannot start one, so apps asking it for secrets
+# (browsers, VS Code) would wait two minutes. waylandsecrets.py passes
+# their calls to the user's keyring. Started before the desktop, which
+# waits (a second at most) for it to hold the keyring's name.
+if [ "$XRDP_WAYLAND_USER_BUS" != 1 ] && [ -S "$XDG_RUNTIME_DIR/bus" ] &&
+        command -v python3 >/dev/null 2>&1; then
+    python3 "$(dirname "$(readlink -f "$0")")/waylandsecrets.py" \
+        "unix:path=$XDG_RUNTIME_DIR/bus" &
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+            /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+            string:org.freedesktop.secrets 2>/dev/null |
+            grep -q 'boolean true' && break
+        sleep 0.1
+    done
+fi
+
 USER_SESSION=${XDG_CONFIG_HOME:-$HOME/.config}/xrdp/waylandsession
 if [ -x "$USER_SESSION" ]; then
     activation_env

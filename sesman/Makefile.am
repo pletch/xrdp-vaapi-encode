@@ -68,12 +68,14 @@ dist_sesmansysconf_SCRIPTS = \
 if XRDP_WAYLAND
 dist_sesmansysconf_SCRIPTS += \
   startwayland.sh \
+  waylandsecrets.py \
   waylandsession.sh
 dist_sesmansysconf_DATA = \
   sway-remoteapp.conf
 else
 EXTRA_DIST += \
   startwayland.sh \
+  waylandsecrets.py \
   waylandsession.sh \
   sway-remoteapp.conf
 endif
