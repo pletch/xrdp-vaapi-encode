@@ -88,6 +88,14 @@
    more (a 16x16 corner) so the helper can send the 4:4:4 detail that
    moving areas were sent without; as xorgxrdp's idle flush */
 #define IDLE_FLUSH_MS 150
+/* screen sleep (XRDP_SCREEN_SLEEP_TIME and _MODE, as xorgxrdp reads them):
+   after that many minutes without input no more frames go out, and the
+   client keeps the last one (last), is sent black (black), or gets one
+   second of frames every N minutes (refresh[:N]) */
+#define SLEEP_LAST 0
+#define SLEEP_BLACK 1
+#define SLEEP_REFRESH 2
+#define SLEEP_REFRESH_AWAKE_MS 1000
 #define IN_MAX (128 * 1024)
 /* spare keycodes for characters not on the client's layout */
 #define UNI_SLOTS 8
@@ -163,6 +171,15 @@ struct be
     /* AVC444 idle flush: a capture is due this long after the last one */
     int idle_flush;
     uint32_t idle_flush_ms;
+    /* screen sleep: off when sleep_ms is 0 */
+    int sleep_ms;
+    int sleep_mode;
+    int sleep_refresh_ms;
+    int asleep;
+    int sleep_refreshing;       /* refresh mode: awake until sleep_next_ms */
+    uint32_t sleep_next_ms;     /* refresh mode: the next change of state */
+    uint32_t sleep_start_ms;
+    uint32_t last_input_ms;
 
     /* keyboard */
     struct xkb_context *xkb_ctx;
@@ -964,6 +981,24 @@ helper_stop(struct be *b)
 }
 
 /*****************************************************************************/
+/* the session capabilities the helper's batch carries */
+static int
+helper_caps(struct be *b)
+{
+    int caps = 0;
+
+    if (b->codec_id != 0x000B)
+    {
+        caps |= XH_CAPS_AVC444;
+        if (b->codec_id == 0x000F)
+        {
+            caps |= XH_CAPS_AVC444_V2;
+        }
+    }
+    return caps;
+}
+
+/*****************************************************************************/
 /* The helper's setup batch (type 100): clear, session caps, then each
    monitor's capture buffers as dma-bufs, whose fds follow in order. Resent
    whenever the capture buffers change. */
@@ -980,15 +1015,7 @@ helper_send_buffers(struct be *b)
     {
         return 0;
     }
-    caps = 0;
-    if (b->codec_id != 0x000B)
-    {
-        caps |= XH_CAPS_AVC444;
-        if (b->codec_id == 0x000F)
-        {
-            caps |= XH_CAPS_AVC444_V2;
-        }
-    }
+    caps = helper_caps(b);
     count = 0;
     for (i = 0; i < b->num_mons; i++)
     {
@@ -1052,12 +1079,46 @@ helper_send_buffers(struct be *b)
 }
 
 /*****************************************************************************/
-/* each monitor's newest complete capture, full frame */
+/* A batch with the session caps alone. The helper takes any batch as new
+   buffers and makes its next frames IDRs, which it sends whole, without
+   damage detection: for a client whose picture is no longer the one the
+   helper last encoded. */
+static int
+helper_send_refresh(struct be *b)
+{
+    struct stream *s;
+    int rv;
+
+    if (b->helper_pid <= 0 || b->cpu || !b->helper_ready)
+    {
+        return 0;
+    }
+    make_stream(s);
+    init_stream(s, 64);
+    out_uint16_le(s, 100);
+    out_uint16_le(s, 1);
+    out_uint32_le(s, 8);
+    out_uint16_le(s, 4);                /* session capabilities */
+    out_uint16_le(s, 8);
+    out_uint32_le(s, helper_caps(b));
+    s_mark_end(s);
+    rv = send_all(b->client_fd, s->data, (int) (s->end - s->data));
+    free_stream(s);
+    return rv;
+}
+
+/*****************************************************************************/
+/* each monitor's newest complete capture, full frame (asleep: none; the
+   wake sends whole frames) */
 static int
 send_full_frame(struct be *b)
 {
     int i;
 
+    if (b->asleep)
+    {
+        return 0;
+    }
     for (i = 0; i < b->num_mons; i++)
     {
         struct mon *m = b->mons + i;
@@ -1623,9 +1684,257 @@ relayout(struct be *b, int count, const struct monitor_info *mi,
 }
 
 /*****************************************************************************/
+/* XRDP_SCREEN_SLEEP_TIME (minutes, 0 or unset: off) and _MODE (last,
+   black, refresh[:minutes]; refresh defaults to 5), checked as xorgxrdp
+   checks them */
+static void
+sleep_config(struct be *b)
+{
+    const char *t = g_getenv("XRDP_SCREEN_SLEEP_TIME");
+    const char *mode = g_getenv("XRDP_SCREEN_SLEEP_MODE");
+    char *end;
+    long v;
+
+    b->sleep_ms = 0;
+    b->sleep_mode = SLEEP_BLACK;
+    b->sleep_refresh_ms = 0;
+    if (t != NULL && t[0] != '\0')
+    {
+        errno = 0;
+        v = strtol(t, &end, 10);
+        if (errno != 0 || end == t || *end != '\0' || v < 0 || v > 10080)
+        {
+            LOG(LOG_LEVEL_WARNING, "ignoring invalid XRDP_SCREEN_SLEEP_TIME "
+                "'%s'", t);
+            v = 0;
+        }
+        b->sleep_ms = (int) v * 60 * 1000;
+    }
+    if (mode == NULL || mode[0] == '\0' || g_strcasecmp(mode, "black") == 0)
+    {
+        b->sleep_mode = SLEEP_BLACK;
+    }
+    else if (g_strcasecmp(mode, "last") == 0)
+    {
+        b->sleep_mode = SLEEP_LAST;
+    }
+    else if (g_strncasecmp(mode, "refresh", 7) == 0 &&
+             (mode[7] == '\0' || mode[7] == ':'))
+    {
+        v = 5;
+        if (mode[7] == ':')
+        {
+            errno = 0;
+            v = strtol(mode + 8, &end, 10);
+            if (errno != 0 || end == mode + 8 || *end != '\0')
+            {
+                LOG(LOG_LEVEL_WARNING, "ignoring invalid "
+                    "XRDP_SCREEN_SLEEP_MODE '%s', using black", mode);
+                v = -1;
+            }
+            else if (v < 1 || v > 10080)
+            {
+                v = 5;
+            }
+        }
+        if (v > 0)
+        {
+            b->sleep_mode = SLEEP_REFRESH;
+            b->sleep_refresh_ms = (int) v * 60 * 1000;
+        }
+    }
+    else
+    {
+        LOG(LOG_LEVEL_WARNING, "ignoring invalid XRDP_SCREEN_SLEEP_MODE "
+            "'%s', using black", mode);
+    }
+    if (b->sleep_ms > 0)
+    {
+        LOG(LOG_LEVEL_INFO, "screen sleep after %d minute(s) without input, "
+            "mode %s", b->sleep_ms / 60000,
+            b->sleep_mode == SLEEP_LAST ? "last" :
+            b->sleep_mode == SLEEP_BLACK ? "black" : "refresh");
+    }
+}
+
+/*****************************************************************************/
+/* black over the whole layout, as xorgxrdp's screen sleep paints it: a
+   solid fill order, which xrdp draws on the client's surfaces */
+static int
+sleep_send_black(struct be *b)
+{
+    struct stream *s;
+    int rv;
+
+    make_stream(s);
+    init_stream(s, 64);
+    out_uint16_le(s, 3);                /* order list with lengths */
+    out_uint16_le(s, 6);
+    out_uint32_le(s, 4 + 4 + 6 + 8 + 12 + 4);
+    out_uint16_le(s, 1);                /* begin update */
+    out_uint16_le(s, 4);
+    out_uint16_le(s, 11);               /* reset clip */
+    out_uint16_le(s, 4);
+    out_uint16_le(s, 14);               /* set opcode: copy */
+    out_uint16_le(s, 6);
+    out_uint16_le(s, 0xcc);
+    out_uint16_le(s, 12);               /* set fgcolor: black */
+    out_uint16_le(s, 8);
+    out_uint32_le(s, 0);
+    out_uint16_le(s, 3);                /* fill rect */
+    out_uint16_le(s, 12);
+    out_uint16_le(s, 0);
+    out_uint16_le(s, 0);
+    out_uint16_le(s, b->total_w);
+    out_uint16_le(s, b->total_h);
+    out_uint16_le(s, 2);                /* end update */
+    out_uint16_le(s, 4);
+    s_mark_end(s);
+    rv = send_all(b->client_fd, s->data, (int) (s->end - s->data));
+    free_stream(s);
+    return rv;
+}
+
+/*****************************************************************************/
+/* no input for the sleep time: stop sending frames */
+static int
+sleep_enter(struct be *b, int log_it)
+{
+    uint32_t now = now_ms32();
+
+    b->asleep = 1;
+    b->sleep_refreshing = 0;
+    b->idle_flush = 0;
+    if (log_it)
+    {
+        b->sleep_start_ms = now;
+        LOG(LOG_LEVEL_INFO, "screen sleep after %d minute(s) without input",
+            b->sleep_ms / 60000);
+    }
+    if (b->sleep_mode == SLEEP_REFRESH)
+    {
+        b->sleep_next_ms = now + b->sleep_refresh_ms;
+    }
+    if (b->sleep_mode == SLEEP_BLACK)
+    {
+        return sleep_send_black(b);
+    }
+    return 0;
+}
+
+/*****************************************************************************/
+/* awake again: each monitor's newest capture goes whole, now, since a
+   still screen brings no new one. After black the helper also sends it
+   without damage detection, which compares with what it last encoded, not
+   with the black the client has. */
+static int
+sleep_wake(struct be *b, int refresh)
+{
+    int was_black = b->asleep && b->sleep_mode == SLEEP_BLACK;
+
+    b->asleep = 0;
+    b->sleep_refreshing = refresh;
+    if (refresh)
+    {
+        b->sleep_next_ms = now_ms32() + SLEEP_REFRESH_AWAKE_MS;
+    }
+    else
+    {
+        LOG(LOG_LEVEL_INFO, "screen sleep: input after %u s, waking",
+            (now_ms32() - b->sleep_start_ms) / 1000);
+    }
+    if (was_black && helper_send_refresh(b) != 0)
+    {
+        return 1;
+    }
+    return send_full_frame(b);
+}
+
+/*****************************************************************************/
+/* input from the client: the sleep time starts again, and a sleeping
+   screen wakes */
+static int
+sleep_activity(struct be *b)
+{
+    b->last_input_ms = now_ms32();
+    if (b->asleep)
+    {
+        return sleep_wake(b, 0);
+    }
+    b->sleep_refreshing = 0;
+    return 0;
+}
+
+/*****************************************************************************/
+/* the screen sleep's timers. Returns the ms until the next is due, -1 if
+   none is. */
+static int
+core_sleep(struct be *b)
+{
+    uint32_t now;
+    int left;
+
+    if (b->sleep_ms <= 0 || b->client_fd < 0 || !b->have_ci)
+    {
+        return -1;
+    }
+    now = now_ms32();
+    if (b->asleep)
+    {
+        if (b->sleep_mode != SLEEP_REFRESH)
+        {
+            return -1;
+        }
+        left = (int) (b->sleep_next_ms - now);
+        if (left > 0)
+        {
+            return left;
+        }
+        /* refresh mode: frames for a second */
+        if (sleep_wake(b, 1) != 0)
+        {
+            drop_client(b);
+            return -1;
+        }
+        return SLEEP_REFRESH_AWAKE_MS;
+    }
+    if (b->sleep_refreshing)
+    {
+        left = (int) (b->sleep_next_ms - now);
+        if (left > 0)
+        {
+            return left;
+        }
+        if (sleep_enter(b, 0) != 0)
+        {
+            drop_client(b);
+            return -1;
+        }
+        return b->sleep_refresh_ms;
+    }
+    left = (int) (b->last_input_ms + b->sleep_ms - now);
+    if (left > 0)
+    {
+        return left;
+    }
+    if (sleep_enter(b, 1) != 0)
+    {
+        drop_client(b);
+        return -1;
+    }
+    return b->sleep_mode == SLEEP_REFRESH ? b->sleep_refresh_ms : -1;
+}
+
+/*****************************************************************************/
 static void
 handle_input(struct be *b, int msg, int p1, int p2, int p3, int p4)
 {
+    if (msg != WM_INVALIDATE && msg != 301)
+    {
+        /* a failed send shows again on the next frame, which drops the
+           client; not here, in the middle of its message */
+        (void) sleep_activity(b);
+    }
     switch (msg)
     {
         case WM_KEYDOWN:
@@ -2114,7 +2423,7 @@ core_frame(void *core, int mon, int buf, const struct xh_rect *damage,
         rects[0].h = m->wb[buf].height;
         num_rects = 1;
     }
-    if (b->client_fd < 0 || !b->have_ci)
+    if (b->client_fd < 0 || !b->have_ci || b->asleep)
     {
         core_release(b, m);
         return;
@@ -2160,7 +2469,8 @@ core_idle_flush(struct be *b)
     {
         return -1;
     }
-    if (b->client_fd < 0 || !b->have_ci || b->cpu || !b->helper_ready)
+    if (b->client_fd < 0 || !b->have_ci || b->cpu || !b->helper_ready ||
+            b->asleep)
     {
         b->idle_flush = 0;
         return -1;
@@ -2258,7 +2568,7 @@ core_pace(struct be *b)
     int wait = -1;
     int i;
 
-    if (b->client_fd < 0 || !b->have_ci || b->suppress ||
+    if (b->client_fd < 0 || !b->have_ci || b->suppress || b->asleep ||
             b->frame_id - b->acked_id >= MAX_IN_FLIGHT * b->active)
     {
         return -1;
@@ -2320,6 +2630,8 @@ drop_client(struct be *b)
     b->acked_id = 0;
     b->suppress = 0;
     b->frames_sent = 0;
+    b->asleep = 0;
+    b->sleep_refreshing = 0;
 }
 
 /*****************************************************************************/
@@ -2463,6 +2775,7 @@ main(int argc, char **argv)
         return 1;
     }
     b->xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    sleep_config(b);
 
     b->listen_fd = listen_unix(sock_path);
     if (b->listen_fd < 0)
@@ -2516,6 +2829,11 @@ main(int argc, char **argv)
         {
             timeout = pace;
         }
+        pace = core_sleep(b);
+        if (pace >= 0 && pace < timeout)
+        {
+            timeout = pace;
+        }
         if (poll(pfd, n, timeout) < 0)
         {
             int err = errno;
@@ -2555,6 +2873,7 @@ main(int argc, char **argv)
             {
                 LOG(LOG_LEVEL_INFO, "xrdp connected");
                 b->client_fd = fd;
+                b->last_input_ms = now_ms32();
                 b->in_len = 0;
                 continue;
             }
