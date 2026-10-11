@@ -227,6 +227,7 @@ struct mon_info
     int avc444;                   /* both views live in mi->ei, one sequence */
     int avc444_v2;                /* ChromaV2 aux layout (codec id 0x000F) */
     int enc_w;                    /* encode width; 16-aligned for v2 */
+    int v2_split;                 /* v2: byte column of the U/V split */
     int enc_w4;                   /* enc_w / 4: the packed viewport width */
     int pad_h;                    /* encode height; == height for v2 */
     int buf_h;                    /* the target's Y plane rows: UV starts
@@ -307,6 +308,7 @@ struct shader_info
     GLint tex_loc;
     GLint tex_size_loc;
     GLint pad_h_loc;       /* only present in the AV (aux) shader; -1 elsewhere */
+    GLint split_loc;       /* only present in the v2 aux shader */
     GLint bpf_loc;         /* bytes per fragment, NV12 shaders only */
     GLint y_off_loc;       /* row offset of the plane drawn, NV12 only */
     GLint prev_loc;        /* only present in the mask diff shader */
@@ -535,6 +537,8 @@ xrdp_accel_assist_gl_init(void)
             glGetUniformLocation(g_si[index].program, "tex_size");
         g_si[index].pad_h_loc =
             glGetUniformLocation(g_si[index].program, "pad_h");
+        g_si[index].split_loc =
+            glGetUniformLocation(g_si[index].program, "split");
         g_si[index].bpf_loc =
             glGetUniformLocation(g_si[index].program, "bpf");
         g_si[index].y_off_loc =
@@ -840,7 +844,7 @@ get_vertices_av_v2(struct mon_info *mi, GLuint *vertices_bytes,
     {
         return NULL;
     }
-    x1 = ((mi->width + 15) / 16) * 8;
+    x1 = mi->v2_split;
     fw = mi->enc_w4;
     fh = mi->buf_h * 3 / 2;
     nquads = 0;
@@ -984,6 +988,29 @@ int
 xrdp_accel_assist_x11_encoder_avc444_v2(void)
 {
     return g_create_v2;
+}
+
+/*****************************************************************************/
+/* A monitor whose width is an odd number of 16-pixel macroblocks (1680,
+   1744, 3440, most window sizes) is coded 32-aligned, and AVC444v2 splits
+   its aux view into U and V halves at half the coded width. That is where
+   mstsc, Windows hosts, GNOME Remote Desktop and FreeRDP >= 3.18 look; mstsc
+   drops a 16-aligned picture of such a width outright. FreeRDP < 3.18
+   splits at half the 16-aligned surface width instead.
+   XRDP_AVC444_LEGACY_FREERDP=1 serves hosts whose FreeRDP clients are all
+   older than 3.18: a client that sent no clientDigProductId (the FreeRDP
+   family; mstsc sends one) gets the 16-aligned layout. Returns whether
+   this session's client gets it. */
+int
+xrdp_accel_assist_x11_legacy_freerdp_split(void)
+{
+    const char *env = g_getenv("XRDP_AVC444_LEGACY_FREERDP");
+
+    if (env == NULL || g_strcmp(env, "0") == 0)
+    {
+        return 0;
+    }
+    return (g_session_caps & XH_CAPS_NO_DIG_PRODUCT_ID) != 0;
 }
 
 /*****************************************************************************/
@@ -1174,6 +1201,8 @@ create_encode_surface(struct mon_info *mi, int width, int height)
     GLuint enc_texture_aux;
     int gl_alloc;
     int buf;
+    int odd;
+    int legacy_split;
 
     glEnable(GL_TEXTURE_2D);
     /* The texture that gets encoded, unless the encoder allocates its own
@@ -1202,22 +1231,39 @@ create_encode_surface(struct mon_info *mi, int width, int height)
         mi->idr_pending = 0;
         mi->avc444 = xrdp_accel_assist_x11_avc444_enabled();
         mi->avc444_v2 = mi->avc444 && xrdp_accel_assist_x11_avc444_v2();
-        /* v2 splits the aux view into U and V halves. At a 16-aligned
-           width of an odd number of macroblocks the clients disagree on
-           where: FreeRDP at half that width, mstsc at half the coded width
-           (and it drops a picture whose width is an odd number of
-           macroblocks). v1 has no split, so it serves such a surface. */
-        if (mi->avc444_v2 && (((width + 15) / 16) & 1) != 0)
+        /* A width of an odd number of macroblocks is coded 32-aligned,
+           whatever the codec: the v2 aux split then falls on a macroblock
+           (see xrdp_accel_assist_x11_legacy_freerdp_split), and mstsc's
+           software decoder rejects such a width coded 16-aligned (GNOME
+           Remote Desktop 0815adb). Clients copy only the surface width. */
+        odd = (((width + 15) / 16) & 1) != 0;
+        legacy_split = 0;
+        if (odd)
         {
+            legacy_split = mi->avc444_v2 &&
+                           xrdp_accel_assist_x11_legacy_freerdp_split();
             LOG(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_create_pixmap: "
-                "width %d is an odd number of macroblocks; AVC444v1 for this "
-                "monitor", width);
-            mi->avc444_v2 = 0;
+                "width %d is an odd number of macroblocks; %s", width,
+                legacy_split ? "AVC444v2, coded and split at the 16-aligned "
+                "width (XRDP_AVC444_LEGACY_FREERDP, client without "
+                "clientDigProductId)" :
+                mi->avc444_v2 ? "AVC444v2, coded and split at the 32-aligned "
+                "width" :
+                mi->avc444 ? "AVC444v1, coded 32-aligned" :
+                "AVC420, coded 32-aligned");
         }
-        /* v2 splits the aux plane into U and V halves at half the
-           16-aligned width (FreeRDP's nTotalWidth; mstsc agrees), so encode
-           at the aligned width. Clients copy only the surface width. */
-        mi->enc_w = mi->avc444_v2 ? ((width + 15) & ~15) : width;
+        if (odd && !legacy_split)
+        {
+            mi->enc_w = (width + 31) & ~31;
+        }
+        else
+        {
+            /* v2 splits at half the 16-aligned width, here a whole
+               macroblock (or the legacy layout), so it codes at that
+               width. */
+            mi->enc_w = mi->avc444_v2 ? ((width + 15) & ~15) : width;
+        }
+        mi->v2_split = mi->enc_w / 2;
         /* v1's tiled layout needs the aux padded to 16 rows (MS-RDPEGFX
            2.2.4.4.2); v2 needs none. */
         mi->pad_h = (mi->avc444 && !mi->avc444_v2)
@@ -1636,6 +1682,10 @@ xrdp_accel_assist_x11_run_shader(int left, int top, int width, int height,
     {
         glUniform1f(si->pad_h_loc,
                     (float) (pad_h > 0 ? pad_h : mi->height));
+    }
+    if (si->split_loc >= 0)
+    {
+        glUniform1f(si->split_loc, (float) mi->v2_split);
     }
     /* viewport and draw */
     /* vp_w is a quarter of the byte width; a parameter because the planes
@@ -2121,6 +2171,12 @@ encode_pixmap(int left, int top, int width, int height,
                 aux_x1 = aux_rect.x;
                 aux_y1 = aux_rect.y;
                 aux_x2 = aux_rect.x + aux_rect.w;
+                /* Declare no padding columns: past the monitor's width the
+                   surface may overlap the next monitor. */
+                if (aux_x2 > mi->width)
+                {
+                    aux_x2 = mi->width;
+                }
                 aux_y2 = aux_rect.y + aux_rect.h;
             }
             else

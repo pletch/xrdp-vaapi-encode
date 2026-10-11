@@ -66,6 +66,8 @@ xrdp_accel_assist_x11_avc444_v2(void);
 int
 xrdp_accel_assist_x11_mon_avc444_v2(int mon_id);
 int
+xrdp_accel_assist_x11_legacy_freerdp_split(void);
+int
 xrdp_accel_assist_x11_encoder_avc444_v2(void);
 int
 xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,

@@ -272,6 +272,17 @@ PULSE_SCRIPT=@sesmansysconfdir@/pulse/default.pa
 ; separates them and a client that cannot parse codec id 0x000F has no way
 ; to say so. Set to 1 to force v2 or 0 to force v1.
 ;XRDP_ACCEL_AVC444_V2=1
+; A monitor whose width is an odd number of 16-pixel macroblocks (1680,
+; 1744, 3440, most window sizes) is coded 32 pixels wide, and AVC444v2
+; splits its chroma at half of that, as Windows does. mstsc and FreeRDP 3.18
+; and later decode this; FreeRDP before 3.18 (and 2.x) expect a 16-aligned
+; split and show colour fringes at such widths. Set to 1 on hosts whose
+; FreeRDP clients are all older than 3.18: a client that sends no
+; clientDigProductId (the FreeRDP family) then gets the 16-aligned layout,
+; while mstsc, which sends one, keeps the 32-aligned one. A FreeRDP 3.18+
+; client shows the fringes under this setting. For any client that shows
+; them, XRDP_ACCEL_AVC444_V2=0 above falls back to v1 at every width.
+;XRDP_AVC444_LEGACY_FREERDP=1
 ; The auxiliary chroma picture goes only where a change needs it: where the
 ; 4:2:0 main picture alone would be off by more than this (0-255, the
 ; threshold MS-RDPEGFX gives the client's reverse filter). Grey and flat

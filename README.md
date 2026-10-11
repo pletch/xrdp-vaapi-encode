@@ -443,6 +443,15 @@ persistent corruption that looks like a chroma bug but is not.
   separating the two layouts - the whole set is `THINCLIENT`, `SMALL_CACHE`,
   `AVC420_ENABLED`, `AVC_DISABLED`, `AVC_THINCLIENT`, `SCALEDMAP_DISABLE` - so
   the version is the only signal and the choice is finally the server's.
+  A width of an odd number of macroblocks (1680, 1744, 3440, most window
+  sizes) is coded 32 pixels wide, and v2 splits at half of that, as Windows
+  does: mstsc, GNOME Remote Desktop and FreeRDP 3.18 and later expect it.
+  FreeRDP before 3.18 (Debian 13 ships 3.15) expects the split at half the
+  16-aligned width and shows color fringes otherwise. For sites whose
+  FreeRDP clients are all that old, `XRDP_AVC444_LEGACY_FREERDP=1` gives a
+  client that sends no `clientDigProductId` (FreeRDP does not, mstsc does)
+  the 16-aligned layout, while mstsc keeps the 32-aligned one. On Xorg this
+  needs an xorgxrdp that passes the client type on.
 * **Long-term reference frames, one chain per view**: each view predicts only
   from its own previous picture, held long-term on its own `LongTermFrameIdx`
   (main 0, auxiliary 1), and every slice names that picture with a
@@ -658,6 +667,7 @@ All of these are `[SessionVariables]` in `sesman.ini`, documented there as well:
 | -------- | ------- | ------ |
 | `XRDP_USE_ACCEL_ASSIST` | off | required for any of the below |
 | `XRDP_ACCEL_AVC444` | negotiated | `0` forces AVC420; otherwise follows what the client advertised |
+| `XRDP_AVC444_LEGACY_FREERDP` | off | `1`: FreeRDP clients get the 16-aligned v2 layout of FreeRDP < 3.18 at odd-macroblock widths |
 | `XRDP_AVC444_AUX_THRESHOLD` | 30 | chroma error (0-255) beyond which a change gets the auxiliary picture |
 | `XRDP_AVC444_IDR_MS` | 10000 | synchronised IDR on both views at most this often; `0` off |
 | `XRDP_AVC444_IDR_MIN_KB` | 100 | ...and only after this much has been sent since the last; `0` purely timed |
