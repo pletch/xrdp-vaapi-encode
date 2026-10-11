@@ -994,6 +994,13 @@ helper_caps(struct be *b)
         {
             caps |= XH_CAPS_AVC444_V2;
         }
+        /* xrdp's level 3: the client sent no clientDigProductId, which
+           gets the 16-aligned layout under
+           XRDP_AVC444_LEGACY_FREERDP */
+        if (b->ci.gfx_avc444 >= 3)
+        {
+            caps |= XH_CAPS_NO_DIG_PRODUCT_ID;
+        }
     }
     return caps;
 }
