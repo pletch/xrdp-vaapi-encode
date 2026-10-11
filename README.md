@@ -128,6 +128,17 @@ the AVC444 and QP settings in **Tuning** below). Wayland adds:
 | `WLXRDP_PAINT_CURSOR` | unset | `1`: where the cursor can't be captured, the compositor paints it into the frames (the session's shapes, but moving at the frame rate) instead of the client drawing the theme's arrow |
 | `WLXRDP_DEBUG` | unset | debug logging |
 
+Screen sleep stops sending frames to a client that has had no input for a
+while. Xorg sessions get it from upstream xorgxrdp, and wlxrdp reads the same
+two variables, so one setting covers both session types:
+
+| variable | default | effect |
+| -------- | ------- | ------ |
+| `XRDP_SCREEN_SLEEP_TIME` | off | minutes without keyboard or mouse input before frames stop (`0` or unset: never) |
+| `XRDP_SCREEN_SLEEP_MODE` | `black` | `black`: the client's screen goes black; `last`: it keeps the last picture; `refresh[:N]`: it keeps the last picture and gets a second of frames every N minutes (5 by default) |
+
+Any input wakes the session, and the client gets the whole picture again.
+
 A user's own desktop command goes in `~/.config/xrdp/waylandsession`
 (executable); without it the session runs `xfce4-session`, or a terminal. The
 session scripts are `startwayland.sh` (the compositor) and `waylandsession.sh`
