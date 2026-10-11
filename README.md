@@ -413,6 +413,10 @@ Wayland sessions on NVIDIA (`--enable-nvenc --enable-wayland`):
 | *No devices detected*, then `/dev/tty0` fatal | wrong `BusID` in the NVIDIA Xorg config |
 | wallpaper only in a 640x480 corner, or doesn't follow a reconnect at another size | NVIDIA path with upstream xorgxrdp (RandR 1.3): update the xorgxrdp fork, or restart xfdesktop |
 | AVC444 client, but the session runs AVC420 | upstream xorgxrdp instead of the fork (no *(AVC444 ... negotiated)* line in `~/.xorgxrdp.*.log`), a client that doesn't advertise AVC444 (FreeRDP without `/gfx:AVC444`), or `XRDP_ACCEL_AVC444=0` |
+| FreeRDP shows color fringes (red text brown, cyan ghosts) at some window sizes only | FreeRDP before 3.18 at a width of an odd number of macroblocks (the helper log says *odd number of macroblocks*): set `XRDP_AVC444_LEGACY_FREERDP=1` if all your FreeRDP clients are that old, otherwise update the client, or set `XRDP_ACCEL_AVC444_V2=0` (v1 for every client) |
+| the same fringes on FreeRDP 3.18+ | `XRDP_AVC444_LEGACY_FREERDP=1` is on; it suits only FreeRDP before 3.18 |
+| `XRDP_AVC444_LEGACY_FREERDP=1` changes nothing | on Xorg, an xorgxrdp without the client-type bit: `~/.xorgxrdp.*.log` shows *capabilities 0x00000003* for a FreeRDP client instead of *0x00000007*; or the session started before the setting (a reconnect keeps the old environment) |
+| AVC444v1 on FreeRDP looks dithered, no better than AVC420 | FreeRDP's SSE4.1 v1 combine on x86 (FreeRDP#13669); v2 is unaffected |
 | no *hardware encoding active* line | `XRDP_USE_ACCEL_ASSIST` unset, no x264/OpenH264 in the build, or (NVIDIA) the xrdpdev `xorg.conf` |
 | bash: *!dev: event not found* when pasting a command | history expansion on `!` inside double quotes; use single quotes |
 

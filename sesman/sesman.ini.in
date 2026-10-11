@@ -281,7 +281,8 @@ PULSE_SCRIPT=@sesmansysconfdir@/pulse/default.pa
 ; clientDigProductId (the FreeRDP family) then gets the 16-aligned layout,
 ; while mstsc, which sends one, keeps the 32-aligned one. A FreeRDP 3.18+
 ; client shows the fringes under this setting. For any client that shows
-; them, XRDP_ACCEL_AVC444_V2=0 above falls back to v1 at every width.
+; them, XRDP_ACCEL_AVC444_V2=0 above falls back to v1 at every width. On
+; Xorg this needs an xorgxrdp that tells the helper the client type.
 ;XRDP_AVC444_LEGACY_FREERDP=1
 ; The auxiliary chroma picture goes only where a change needs it: where the
 ; 4:2:0 main picture alone would be off by more than this (0-255, the
