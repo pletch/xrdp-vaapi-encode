@@ -346,27 +346,30 @@ PULSE_SCRIPT=@sesmansysconfdir@/pulse/default.pa
 ; client acknowledged frames in 11-18 ms while a browser client at HiDPI took
 ; 222-289. No single value serves both.
 ;
-; XORGXRDP_ADAPTIVE_PACE=1 steers the interval per connection from the round
-; trip xrdp measures to that client, so each gets the rate it can actually
-; take. h264_frame_interval then only seeds it. MIN and MAX bound the result;
+; Adaptive pacing, on by default, steers the interval per connection from the
+; round trip xrdp measures to that client, so each gets the rate it can
+; actually take. h264_frame_interval then only seeds it; set
+; XORGXRDP_ADAPTIVE_PACE=0 to keep it fixed. MIN and MAX bound the result;
 ; the floor should not go below the source's own refresh (see VFREQ), since
 ; capturing faster than the desktop paints finds nothing changed.
-;XORGXRDP_ADAPTIVE_PACE=1
+;XORGXRDP_ADAPTIVE_PACE=0
 ;XORGXRDP_PACE_MIN_MS=20
 ;XORGXRDP_PACE_MAX_MS=100
 ;
-; Capture depth. One means strict lockstep: nothing is captured until the
-; previous frame has been acknowledged, which leaves the pipeline idle for a
-; whole round trip. Two captures the next frame while the previous is still in
-; flight. Measured with a native client and a saturating source, going from
-; one to two took 26 fps to 51, with blocked capture callbacks falling from
-; 155-173 per hundred frames to 1-6.
+; Capture depth, two by default. One means strict lockstep: nothing is
+; captured until the previous frame has been acknowledged, which leaves the
+; pipeline idle for a whole round trip. Two captures the next frame while the
+; previous is still in flight. Measured with a native client and a saturating
+; source, going from one to two took 26 fps to 51, with blocked capture
+; callbacks falling from 155-173 per hundred frames to 1-6.
 ;
 ; Two is safe only because each capture buffer is given the damage it missed
 ; as well as the current frame's: the AVC444 auxiliary view is rendered
 ; full-frame and reads the whole source texture, so a buffer holding only its
-; own share of the damage shows blocks of stale content.
-;XORGXRDP_CAPTURE_DEPTH=2
+; own share of the damage shows blocks of stale content. Depth two was
+; measured with adaptive pacing on; with a fixed interval it delivered frames
+; in pairs.
+;XORGXRDP_CAPTURE_DEPTH=1
 ;
 ; The refresh rate the virtual output advertises. There is no physical one, and
 ; the value is a fiction either way, but applications that pace to the RandR

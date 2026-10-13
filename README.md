@@ -697,14 +697,17 @@ These are read by xorgxrdp rather than the encoder, and are documented in the
 
 | variable | default | effect |
 | -------- | ------- | ------ |
-| `XORGXRDP_ADAPTIVE_PACE` | off | steer the capture interval per client |
+| `XORGXRDP_ADAPTIVE_PACE` | on | steer the capture interval per client; `0` fixes it at `h264_frame_interval` |
 | `XORGXRDP_PACE_MIN_MS` / `_MAX_MS` | 20 / 100 | bounds for the above |
-| `XORGXRDP_CAPTURE_DEPTH` | 1 | 2 captures ahead of the acknowledgement |
+| `XORGXRDP_CAPTURE_DEPTH` | 2 | capture one frame ahead of the acknowledgement; `1` is strict lockstep |
 | `XORGXRDP_VFREQ` | 50 | refresh rate the virtual output advertises |
 
 Together, adaptive pacing and capture depth 2 took a native client from 26 to
-51 fps on this host. The pacing loop needs the client round trip xrdp measures,
-which is why `mod_frame_ack` carries it down to the module.
+51 fps on this host. Both are on by default. Re-measured with pacing on,
+depth 2 costs nothing on a fast link (30 and 60 fps sources arrive at the same
+rate and spacing at either depth); without pacing it delivered frames in pairs,
+which is why the two go together. The pacing loop needs the client round trip
+xrdp measures, which is why `mod_frame_ack` carries it down to the module.
 
 `h264_frame_interval` in `xrdp.ini` `[Xorg]` is the minimum spacing between
 captures in milliseconds, and matters more than it looks: too high aliases against
