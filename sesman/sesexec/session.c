@@ -75,6 +75,15 @@ session_start_preamble(struct login_info *login_info,
     }
 #endif
 
+    /* Session modules may want to know how the session will be
+       displayed, e.g. to choose a GPU (or none) for it */
+    if (sd->params->codec[0] != '\0' &&
+            auth_put_env(login_info->auth_info, "XRDP_SESSION_CODEC",
+                         sd->params->codec) != 0)
+    {
+        return E_SCP_SCREATE_GENERAL_ERROR;
+    }
+
     if (auth_start_session(login_info->auth_info, sd->display) != 0)
     {
         // Errors are logged by the auth module, as they are

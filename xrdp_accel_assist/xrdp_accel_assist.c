@@ -58,7 +58,7 @@
 
 #define ARRAYSIZE(x) (sizeof(x)/sizeof(*(x)))
 
-#define GFX_MAP_SIZE 3145728
+#define GFX_MAP_SIZE_MIN 3145728
 
 struct xorgxrdp_info
 {
@@ -74,6 +74,24 @@ struct xorgxrdp_info
 static int g_display_num = 0;
 static int g_headless = 0; /* -w: frames arrive as dma-bufs, no X */
 static int g_force_avc444 = -1; /* -1 = not yet checked, see XRDP_ACCEL_AVC444 */
+
+/*****************************************************************************/
+/* The shared buffer an encoded frame goes back to xrdp in: room for two views
+   (AVC444) at the encoders' coded-buffer size each, width x height x 3/2 of
+   the coded picture (up to 32 wide and 16 high aligned), plus their length
+   fields, and never less than the old fixed 3 MiB. A fixed 3 MiB split in two
+   was too small for a detailed 3840x2160 AVC444 frame, and the IDR that
+   followed the failure was larger still. A memfd only takes the pages that
+   are written, so the headroom costs nothing. */
+static size_t
+gfx_map_size(int width, int height)
+{
+    size_t w = ((size_t) (width > 0 ? width : 0) + 31) & ~(size_t) 31;
+    size_t h = ((size_t) (height > 0 ? height : 0) + 15) & ~(size_t) 15;
+    size_t bytes = 2 * (w * h * 3 / 2) + 64;
+
+    return bytes > GFX_MAP_SIZE_MIN ? bytes : GFX_MAP_SIZE_MIN;
+}
 
 /*****************************************************************************/
 static int
@@ -93,6 +111,7 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
     int width;
     int height;
     int cdata_bytes;
+    size_t map_size;
     int rv;
     int encoder_flags;
     char *flags_pointer;
@@ -119,23 +138,8 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
         }
     }
 
-    if (xi->shmem_fd_ret != -1)
-    {
-        LOG(LOG_LEVEL_ERROR, "gfx_wiretosurface1: xi->shmem_fd_ret "
-            "should be -1, it is %d", xi->shmem_fd_ret);
-    }
-    if (g_alloc_shm_map_fd(&addr, &(xi->shmem_fd_ret), GFX_MAP_SIZE) != 0)
-    {
-        return 1;
-    }
-    LOG_DEVEL(LOG_LEVEL_INFO, "gfx_wiretosurface1: addr %p fd %d",
-              addr, xi->shmem_fd_ret);
-
     if (!s_check_rem(s, 11))
     {
-        g_munmap(addr, GFX_MAP_SIZE);
-        g_file_close(xi->shmem_fd_ret);
-        xi->shmem_fd_ret = -1;
         return 1;
     }
     in_uint16_le(s, surface_id);
@@ -163,17 +167,11 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
     if ((num_rects_d < 1) || (num_rects_d > 16 * 1024) ||
             (!s_check_rem(s, num_rects_d * 8)))
     {
-        g_munmap(addr, GFX_MAP_SIZE);
-        g_file_close(xi->shmem_fd_ret);
-        xi->shmem_fd_ret = -1;
         return 1;
     }
     in_uint8s(s, num_rects_d * 8);
     if (!s_check_rem(s, 2))
     {
-        g_munmap(addr, GFX_MAP_SIZE);
-        g_file_close(xi->shmem_fd_ret);
-        xi->shmem_fd_ret = -1;
         return 1;
     }
 
@@ -181,17 +179,11 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
     if ((num_rects_c < 1) || (num_rects_c > 16 * 1024) ||
             (!s_check_rem(s, num_rects_c * 8)))
     {
-        g_munmap(addr, GFX_MAP_SIZE);
-        g_file_close(xi->shmem_fd_ret);
-        xi->shmem_fd_ret = -1;
         return 1;
     }
     crects = g_new0(struct xh_rect, num_rects_c);
     if (crects == NULL)
     {
-        g_munmap(addr, GFX_MAP_SIZE);
-        g_file_close(xi->shmem_fd_ret);
-        xi->shmem_fd_ret = -1;
         return 1;
     }
     for (index = 0; index < num_rects_c; index++)
@@ -203,9 +195,6 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
     }
     if (!s_check_rem(s, 8))
     {
-        g_munmap(addr, GFX_MAP_SIZE);
-        g_file_close(xi->shmem_fd_ret);
-        xi->shmem_fd_ret = -1;
         g_free(crects);
         return 1;
     }
@@ -218,7 +207,21 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
     (void)left;
     (void)top;
 
-    cdata_bytes = GFX_MAP_SIZE;
+    if (xi->shmem_fd_ret != -1)
+    {
+        LOG(LOG_LEVEL_ERROR, "gfx_wiretosurface1: xi->shmem_fd_ret "
+            "should be -1, it is %d", xi->shmem_fd_ret);
+    }
+    map_size = gfx_map_size(width, height);
+    if (g_alloc_shm_map_fd(&addr, &(xi->shmem_fd_ret), map_size) != 0)
+    {
+        g_free(crects);
+        return 1;
+    }
+    LOG_DEVEL(LOG_LEVEL_INFO, "gfx_wiretosurface1: addr %p fd %d size %u",
+              addr, xi->shmem_fd_ret, (unsigned int) map_size);
+
+    cdata_bytes = (int) map_size;
     /* Keep xorgxrdp's flag bits rather than rebuilding the word, so a bit
        added later is not silently cleared. */
     encoder_flags = flags & ~(unsigned int) XH_ENC_FLAGS_FORCEIDR;
@@ -262,7 +265,7 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
     xi->shmem_bytes_ret = cdata_bytes;
 
     g_free(crects);
-    g_munmap(addr, GFX_MAP_SIZE);
+    g_munmap(addr, map_size);
     if (cdata_bytes == 0)
     {
         /* the frame's end says no shared memory: send no fd either, or its
