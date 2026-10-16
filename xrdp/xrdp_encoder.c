@@ -52,6 +52,9 @@
 #define DEFAULT_XRDP_GFX_MAX_COMPRESSED_BYTES (3 * 1024 * 1024)
 /* limits used for validate env var XRDP_GFX_MAX_COMPRESSED_BYTES */
 #define MIN_XRDP_GFX_MAX_COMPRESSED_BYTES (64 * 1024)
+/* Room for the RFX_AVC420_METABLOCKs (up to 16384 rects each) in front of
+   a pre-encoded frame */
+#define GFX_PREENCODED_HEADROOM (1024 * 1024)
 #define MAX_XRDP_GFX_MAX_COMPRESSED_BYTES (256 * 1024 * 1024)
 
 #define XRDP_SURCMD_PREFIX_BYTES 256
@@ -918,6 +921,15 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
     s = &ls;
     g_memset(s, 0, sizeof(struct stream));
     s->size = self->max_compressed_bytes;
+    /* A frame pre-encoded by accel-assist can be larger than that (a
+       detailed 3840x2160 AVC444 frame is several MB): room for all of it,
+       plus the metablocks in front of each view. A frame that did not fit
+       was dropped and never acknowledged, which froze the session. */
+    if (enc_gfx_cmd->data_bytes > 0 &&
+            enc_gfx_cmd->data_bytes > s->size - GFX_PREENCODED_HEADROOM)
+    {
+        s->size = enc_gfx_cmd->data_bytes + GFX_PREENCODED_HEADROOM;
+    }
     s->data = g_new(char, s->size);
     if (s->data == NULL)
     {
@@ -1233,6 +1245,8 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
                                          &emitted_rects) != 0 ||
                     !s_check_rem_out(s, len1))
             {
+                LOG(LOG_LEVEL_ERROR, "gfx_wiretosurface1: AVC444 main view "
+                    "of %d bytes does not fit", len1);
                 g_free(s->data);
                 g_free(c_rects);
                 g_free(d_rects);
@@ -1275,6 +1289,8 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
                                              &emitted_aux_rects) != 0 ||
                         !s_check_rem_out(s, len2))
                 {
+                    LOG(LOG_LEVEL_ERROR, "gfx_wiretosurface1: AVC444 aux view "
+                        "of %d bytes does not fit", len2);
                     g_free(s->data);
                     g_free(c_rects);
                     g_free(d_rects);
@@ -1359,6 +1375,15 @@ gfx_wiretosurface1(struct xrdp_encoder *self,
         {
             LOG(LOG_LEVEL_INFO, "gfx_wiretosurface1: AVC420 codec_id 0x%4.4x "
                 "len1 %d", codec_id, enc_gfx_cmd->data_bytes);
+        }
+        if (!s_check_rem_out(s, enc_gfx_cmd->data_bytes))
+        {
+            LOG(LOG_LEVEL_ERROR, "gfx_wiretosurface1: AVC420 frame of %d "
+                "bytes does not fit in %d", enc_gfx_cmd->data_bytes,
+                (int) (s->size - (s->p - s->data)));
+            g_free(s->data);
+            g_free(crects);
+            return NULL;
         }
         out_uint8a(s, enc_gfx_cmd->data, enc_gfx_cmd->data_bytes);
     }
