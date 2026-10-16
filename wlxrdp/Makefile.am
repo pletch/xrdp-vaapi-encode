@@ -28,8 +28,10 @@ PROTOCOL_SOURCES = \
   wlr-output-management-unstable-v1-client-protocol.h \
   wlr-output-management-unstable-v1-protocol.c
 
+if XRDP_WAYLAND
 BUILT_SOURCES = $(PROTOCOL_SOURCES)
 CLEANFILES = $(PROTOCOL_SOURCES)
+endif
 
 nodist_wlxrdp_SOURCES = $(PROTOCOL_SOURCES)
 wlxrdp_SOURCES = \

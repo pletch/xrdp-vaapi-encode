@@ -1038,8 +1038,8 @@ static const struct session_data_vtable
 {
     .start = start,
     .free = sess_free,
-    .cleanup = cleanup,
     .process_child_exit = process_child_exit,
+    .cleanup = cleanup,
     .active_processes = active_processes,
     .main_sess_proc_active = main_sess_proc_active,
     .getpgid = x11_getpgid,
