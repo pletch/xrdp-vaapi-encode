@@ -847,6 +847,7 @@ gfx_send_done(struct xrdp_encoder *self, XRDP_ENC_DATA *enc,
 }
 
 /*****************************************************************************/
+#if defined(XRDP_X264) || defined(XRDP_OPENH264)
 /* Reads a rects trailer (see XH_AVC444_RECTS_MAGIC) at pos, if one with this
    magic is there, into *rects (clamped to the surface). Returns the position
    after it, or pos if there was none. */
@@ -908,6 +909,7 @@ gfx_rects_trailer(const unsigned char *d, int avail, int pos,
     *num_rects = n;
     return pos + XH_AVC444_RECTS_HEAD_BYTES + count * 8;
 }
+#endif
 
 /*****************************************************************************/
 static struct stream *
