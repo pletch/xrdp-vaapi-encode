@@ -55,6 +55,9 @@
 /* Room for the RFX_AVC420_METABLOCKs (up to 16384 rects each) in front of
    a pre-encoded frame */
 #define GFX_PREENCODED_HEADROOM (1024 * 1024)
+/* Most rects one RFX_AVC420_METABLOCK declares (10 bytes each); more fall
+   back to their bounding box */
+#define METABLOCK_MAX_RECTS 16384
 #define MAX_XRDP_GFX_MAX_COMPRESSED_BYTES (256 * 1024 * 1024)
 
 #define XRDP_SURCMD_PREFIX_BYTES 256
@@ -742,6 +745,34 @@ out_RFX_AVC420_METABLOCK(struct xrdp_egfx_rect *dst_rect,
         rect.bottom = MIN(dst_rect->y2 - dst_rect->y1,
                           (rect.bottom + align_y - 1) & ~(align_y - 1));
         xrdp_region_add_rect(reg, &rect);
+    }
+    /* The union can hold more rects than went in. Past
+       METABLOCK_MAX_RECTS, or past what the stream holds, declare the
+       bounding box instead. */
+    count = 0;
+    while (xrdp_region_get_rect(reg, count, &rect) == 0)
+    {
+        count++;
+    }
+    if (count > METABLOCK_MAX_RECTS || !s_check_rem_out(s, count * 10))
+    {
+        if (xrdp_region_get_bounds(reg, &rect) != 0)
+        {
+            xrdp_region_delete(reg);
+            return 1;
+        }
+        xrdp_region_delete(reg);
+        reg = xrdp_region_create(NULL);
+        if (reg == NULL)
+        {
+            return 1;
+        }
+        xrdp_region_add_rect(reg, &rect);
+        if (!s_check_rem_out(s, 10))
+        {
+            xrdp_region_delete(reg);
+            return 1;
+        }
     }
     index = 0;
     while (xrdp_region_get_rect(reg, index, &rect) == 0)

@@ -511,9 +511,17 @@ xorg_process_message_64(struct xorgxrdp_info *xi, struct stream *s)
                 bmpdata = (char *)shmem_ptr;
                 bmpdata += shmem_offset;
 
-                if ((bmpdata != NULL) && (flags & 1))
+                /* The encoder writes behind a 4-byte length, into what is
+                   left of xorgxrdp's mapping after shmem_offset: no more */
+                if ((shmem_offset < 0) || (shmem_offset > shmem_bytes - 5))
                 {
-                    cdata_bytes = 16 * 1024 * 1024;
+                    LOG(LOG_LEVEL_ERROR, "xorg_process_message_64: offset %d "
+                        "leaves no room in %d bytes", shmem_offset,
+                        shmem_bytes);
+                }
+                else if ((bmpdata != NULL) && (flags & 1))
+                {
+                    cdata_bytes = shmem_bytes - shmem_offset - 4;
                     encoder_flags = 0;
                     if (xi->idr_count > 0)
                     {
