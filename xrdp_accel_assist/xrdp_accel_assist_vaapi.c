@@ -127,7 +127,11 @@ struct enc_info
     int frameCount;
     int nviews;          /* 1 = AVC420, 2 = AVC444 (main + aux, one sequence) */
     int qp_view[2];      /* per-view QP; [1] is the AVC444 aux view */
+    int chroma_qp_view[2]; /* per-view chroma_qp_index_offset, -12..12 */
+    int cur_pps;         /* PPS of the picture being encoded: 1 for an aux
+                            view with its own chroma offset, else 0 */
     int deblock_view[2]; /* 0 = disable_deblocking_filter_idc 1 */
+    int deblock_off_view[2]; /* slice_alpha_c0/beta_offset_div2, -6..6 */
     /* Constant QP unless XRDP_VAAPI_BITRATE (kbit/s) selects VBR. */
     int rc_mode;         /* VA_RC_CQP or VA_RC_VBR */
     int bitrate_kbps;    /* XRDP_VAAPI_BITRATE, 0 = CQP */
@@ -417,7 +421,7 @@ build_sps(unsigned char *out, struct enc_info *ei)
 
 /*****************************************************************************/
 static int
-build_pps(unsigned char *out, struct enc_info *ei)
+build_pps(unsigned char *out, struct enc_info *ei, int pps_id, int coff)
 {
     unsigned char rbsp[64];
     struct bitstream b;
@@ -425,7 +429,7 @@ build_pps(unsigned char *out, struct enc_info *ei)
     g_memset(rbsp, 0, sizeof(rbsp));
     b.p = rbsp;
     b.bitpos = 0;
-    bs_ue(&b, 0);                  /* pic_parameter_set_id */
+    bs_ue(&b, pps_id);             /* pic_parameter_set_id */
     bs_ue(&b, 0);                  /* seq_parameter_set_id */
     bs_put(&b, 1, 1);              /* entropy_coding_mode_flag = CABAC */
     bs_put(&b, 1, 0);              /* bottom_field_pic_order_present_flag */
@@ -438,7 +442,7 @@ build_pps(unsigned char *out, struct enc_info *ei)
        slice_qp_delta. */
     bs_se(&b, ei->qp_view[0] - 26); /* pic_init_qp_minus26 */
     bs_se(&b, 0);                  /* pic_init_qs_minus26 */
-    bs_se(&b, 0);                  /* chroma_qp_index_offset */
+    bs_se(&b, coff);               /* chroma_qp_index_offset */
     bs_put(&b, 1, 1);              /* deblocking_filter_control_present_flag */
     bs_put(&b, 1, 0);              /* constrained_intra_pred_flag */
     bs_put(&b, 1, 0);              /* redundant_pic_cnt_present_flag */
@@ -447,7 +451,7 @@ build_pps(unsigned char *out, struct enc_info *ei)
         /* High profile only: 8x8 transform flag. */
         bs_put(&b, 1, 1);          /* transform_8x8_mode_flag = 1 */
         bs_put(&b, 1, 0);          /* pic_scaling_matrix_present_flag = 0 */
-        bs_se(&b, 0);              /* second_chroma_qp_index_offset = 0 */
+        bs_se(&b, coff);           /* second_chroma_qp_index_offset */
     }
     bs_trailing(&b);
     return build_nal(out, 3, 8, rbsp, b.bitpos / 8);
@@ -471,7 +475,8 @@ build_pps(unsigned char *out, struct enc_info *ei)
 static int
 build_slice_header(unsigned char *out, struct enc_info *ei, int is_idr,
                    int is_ltr, int slice_type, int nref,
-                   int qp, int deblock_idc, int idr_pic_id,
+                   int qp, int deblock_idc, int deblock_off,
+                   int idr_pic_id,
                    int ref_lt_idx, int cur_lt_idx, int send_lt_max)
 {
     unsigned char rbsp[64];
@@ -486,7 +491,7 @@ build_slice_header(unsigned char *out, struct enc_info *ei, int is_idr,
 
     bs_ue(&b, 0);                      /* first_mb_in_slice */
     bs_ue(&b, slice_type);             /* 0 = P, 2 = I */
-    bs_ue(&b, 0);                      /* pic_parameter_set_id */
+    bs_ue(&b, ei->cur_pps);            /* pic_parameter_set_id */
     bs_put(&b, 4, ei->frame_num & 15); /* frame_num */
     if (is_idr)
     {
@@ -546,8 +551,8 @@ build_slice_header(unsigned char *out, struct enc_info *ei, int is_idr,
     bs_ue(&b, deblock_idc);            /* disable_deblocking_filter_idc */
     if (deblock_idc != 1)
     {
-        bs_se(&b, 0);                  /* slice_alpha_c0_offset_div2 */
-        bs_se(&b, 0);                  /* slice_beta_offset_div2 */
+        bs_se(&b, deblock_off);        /* slice_alpha_c0_offset_div2 */
+        bs_se(&b, deblock_off);        /* slice_beta_offset_div2 */
     }
 
     /* Emulation prevention is left to the driver (has_emulation_bytes 0),
@@ -1290,6 +1295,53 @@ xrdp_accel_assist_vaapi_create_encoder(int width, int height, int nviews,
     lei->deblock_view[0] = 1;
     lei->deblock_view[1] = xrdp_accel_assist_x11_encoder_avc444_v2();
 
+    /* Main-view deblocking strength. At intra macroblock edges the strong
+       filter also changes the third pixel from the edge, which darkens the
+       white pixel next to a 1-pixel black line: grayscale dark specks and
+       grey halo columns along table borders, at any QP. An offset of -6
+       (alpha and beta both), the default, removes them at QP 26 and keeps
+       about half the smoothing at high QP; bytes are unchanged. */
+    {
+        const char *d = g_getenv("XRDP_VAAPI_DEBLOCK_OFFSET");
+
+        lei->deblock_off_view[0] = (d != NULL) ? g_atoi(d) : -6;
+        lei->deblock_off_view[1] = 0;
+        if (lei->deblock_off_view[0] < -6)
+        {
+            lei->deblock_off_view[0] = -6;
+        }
+        if (lei->deblock_off_view[0] > 6)
+        {
+            lei->deblock_off_view[0] = 6;
+        }
+    }
+
+    /* Chroma QP offsets, per view. The client rebuilds one pixel in four
+       of AVC444 as four times the main view's 4:2:0 chroma minus three aux
+       samples, so a chroma coding error in the main view shows up to four
+       times over there: single dark or colored dots on subpixel-antialiased
+       text. A finer main-view chroma quantiser removes them. The aux view's
+       samples are used once each and gain little. When the two offsets
+       differ the aux view gets PPS 1. */
+    {
+        const char *m = g_getenv("XRDP_VAAPI_CHROMA_QP_OFFSET");
+        const char *a = g_getenv("XRDP_VAAPI_AUX_CHROMA_QP_OFFSET");
+
+        lei->chroma_qp_view[0] = (m != NULL) ? g_atoi(m) : 0;
+        lei->chroma_qp_view[1] = (a != NULL) ? g_atoi(a) : 0;
+        for (view = 0; view < 2; view++)
+        {
+            if (lei->chroma_qp_view[view] < -12)
+            {
+                lei->chroma_qp_view[view] = -12;
+            }
+            if (lei->chroma_qp_view[view] > 12)
+            {
+                lei->chroma_qp_view[view] = 12;
+            }
+        }
+    }
+
     qp_str = g_getenv("XRDP_VAAPI_TIMING");
     lei->timing = (qp_str != NULL && g_atoi(qp_str) != 0);
 
@@ -1306,9 +1358,12 @@ xrdp_accel_assist_vaapi_create_encoder(int width, int height, int nviews,
        the spare reference slot; see xrdp_accel_assist_vaapi_num_ref(). */
 
     LOG(LOG_LEVEL_INFO, "vaapi: encoder %dx%d, %d view(s), QP %d/%d, "
-        "deblock %d/%d, rc %s, bitrate %d kbit/s, level %d",
+        "chroma QP offset %d/%d, deblock %d/%d offset %d/%d, rc %s, "
+        "bitrate %d kbit/s, level %d",
         width, height, lei->nviews, lei->qp_view[0], lei->qp_view[1],
+        lei->chroma_qp_view[0], lei->chroma_qp_view[1],
         lei->deblock_view[0], lei->deblock_view[1],
+        lei->deblock_off_view[0], lei->deblock_off_view[1],
         lei->rc_mode == VA_RC_CQP ? "CQP" : "VBR",
         lei->bitrate_kbps, h264_level_for(width, height));
 
@@ -1958,8 +2013,10 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
             pic.ReferenceFrames[nref++] = ei->ltrv[i];
         }
     }
+    ei->cur_pps = (ei->nviews > 1 && view == 1 &&
+                   ei->chroma_qp_view[1] != ei->chroma_qp_view[0]) ? 1 : 0;
     pic.coded_buf = ei->coded_buf[view];
-    pic.pic_parameter_set_id = 0;
+    pic.pic_parameter_set_id = ei->cur_pps;
     pic.seq_parameter_set_id = 0;
     pic.last_picture = 0;
     pic.frame_num = ei->frame_num;
@@ -1968,8 +2025,8 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
     pic.num_ref_idx_l0_active_minus1 = 0;
     pic.num_ref_idx_l1_active_minus1 = 0;
     /* Must match the packed PPS. */
-    pic.chroma_qp_index_offset = 0;
-    pic.second_chroma_qp_index_offset = 0;
+    pic.chroma_qp_index_offset = ei->chroma_qp_view[view];
+    pic.second_chroma_qp_index_offset = ei->chroma_qp_view[view];
     pic.pic_fields.bits.idr_pic_flag = is_idr ? 1 : 0;
     pic.pic_fields.bits.reference_pic_flag = 1;
     pic.pic_fields.bits.entropy_coding_mode_flag = 1; /* CABAC */
@@ -1983,11 +2040,20 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
     }
     if (is_idr)
     {
-        pps_len = build_pps(pps, ei);
+        pps_len = build_pps(pps, ei, 0, ei->chroma_qp_view[0]);
         if (render_packed(ei->context, VAEncPackedHeaderPicture,
                           pps, pps_len, track, &ntrack) != 0)
         {
             goto cleanup_err;
+        }
+        if (ei->nviews > 1 && ei->chroma_qp_view[1] != ei->chroma_qp_view[0])
+        {
+            pps_len = build_pps(pps, ei, 1, ei->chroma_qp_view[1]);
+            if (render_packed(ei->context, VAEncPackedHeaderPicture,
+                              pps, pps_len, track, &ntrack) != 0)
+            {
+                goto cleanup_err;
+            }
         }
     }
 
@@ -1997,7 +2063,7 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
     slice.num_macroblocks = w_mbs * h_mbs;
     slice.macroblock_info = VA_INVALID_ID;
     slice.slice_type = (is_idr || force_intra) ? 2 : 0; /* I : P */
-    slice.pic_parameter_set_id = 0;
+    slice.pic_parameter_set_id = ei->cur_pps;
     slice.idr_pic_id = idr_id_used;
     slice.pic_order_cnt_lsb = 0;       /* pic_order_cnt_type 2: unused */
     slice.num_ref_idx_l1_active_minus1 = 0;
@@ -2036,13 +2102,13 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
     slice.cabac_init_idc = 0;
     slice.slice_qp_delta = qp - ei->qp_view[0];
     slice.disable_deblocking_filter_idc = ei->deblock_view[view] ? 0 : 1;
-    slice.slice_alpha_c0_offset_div2 = 0;
-    slice.slice_beta_offset_div2 = 0;
+    slice.slice_alpha_c0_offset_div2 = ei->deblock_off_view[view];
+    slice.slice_beta_offset_div2 = ei->deblock_off_view[view];
     slice.direct_spatial_mv_pred_flag = 0;
     /* Must be rendered before the slice parameter buffer. */
     sh_bits = build_slice_header(sh, ei, is_idr, is_ltr, slice.slice_type,
                                  nref, qp, slice.disable_deblocking_filter_idc,
-                                 idr_id_used, ref_lt_idx, cur_lt_idx,
+                                 ei->deblock_off_view[view], idr_id_used, ref_lt_idx, cur_lt_idx,
                                  send_lt_max);
     if (render_packed_bits(ei->context, VAEncPackedHeaderSlice, sh,
                            sh_bits, 0, track, &ntrack) != 0)
