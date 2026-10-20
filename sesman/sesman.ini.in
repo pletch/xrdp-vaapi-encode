@@ -372,6 +372,13 @@ PULSE_SCRIPT=@sesmansysconfdir@/pulse/default.pa
 ;XORGXRDP_PACE_MIN_MS=20
 ;XORGXRDP_PACE_MAX_MS=100
 ;
+; A floor on the interval once nobody has typed or moved the mouse for
+; IDLE_AFTER milliseconds, off by default. An animated page left on screen (a
+; dashboard) otherwise keeps the encoder at the full rate all day. 33 leaves
+; 30 fps video alone; the next key or mouse event lifts it at once.
+;XORGXRDP_PACE_IDLE_MIN_MS=33
+;XORGXRDP_PACE_IDLE_AFTER_MS=1000
+;
 ; Capture depth, two by default. One means strict lockstep: nothing is
 ; captured until the previous frame has been acknowledged, which leaves the
 ; pipeline idle for a whole round trip. Two captures the next frame while the
