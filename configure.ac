@@ -557,7 +557,8 @@ fi
 if test "x$enable_vaapi" = "xyes"
 then
 enable_accel=yes
-PKG_CHECK_MODULES(XRDP_VAAPI, [libva >= 1.4.0 libva-drm >= 1.4.0])
+# VA-API 1.12 (libva 2.12): VASurfaceAttribDRMFormatModifiers
+PKG_CHECK_MODULES(XRDP_VAAPI, [libva >= 1.12.0 libva-drm >= 1.12.0])
 fi
 
 AM_CONDITIONAL(XRDP_ACCEL, [test x$enable_accel = xyes])
