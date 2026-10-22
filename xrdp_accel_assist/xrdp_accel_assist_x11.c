@@ -1096,7 +1096,6 @@ xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
         XFree(ximage);
     }
 
-    glEnable(GL_TEXTURE_2D);
     /* The texture that gets encoded, unless the encoder allocates its own
        surfaces and gives us targets over them. */
     gl_alloc = (g_enc_funcs[g_enc].create_enc_targets == NULL);
@@ -1528,7 +1527,6 @@ xrdp_accel_assist_x11_run_shader(int left, int top, int width, int height,
     int bpf;
 
     /* rgb to yuv */
-    glEnable(GL_TEXTURE_2D);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, mi->bmp_texture[mi->cur_buf]);
     g_inf_funcs[g_inf].bind_tex_image(mi->inf_image[mi->cur_buf]);
@@ -2601,7 +2599,6 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
         }
     }
 
-    glEnable(GL_TEXTURE_2D);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, mi->bmp_texture[cur_buf]);
     g_inf_funcs[g_inf].bind_tex_image(mi->inf_image[cur_buf]);
