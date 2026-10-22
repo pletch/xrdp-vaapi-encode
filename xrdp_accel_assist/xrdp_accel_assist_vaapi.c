@@ -2095,10 +2095,10 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
             "forcing intra");
         slice.slice_type = 2;
     }
-    /* One entry for the first aux after an IDR, two thereafter. */
+    /* The list built above (one entry); the picture parameters, already
+       submitted, keep the PPS default. */
     slice.num_ref_idx_active_override_flag = 1;
     slice.num_ref_idx_l0_active_minus1 = (nref > 0) ? nref - 1 : 0;
-    pic.num_ref_idx_l0_active_minus1 = slice.num_ref_idx_l0_active_minus1;
     slice.cabac_init_idc = 0;
     slice.slice_qp_delta = qp - ei->qp_view[0];
     slice.disable_deblocking_filter_idc = ei->deblock_view[view] ? 0 : 1;
@@ -2126,7 +2126,12 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
     {
         LOG(LOG_LEVEL_ERROR, "vaapi: vaEndPicture failed %d (%s)",
             va_status, vaErrorStr(va_status));
-        goto cleanup_err;
+        /* Not cleanup_err: the picture is already ended. */
+        for (i = 0; i < ntrack; i++)
+        {
+            vaDestroyBuffer(g_va_dpy, track[i]);
+        }
+        return ENCODER_ERROR;
     }
     for (i = 0; i < ntrack; i++)
     {
