@@ -97,7 +97,8 @@ struct vnc
     int (*mod_get_wait_objs)(struct vnc *v, tbus *read_objs, int *rcount,
                              tbus *write_objs, int *wcount, int *timeout);
     int (*mod_check_wait_objs)(struct vnc *v);
-    int (*mod_frame_ack)(struct vnc *v, int flags, int frame_id);
+    int (*mod_frame_ack)(struct vnc *v, int flags, int frame_id,
+                         int rtt_ms);
     int (*mod_suppress_output)(struct vnc *v, int suppress,
                                int left, int top, int right, int bottom);
     int (*mod_server_monitor_resize)(struct vnc *v,

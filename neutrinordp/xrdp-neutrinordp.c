@@ -945,7 +945,7 @@ lxrdp_check_wait_objs(struct mod *mod)
 
 /******************************************************************************/
 static int
-lxrdp_frame_ack(struct mod *mod, int flags, int frame_id)
+lxrdp_frame_ack(struct mod *mod, int flags, int frame_id, int rtt_ms)
 {
     return 0;
 }

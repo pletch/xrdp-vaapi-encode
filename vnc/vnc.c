@@ -2737,7 +2737,7 @@ lib_mod_check_wait_objs(struct vnc *v)
 /******************************************************************************/
 /* return error */
 static int
-lib_mod_frame_ack(struct vnc *v, int flags, int frame_id)
+lib_mod_frame_ack(struct vnc *v, int flags, int frame_id, int rtt_ms)
 {
     return 0;
 }
