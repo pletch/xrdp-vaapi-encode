@@ -190,8 +190,9 @@ SPS/PPS/slice headers are generated directly - no ffmpeg, no libx264.
 * `glFlush()` instead of `glFinish()` at the encode entry - the dma-buf shared between
   Mesa GL and iHD VAAPI carries implicit DRM_PRIME synchronisation, so the kernel
   sequencer already enforces GL-before-VAAPI ordering on the GPU itself. The hard
-  CPU-side stall was double-syncing; the next frame's GL work can now overlap with
-  this frame's encode.
+  CPU-side stall was double-syncing: the helper now waits once, for the encode
+  (`vaSyncSurface`), instead of for the render and then the encode. Verified on
+  iHD with the xe kernel driver.
 * **Metablock rect alignment** in `out_RFX_AVC420_METABLOCK` - the -1/+1 chroma
   margin expansion could produce odd-width rects, which FreeRDP's AVC SSE primitive
   asserts on and crashes the client (and mstsc tolerates but mis-renders as stripes

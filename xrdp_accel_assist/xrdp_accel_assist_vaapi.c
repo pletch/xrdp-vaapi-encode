@@ -1114,8 +1114,8 @@ xrdp_accel_assist_vaapi_import_plane(struct enc_info *lei, int view,
             (const char *) &fourcc, width, rows, modifier, eglGetError());
         return 1;
     }
-    /* Clear errors left by earlier calls (glEnable(GL_TEXTURE_2D) is one
-       in a core profile context), so the check below sees only ours. */
+    /* Clear errors left by earlier calls, so the check below sees only
+       ours. */
     while (glGetError() != GL_NO_ERROR)
     {
     }
@@ -1376,8 +1376,10 @@ xrdp_accel_assist_vaapi_create_encoder(int width, int height, int nviews,
         }
     }
 
-    /* reconstructed / reference surfaces, used as a ring */
-    va_status = vaCreateSurfaces(g_va_dpy, VA_RT_FORMAT_YUV420, width, height,
+    /* reconstructed / reference surfaces, used as a ring, at the coded
+       size like the input surfaces (and the context below) */
+    va_status = vaCreateSurfaces(g_va_dpy, VA_RT_FORMAT_YUV420,
+                                 (width + 15) & ~15, (height + 15) & ~15,
                                  lei->recon_surfaces, XH_VAAPI_NUM_RECON,
                                  NULL, 0);
     if (va_status != VA_STATUS_SUCCESS)
@@ -1426,7 +1428,8 @@ xrdp_accel_assist_vaapi_create_encoder(int width, int height, int nviews,
     {
         render_targets[nrt++] = lei->recon_surfaces[view];
     }
-    va_status = vaCreateContext(g_va_dpy, lei->config, width, height,
+    va_status = vaCreateContext(g_va_dpy, lei->config,
+                                (width + 15) & ~15, (height + 15) & ~15,
                                 VA_PROGRESSIVE, render_targets, nrt,
                                 &lei->context);
     if (va_status != VA_STATUS_SUCCESS)
@@ -2095,10 +2098,10 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
             "forcing intra");
         slice.slice_type = 2;
     }
-    /* One entry for the first aux after an IDR, two thereafter. */
+    /* The list built above (one entry); the picture parameters, already
+       submitted, keep the PPS default. */
     slice.num_ref_idx_active_override_flag = 1;
     slice.num_ref_idx_l0_active_minus1 = (nref > 0) ? nref - 1 : 0;
-    pic.num_ref_idx_l0_active_minus1 = slice.num_ref_idx_l0_active_minus1;
     slice.cabac_init_idc = 0;
     slice.slice_qp_delta = qp - ei->qp_view[0];
     slice.disable_deblocking_filter_idc = ei->deblock_view[view] ? 0 : 1;
@@ -2126,7 +2129,12 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
     {
         LOG(LOG_LEVEL_ERROR, "vaapi: vaEndPicture failed %d (%s)",
             va_status, vaErrorStr(va_status));
-        goto cleanup_err;
+        /* Not cleanup_err: the picture is already ended. */
+        for (i = 0; i < ntrack; i++)
+        {
+            vaDestroyBuffer(g_va_dpy, track[i]);
+        }
+        return ENCODER_ERROR;
     }
     for (i = 0; i < ntrack; i++)
     {

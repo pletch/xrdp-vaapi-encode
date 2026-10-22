@@ -286,6 +286,9 @@ struct mon_info
 static struct mon_info g_mons[MAX_MON];
 
 static GLuint g_quad_vao = 0;
+/* For per-draw vertices: the buffer is refilled, the objects kept. */
+static GLuint g_draw_vao = 0;
+static GLuint g_draw_vbo = 0;
 static GLuint g_fb = 0;
 
 #define XH_SHADERCOPY           0
@@ -476,6 +479,14 @@ xrdp_accel_assist_gl_init(void)
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
     glDeleteBuffers(1, &quad_vbo);
+    glGenVertexArrays(1, &g_draw_vao);
+    glBindVertexArray(g_draw_vao);
+    glGenBuffers(1, &g_draw_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, g_draw_vbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 2, NULL);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
 
     /* create copy shader */
     vsource[XH_SHADERCOPY] = g_vs;
@@ -575,6 +586,13 @@ xrdp_accel_assist_gl_init(void)
         glUseProgram(0);
     }
     g_memset(g_mons, 0, sizeof(g_mons));
+    if (g_enc_funcs[g_enc].init == NULL)
+    {
+        /* e.g. an NVENC-only build on a server that is not NVIDIA's */
+        LOG(LOG_LEVEL_ERROR, "xrdp_accel_assist_x11_init: this build has "
+            "no %s encoder", g_enc == ENC_NVENC ? "NVENC" : "VA-API");
+        return 1;
+    }
     if (g_enc_funcs[g_enc].init() != 0)
     {
         LOG(LOG_LEVEL_ERROR, "xrdp_accel_assist_x11_init: "
@@ -1204,7 +1222,6 @@ create_encode_surface(struct mon_info *mi, int width, int height)
     int odd;
     int legacy_split;
 
-    glEnable(GL_TEXTURE_2D);
     /* The texture that gets encoded, unless the encoder allocates its own
        surfaces and gives us targets over them. */
     gl_alloc = (g_enc_funcs[g_enc].create_enc_targets == NULL);
@@ -1627,8 +1644,6 @@ xrdp_accel_assist_x11_run_shader(int left, int top, int width, int height,
                                  int num_crects, struct xh_rect *crects,
                                  int pad_h, int vp_w, int aux_v2)
 {
-    GLuint vao;
-    GLuint vbo;
     GLfloat *vertices;
     GLuint vertices_bytes;
     GLuint vertices_pointes;
@@ -1638,7 +1653,6 @@ xrdp_accel_assist_x11_run_shader(int left, int top, int width, int height,
     int bpf;
 
     /* rgb to yuv */
-    glEnable(GL_TEXTURE_2D);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, mi->bmp_texture[mi->cur_buf]);
     g_inf_funcs[g_inf].bind_tex_image(mi->inf_image[mi->cur_buf]);
@@ -1669,13 +1683,9 @@ xrdp_accel_assist_x11_run_shader(int left, int top, int width, int height,
             num_crects);
         return;
     }
-    glGenVertexArrays(1, &vao);
-    glGenBuffers(1, &vbo);
-    glBindVertexArray(vao);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, vertices_bytes, vertices, GL_STATIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 2, NULL);
+    glBindVertexArray(g_draw_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g_draw_vbo);
+    glBufferData(GL_ARRAY_BUFFER, vertices_bytes, vertices, GL_STREAM_DRAW);
     /* uniforms */
     glUniform2f(si->tex_size_loc, mi->width, mi->height);
     if (si->pad_h_loc >= 0)
@@ -1714,8 +1724,6 @@ xrdp_accel_assist_x11_run_shader(int left, int top, int width, int height,
     /* cleanup */
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
-    glDeleteBuffers(1, &vbo);
-    glDeleteVertexArrays(1, &vao);
     g_free(vertices);
 #if XR_DUMP_FRAMEBUFFER
     save_fb_to_file(width, height);
@@ -2563,25 +2571,17 @@ static void
 dd_draw(GLuint target, int vp_w, int vp_h, const GLfloat *vertices,
         GLuint vertices_bytes, GLuint vertices_pointes)
 {
-    GLuint vao;
-    GLuint vbo;
 
     glBindFramebuffer(GL_FRAMEBUFFER, g_fb);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                            GL_TEXTURE_2D, target, 0);
-    glGenVertexArrays(1, &vao);
-    glGenBuffers(1, &vbo);
-    glBindVertexArray(vao);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, vertices_bytes, vertices, GL_STATIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 2, NULL);
+    glBindVertexArray(g_draw_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g_draw_vbo);
+    glBufferData(GL_ARRAY_BUFFER, vertices_bytes, vertices, GL_STREAM_DRAW);
     glViewport(0, 0, vp_w, vp_h);
     glDrawArrays(GL_TRIANGLES, 0, vertices_pointes);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
-    glDeleteBuffers(1, &vbo);
-    glDeleteVertexArrays(1, &vao);
 }
 
 /*****************************************************************************/
@@ -2716,8 +2716,6 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
     int num_cand = 0;
     int num_changed = 0;
     int n;
-    GLuint vao;
-    GLuint vbo;
 
     if (num_crects < 1 || dd_alloc(mi, mi->width, mi->height) != 0)
     {
@@ -2742,7 +2740,6 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
         }
     }
 
-    glEnable(GL_TEXTURE_2D);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, mi->bmp_texture[cur_buf]);
     g_inf_funcs[g_inf].bind_tex_image(mi->inf_image[cur_buf]);
@@ -2816,15 +2813,7 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
             si = g_si + XH_SHADERCELLMAX;
             glUseProgram(si->program);
             glUniform1i(si->tex_loc, 0);
-            glGenVertexArrays(1, &vao);
-            glGenBuffers(1, &vbo);
-            glBindVertexArray(vao);
-            glBindBuffer(GL_ARRAY_BUFFER, vbo);
-            glBufferData(GL_ARRAY_BUFFER, sizeof(g_vertices), g_vertices,
-                         GL_STATIC_DRAW);
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
-                                  sizeof(float) * 2, NULL);
+            glBindVertexArray(g_quad_vao);
             glBindFramebuffer(GL_FRAMEBUFFER, g_fb);
             glEnable(GL_SCISSOR_TEST);
             if (bx2 > bx1 && by2 > by1)
@@ -2852,10 +2841,7 @@ damage_detect(struct mon_info *mi, int cur_buf, int num_crects,
             }
             glDisable(GL_SCISSOR_TEST);
         }
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
         glBindVertexArray(0);
-        glDeleteBuffers(1, &vbo);
-        glDeleteVertexArrays(1, &vao);
         /* the source again on unit 0, for the copy below */
         glBindTexture(GL_TEXTURE_2D, mi->bmp_texture[cur_buf]);
         /* changed = damaged and different; reuse dd_cand in place. Then,
