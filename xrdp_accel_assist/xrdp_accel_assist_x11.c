@@ -521,6 +521,13 @@ xrdp_accel_assist_x11_init(void)
         glUseProgram(0);
     }
     g_memset(g_mons, 0, sizeof(g_mons));
+    if (g_enc_funcs[g_enc].init == NULL)
+    {
+        /* e.g. an NVENC-only build on a server that is not NVIDIA's */
+        LOG(LOG_LEVEL_ERROR, "xrdp_accel_assist_x11_init: this build has "
+            "no %s encoder", g_enc == ENC_NVENC ? "NVENC" : "VA-API");
+        return 1;
+    }
     if (g_enc_funcs[g_enc].init() != 0)
     {
         LOG(LOG_LEVEL_ERROR, "xrdp_accel_assist_x11_init: "
