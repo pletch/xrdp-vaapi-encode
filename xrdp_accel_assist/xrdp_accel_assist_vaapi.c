@@ -1376,8 +1376,10 @@ xrdp_accel_assist_vaapi_create_encoder(int width, int height, int nviews,
         }
     }
 
-    /* reconstructed / reference surfaces, used as a ring */
-    va_status = vaCreateSurfaces(g_va_dpy, VA_RT_FORMAT_YUV420, width, height,
+    /* reconstructed / reference surfaces, used as a ring, at the coded
+       size like the input surfaces (and the context below) */
+    va_status = vaCreateSurfaces(g_va_dpy, VA_RT_FORMAT_YUV420,
+                                 (width + 15) & ~15, (height + 15) & ~15,
                                  lei->recon_surfaces, XH_VAAPI_NUM_RECON,
                                  NULL, 0);
     if (va_status != VA_STATUS_SUCCESS)
@@ -1426,7 +1428,8 @@ xrdp_accel_assist_vaapi_create_encoder(int width, int height, int nviews,
     {
         render_targets[nrt++] = lei->recon_surfaces[view];
     }
-    va_status = vaCreateContext(g_va_dpy, lei->config, width, height,
+    va_status = vaCreateContext(g_va_dpy, lei->config,
+                                (width + 15) & ~15, (height + 15) & ~15,
                                 VA_PROGRESSIVE, render_targets, nrt,
                                 &lei->context);
     if (va_status != VA_STATUS_SUCCESS)
