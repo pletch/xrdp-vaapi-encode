@@ -76,6 +76,10 @@ extern EGLContext g_egl_context; /* in xrdp_accel_assist_egl.c */
 #define XH_DRM_FORMAT_ABGR8888 XH_FOURCC('A', 'B', '2', '4')
 /* DRM_FORMAT_MOD_LINEAR, avoids a hard dependency on drm_fourcc.h */
 #define XH_DRM_FORMAT_MOD_LINEAR 0ULL
+/* DRM_FORMAT_MOD_INVALID: no explicit modifier, the layout travels with
+   the buffer (drivers without modifier support, e.g. radeonsi before
+   GFX9) */
+#define XH_DRM_FORMAT_MOD_INVALID 0x00ffffffffffffffULL
 
 /* Modifiers EGL is asked about per format; drivers list a handful. */
 #define XH_MAX_MODIFIERS 64
@@ -871,6 +875,13 @@ xrdp_accel_assist_vaapi_egl_modifier_ok(unsigned int fourcc,
     EGLint num;
     int index;
 
+    if (modifier == XH_DRM_FORMAT_MOD_INVALID)
+    {
+        /* An implicit layout is imported without a modifier and read from
+           the buffer by the same driver stack; no list names it. Whether
+           GL can render into it is checked after the import. */
+        return 1;
+    }
     num = 0;
     if (epoxy_has_egl_extension(g_egl_display,
                                 "EGL_EXT_image_dma_buf_import_modifiers") &&
@@ -1094,8 +1105,11 @@ xrdp_accel_assist_vaapi_import_plane(struct enc_info *lei, int view,
     attrs[nattr++] = (EGLint) desc->layers[plane].offset[0];
     attrs[nattr++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
     attrs[nattr++] = pitch;
-    if (epoxy_has_egl_extension(g_egl_display,
-                                "EGL_EXT_image_dma_buf_import_modifiers"))
+    /* An implicit layout goes without one: EGL then takes the layout the
+       buffer carries, as libva wrote it. */
+    if (modifier != XH_DRM_FORMAT_MOD_INVALID &&
+            epoxy_has_egl_extension(g_egl_display,
+                                    "EGL_EXT_image_dma_buf_import_modifiers"))
     {
         attrs[nattr++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
         attrs[nattr++] = (EGLint) (modifier & 0xffffffff);
