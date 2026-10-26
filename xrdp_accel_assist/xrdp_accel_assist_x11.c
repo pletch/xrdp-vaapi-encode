@@ -1701,15 +1701,23 @@ xrdp_accel_assist_x11_note_rtt(int rtt_ms)
     q = g_load.srtt8 / 8 - base;
     if (!g_load.loaded && q > LOAD_ENTER_MS)
     {
+        int avc444 = 0;
+        int index;
+
+        /* The state is measured in every mode; only AVC444 acts on it. */
+        for (index = 0; index < MAX_MON; index++)
+        {
+            avc444 |= g_mons[index].ei != NULL && g_mons[index].avc444;
+        }
         g_load.loaded = 1;
-        LOG(LOG_LEVEL_INFO, "AVC444: frames queue (round trip %d ms, "
-            "minimum %d): the aux view waits while anything moves",
-            g_load.srtt8 / 8, base);
+        LOG(LOG_LEVEL_INFO, "load: frames queue (round trip %d ms, "
+            "minimum %d)%s", g_load.srtt8 / 8, base,
+            avc444 ? ": the AVC444 aux view waits while anything moves" : "");
     }
     else if (g_load.loaded && q < LOAD_LEAVE_MS)
     {
         g_load.loaded = 0;
-        LOG(LOG_LEVEL_INFO, "AVC444: frames no longer queue (round trip "
+        LOG(LOG_LEVEL_INFO, "load: frames no longer queue (round trip "
             "%d ms, minimum %d)", g_load.srtt8 / 8, base);
     }
 }
