@@ -70,4 +70,11 @@ wlxrdp_cpu_yuvalp(const uint8_t *src, int src_stride, int bgr, uint8_t *out,
                   uint64_t *hashes, int force,
                   struct xh_rect *tiles, int max_tiles);
 
+/* The region for tiles[] as wlxrdp_cpu_yuvalp returns them: each run of
+   adjacent tiles in a row as one rect, clipped to the frame, into
+   regions[] (room for num_tiles). Returns the count. */
+int
+wlxrdp_cpu_tile_regions(const struct xh_rect *tiles, int num_tiles,
+                        int width, int height, struct xh_rect *regions);
+
 #endif

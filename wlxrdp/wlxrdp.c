@@ -694,6 +694,8 @@ cpu_send_frame(struct mon *m, int index, struct xh_rect *rects,
     struct be *b = m->b;
     const struct wla_buffer *bf;
     struct xh_rect *tiles = NULL;
+    struct xh_rect *regions = NULL;
+    int num_regions = 0;
     const uint8_t *src;
     int src_stride;
     int bgr;
@@ -740,16 +742,28 @@ cpu_send_frame(struct mon *m, int index, struct xh_rect *rects,
                                 bf->width, bf->height, rects, num_rects);
             break;
         default:
+            /* the tiles, then the region they make */
             tiles = (struct xh_rect *)
-                    malloc(sizeof(*tiles) * m->cpu_num_tiles);
+                    malloc(sizeof(*tiles) * m->cpu_num_tiles * 2);
             if (tiles == NULL)
             {
                 return 0;
             }
+            regions = tiles + m->cpu_num_tiles;
             n = wlxrdp_cpu_yuvalp(src, src_stride, bgr, m->cpu_out,
                                   bf->width, bf->height, rects, num_rects,
                                   m->cpu_hashes, force,
                                   tiles, m->cpu_num_tiles);
+            /* The region is the tiles sent, not the damage: the client
+               keeps a tile's old picture where a region covers only part
+               of it (the Android client does, for damage that starts a
+               window border into a tile), and each tile is converted
+               whole from a complete capture, so all of it is current. */
+            if (n > 0)
+            {
+                num_regions = wlxrdp_cpu_tile_regions(tiles, n, bf->width,
+                                                      bf->height, regions);
+            }
             break;
     }
     if (n <= 0)
@@ -772,11 +786,11 @@ cpu_send_frame(struct mon *m, int index, struct xh_rect *rects,
                           shm_fd, (int) m->cpu_out_bytes);
             break;
         case CC_GFX_PRO:    /* RFX progressive (RDPGFX_CODECID_CAPROGRESSIVE) */
-            rv = send_gfx(m, 2, 0x0009, 0, rects, num_rects, tiles, n,
+            rv = send_gfx(m, 2, 0x0009, 0, regions, num_regions, tiles, n,
                           shm_fd, (int) m->cpu_out_bytes);
             break;
         case CC_SUF_RFX:    /* RFX surface commands */
-            rv = send_paint_rect(m, rects, num_rects, tiles, n,
+            rv = send_paint_rect(m, regions, num_regions, tiles, n,
                                  shm_fd, (int) m->cpu_out_bytes);
             break;
         default:            /* CC_SIMPLE: bitmaps */

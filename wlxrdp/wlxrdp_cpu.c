@@ -361,6 +361,33 @@ wlxrdp_cpu_yuvalp(const uint8_t *src, int src_stride, int bgr, uint8_t *out,
 
 /*****************************************************************************/
 int
+wlxrdp_cpu_tile_regions(const struct xh_rect *tiles, int num_tiles,
+                        int width, int height, struct xh_rect *regions)
+{
+    int n = 0;
+    int i;
+
+    for (i = 0; i < num_tiles; i++)
+    {
+        struct xh_rect r = tiles[i];
+
+        if (!clip_rect(&r, width, height))
+        {
+            continue;
+        }
+        if (n > 0 && regions[n - 1].y == r.y && regions[n - 1].h == r.h &&
+                regions[n - 1].x + regions[n - 1].w == r.x)
+        {
+            regions[n - 1].w += r.w; /* the next tile in the row */
+            continue;
+        }
+        regions[n++] = r;
+    }
+    return n;
+}
+
+/*****************************************************************************/
+int
 wlxrdp_cpu_xrgb(const uint8_t *src, int src_stride, int bgr, uint8_t *out,
                 int width, int height,
                 struct xh_rect *rects, int num_rects)
