@@ -65,7 +65,6 @@ SUBDIRS = \
   common \
   vnc \
   xup \
-  mc \
   $(NEUTRINORDPDIR) \
   libipm \
   libxrdp \
