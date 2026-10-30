@@ -701,7 +701,6 @@ AC_CONFIG_FILES([
   libipm/Makefile
   libxrdp/Makefile
   Makefile
-  mc/Makefile
   neutrinordp/Makefile
   pkgconfig/Makefile
   pkgconfig/xrdp.pc
