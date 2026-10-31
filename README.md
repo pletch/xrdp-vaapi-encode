@@ -113,6 +113,29 @@ xrdp sends whether AVC444 is in effect, and tells the helper), and FlyGoat's
 glamor/DRI3 fixes that make glamor work on the Intel `xe` kernel driver
 ([neutrinolabs/xorgxrdp#423](https://github.com/neutrinolabs/xorgxrdp/pull/423)).
 
+#### AMD (radeonsi)
+
+Tested on a Radeon Pro WX 5100 (Polaris, VCE 3 encoder) with Mesa 25.0.7 and a
+Debian 13 kernel ([neutrinolabs/xrdp#3897](https://github.com/neutrinolabs/xrdp/discussions/3897)):
+AVC420, AVC444 and dynamic resize work. Vega and RDNA cards (VCN encoder) are not
+tested yet.
+
+- **Implicit layout.** Cards before Vega have no DRM format modifiers, so the helper
+  imports the encoder's surfaces with the layout the buffer carries. The helper log
+  shows `modifier 0xffffffffffffff` for them; that is expected.
+- **Kernel: VCE 3 hangs.** Stable kernels that took "drm/amdgpu: Implement insert_end
+  for VCE 3" without its follow-up "drm/amdgpu: Fix VCE 3 ring align_mask"
+  (2ee9836545e6, in 7.3) hang the encoder after minutes to hours: dmesg shows
+  `ring vce0 timeout`, the GPU resets, VRAM is lost and Xorg aborts. Any VCE encoder
+  hits it (ffmpeg, RustDesk), not only xrdp. Seen on 6.12.111 (6.12.100 is
+  clean), 6.18.46 and later, and 7.2.x
+  ([drm/amd#5790](https://gitlab.freedesktop.org/drm/amd/-/work_items/5790),
+  [CachyOS/linux-cachyos#1091](https://github.com/CachyOS/linux-cachyos/issues/1091)).
+  Use a kernel with the fix, or one from before the backport.
+- **Headless.** With no monitor on the card, amdgpu's runtime power management logs
+  about missing monitors and its suspend attempts cause short pauses. Turn it off
+  on the kernel command line: `amdgpu.runpm=0 amdgpu.aspm=0`.
+
 ### Installing from source: layout and common snags
 
 These notes come from bringing the fork up on a fresh Xubuntu machine. Package
