@@ -1103,7 +1103,8 @@ xrdp_mm_egfx_send_planar_bitmap(struct xrdp_mm *self,
             }
             lines = libxrdp_planar_compress(pixels, bwidth, bheight, comp_s,
                                             32, GFX_PLANAR_BYTES, bheight - 1,
-                                            temp_s, 0, 0x10);
+                                            temp_s, 0,
+                                            (BMC_FLAGS_RLE | BMC_FLAGS_NOALPHA));
             comp_s->end = comp_s->p;
             comp_s->p = comp_s->data;
             if (lines != bheight)
@@ -3784,12 +3785,6 @@ xrdp_mm_connect_sm(struct xrdp_mm *self)
                                 "Connecting to display server");
                 /* This is synchronous - no reply message expected */
                 status = xrdp_mm_display_server_connect(self);
-                if (status == 0)
-                {
-                    // This is as good a place as any to start processing
-                    // the resize_queue
-                    start_processing_resize_queue(self);
-                }
             }
             break;
 
@@ -4301,7 +4296,11 @@ xrdp_mm_check_wait_objs(struct xrdp_mm *self)
         }
     }
 
-    if (self->wm->screen_dirty_region != NULL)
+    // Only consider sending the dirty region of the WM screen if a resize
+    // is not in progress. This revents unnecessary client updates, and also
+    // prevents us sending EGFX PDUs while we have no surfaces, if the module
+    // is using the WM screen.
+    if (self->wm->screen_dirty_region != NULL && self->resize_data == NULL)
     {
         if (xrdp_region_not_empty(self->wm->screen_dirty_region))
         {
@@ -4454,6 +4453,19 @@ server_init_xkb_layout(struct xrdp_mod *mod,
 {
     xrdp_init_xkb_layout(client_info);
 }
+
+/*****************************************************************************/
+/* Start the resize queue (called from a module) */
+static void
+server_start_resize_queue(struct xrdp_mod *mod)
+{
+    struct xrdp_wm *wm;
+    if ((wm = (struct xrdp_wm *)mod->wm) != NULL && wm->mm != NULL)
+    {
+        start_processing_resize_queue(wm->mm);
+    }
+}
+
 
 /*****************************************************************************/
 static int
@@ -4828,8 +4840,7 @@ server_set_pointer(struct xrdp_mod *mod, int x, int y,
     struct xrdp_wm *wm;
 
     wm = (struct xrdp_wm *)(mod->wm);
-    xrdp_wm_pointer(wm, data, mask, x, y, 0, 32, 32);
-    return 0;
+    return xrdp_wm_pointer(wm, data, mask, x, y, 0, 32, 32);
 }
 
 /*****************************************************************************/
@@ -4840,8 +4851,7 @@ server_set_pointer_ex(struct xrdp_mod *mod, int x, int y,
     struct xrdp_wm *wm;
 
     wm = (struct xrdp_wm *)(mod->wm);
-    xrdp_wm_pointer(wm, data, mask, x, y, bpp, 32, 32);
-    return 0;
+    return xrdp_wm_pointer(wm, data, mask, x, y, bpp, 32, 32);
 }
 
 /*****************************************************************************/
@@ -4853,8 +4863,7 @@ server_set_pointer_large(struct xrdp_mod *mod, int x, int y,
     struct xrdp_wm *wm;
 
     wm = (struct xrdp_wm *)(mod->wm);
-    xrdp_wm_pointer(wm, data, mask, x, y, bpp, width, height);
-    return 0;
+    return xrdp_wm_pointer(wm, data, mask, x, y, bpp, width, height);
 }
 
 /*****************************************************************************/
@@ -5651,6 +5660,7 @@ xrdp_mm_setup_mod1(struct xrdp_mm *self)
             self->mod->server_bell_trigger = server_bell_trigger;
             self->mod->server_chansrv_in_use = server_chansrv_in_use;
             self->mod->server_init_xkb_layout = server_init_xkb_layout;
+            self->mod->server_start_resize_queue = server_start_resize_queue;
             self->mod->server_fill_rect = server_fill_rect;
             self->mod->server_screen_blt = server_screen_blt;
             self->mod->server_paint_rect = server_paint_rect;

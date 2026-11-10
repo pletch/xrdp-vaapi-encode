@@ -232,20 +232,21 @@ xrdp_orders_check(struct xrdp_orders *self, int max_size)
     ci = &(self->rdp_layer->client_info);
     max_order_size = MAX_ORDERS_SIZE(ci);
 
+    /* An order that can never fit must be refused whether or not a
+     * batch is open, as the caller writes max_size bytes after a
+     * successful check */
+    if (max_size > max_order_size)
+    {
+        LOG(LOG_LEVEL_ERROR, "Requested orders max_size (%d) "
+            "is greater than the client connection max_size (%d)",
+            max_size, max_order_size);
+        return 1;
+    }
+
     if (self->order_level < 1)
     {
-        if (max_size > max_order_size)
-        {
-            LOG(LOG_LEVEL_ERROR, "Requested orders max_size (%d) "
-                "is greater than the client connection max_size (%d)",
-                max_size, max_order_size);
-            return 1;
-        }
-        else
-        {
-            xrdp_orders_init(self);
-            return 0;
-        }
+        xrdp_orders_init(self);
+        return 0;
     }
 
     size = (int)(self->out_s->p - self->order_count_ptr);
@@ -2402,7 +2403,7 @@ xrdp_orders_send_bitmap(struct xrdp_orders *self,
     {
         lines_sending = xrdp_bitmap32_compress(data, width, height, s,
                                                bpp, max_order_size,
-                                               i - 1, temp_s, e, 0x10);
+                                               i - 1, temp_s, e, BMC_FLAGS_RLE);
     }
     else
     {
@@ -2830,7 +2831,7 @@ xrdp_orders_send_bitmap2(struct xrdp_orders *self,
     {
         lines_sending = xrdp_bitmap32_compress(data, width, height, s,
                                                bpp, max_order_size,
-                                               i - 1, temp_s, e, 0x10);
+                                               i - 1, temp_s, e, BMC_FLAGS_RLE);
     }
     else
     {
