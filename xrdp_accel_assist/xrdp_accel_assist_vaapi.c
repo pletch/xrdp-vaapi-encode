@@ -1779,6 +1779,13 @@ vaapi_finish(struct enc_info *ei, int flags, void *cdata, int *cdata_bytes)
     total = 0;
     while (seg != NULL)
     {
+        if (seg->status & VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK)
+        {
+            LOG(LOG_LEVEL_ERROR, "vaapi: the coded picture overflowed its "
+                "buffer (status 0x%x)", seg->status);
+            rv = ENCODER_ERROR;
+            break;
+        }
         if (total + (int) seg->size > *cdata_bytes)
         {
             LOG(LOG_LEVEL_ERROR, "vaapi: coded data too big %d > %d",
