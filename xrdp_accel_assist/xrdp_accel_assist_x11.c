@@ -347,6 +347,30 @@ static struct rgb2yuv_matrix g_rgb2yux_matrix[3] =
 #include "xrdp_accel_assist_shaders.c"
 
 /*****************************************************************************/
+/* Xlib's default handler exits on any X error, and the helper holds the
+   client's connection: an error on a pixmap that went away in a resize
+   ended the client's session. Log it and carry on; the calls that needed
+   the resource fail on their own and are handled where they are made. */
+static int
+xrdp_accel_assist_x11_error(Display *display, XErrorEvent *event)
+{
+    static int logged = 0;
+    char text[128];
+
+    if (logged < 20)
+    {
+        logged++;
+        text[0] = '\0';
+        XGetErrorText(display, event->error_code, text, sizeof(text));
+        LOG(LOG_LEVEL_WARNING, "X error %d (%s), request %d.%d, resource "
+            "0x%lx%s", event->error_code, text, event->request_code,
+            event->minor_code, (unsigned long) event->resourceid,
+            logged == 20 ? "; further X errors are not logged" : "");
+    }
+    return 0;
+}
+
+/*****************************************************************************/
 int
 xrdp_accel_assist_x11_init(void)
 {
@@ -367,6 +391,7 @@ xrdp_accel_assist_x11_init(void)
     {
         return 1;
     }
+    XSetErrorHandler(xrdp_accel_assist_x11_error);
     g_x_socket = XConnectionNumber(g_display);
     g_screen_num = DefaultScreen(g_display);
     g_screen = ScreenOfDisplay(g_display, g_screen_num);
