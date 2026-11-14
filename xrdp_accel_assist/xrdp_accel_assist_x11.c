@@ -2957,6 +2957,29 @@ dd_append_rects(void *cdata, int *cdata_bytes, int avail, unsigned int magic,
 }
 
 /*****************************************************************************/
+/* An encoder that fails this many frames in a row, a new encoder each
+   time, is not coming back: the client has seen a still picture since the
+   first of them. One failure is routine (a picture too big for the coded
+   buffer) and the IDR after it clears it. */
+#define XH_MAX_ENC_ERRORS 30
+
+static int g_enc_errors = 0;
+
+static void
+xrdp_accel_assist_x11_enc_failed(int mon_id)
+{
+    char reason[128];
+
+    g_enc_errors++;
+    if (g_enc_errors >= XH_MAX_ENC_ERRORS)
+    {
+        g_snprintf(reason, sizeof(reason), "%d frames in a row did not "
+                   "encode (monitor %d)", g_enc_errors, mon_id);
+        xrdp_accel_assist_give_up(reason);
+    }
+}
+
+/*****************************************************************************/
 enum encoder_result
 xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
                                     int mon_id, int num_crects,
@@ -2974,6 +2997,7 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
         /* its re-creation after a failure failed: try again */
         if (mi->enc_w <= 0 || xrdp_accel_assist_x11_recreate_enc(mi) != 0)
         {
+            xrdp_accel_assist_x11_enc_failed(mon_id);
             return ENCODER_ERROR;
         }
     }
@@ -3087,10 +3111,15 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
                 LOG(LOG_LEVEL_ERROR, "monitor %d: no new encoder", mon_id);
             }
         }
+        xrdp_accel_assist_x11_enc_failed(mon_id);
     }
     else if (flags & XH_ENC_FLAGS_FORCEIDR)
     {
         mi->idr_pending = 0;
+    }
+    if (rv == KEY_FRAME_ENCODED || rv == INCREMENTAL_FRAME_ENCODED)
+    {
+        g_enc_errors = 0;
     }
     if (rv == KEY_FRAME_ENCODED)
     {

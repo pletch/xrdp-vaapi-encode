@@ -68,6 +68,11 @@ struct xh_rect
    view at half the 16-aligned width even at an odd macroblock count. */
 #define XH_CAPS_NO_DIG_PRODUCT_ID (1 << 2)
 
+/* Leave hardware encoding for the rest of this session and exit, see
+   xrdp_accel_assist.c. Does not return. */
+void
+xrdp_accel_assist_give_up(const char *reason);
+
 enum encoder_result
 {
     INCREMENTAL_FRAME_ENCODED,  /* P frame */
