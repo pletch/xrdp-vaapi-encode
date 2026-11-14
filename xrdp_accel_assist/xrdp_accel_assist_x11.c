@@ -968,7 +968,7 @@ xrdp_accel_assist_x11_legacy_freerdp_split(void)
 int
 xrdp_accel_assist_x11_mon_avc444_v2(int mon_id)
 {
-    return g_mons[mon_id % MAX_MON].avc444_v2;
+    return g_mons[(unsigned int) mon_id % MAX_MON].avc444_v2;
 }
 
 /*****************************************************************************/
@@ -1061,7 +1061,7 @@ xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
     int gl_alloc;
     int buf;
 
-    mi = g_mons + mon_id % MAX_MON;
+    mi = g_mons + (unsigned int) mon_id % MAX_MON;
     if (mi->pixmap[0] != 0)
     {
         LOG(LOG_LEVEL_ERROR, "xrdp_accel_assist_x11_create_pixmap: "
@@ -1749,7 +1749,7 @@ encode_pixmap(int left, int top, int width, int height,
     enum encoder_result rv;
     struct xh_rect whole;
 
-    mi = g_mons + mon_id % MAX_MON;
+    mi = g_mons + (unsigned int) mon_id % MAX_MON;
     /* Which capture buffer xorgxrdp used for this frame. */
     mi->cur_buf = (flags & ACCEL_ASSIST_BUFFER_1) ? 1 : 0;
     LOG_DEVEL(LOG_LEVEL_INFO, "xrdp_accel_assist_x11_encode_pixmap: "
@@ -2939,7 +2939,7 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
                                     void *cdata, int *cdata_bytes,
                                     int codec_id, int flags)
 {
-    struct mon_info *mi = g_mons + mon_id % MAX_MON;
+    struct mon_info *mi = g_mons + (unsigned int) mon_id % MAX_MON;
     enum encoder_result rv;
     struct xh_rect *dd_rects = NULL;
     int dd_n = -1;
