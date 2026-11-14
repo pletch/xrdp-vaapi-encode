@@ -1920,8 +1920,32 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
     /* glFlush, not glFinish: the dma-buf's implicit sync orders the GL
        writes before the encode, on a surface libva allocated too. Checked
        on iHD 26.1.2 (xe) with a slow render each frame and every encoded
-       frame decoded and compared: no stale frames. */
-    glFlush();
+       frame decoded and compared: no stale frames. XRDP_VAAPI_GLFINISH=1
+       waits for GL instead, for a driver stack where the encoder turns
+       out not to. */
+    {
+        static int finish = -1;
+
+        if (finish < 0)
+        {
+            const char *env = g_getenv("XRDP_VAAPI_GLFINISH");
+
+            finish = (env != NULL) && (g_atoi(env) != 0);
+            if (finish)
+            {
+                LOG(LOG_LEVEL_INFO, "vaapi: XRDP_VAAPI_GLFINISH is set, "
+                    "waiting for GL before each encode");
+            }
+        }
+        if (finish)
+        {
+            glFinish();
+        }
+        else
+        {
+            glFlush();
+        }
+    }
 
     w_mbs = (ei->width + 15) / 16;
     h_mbs = (ei->height + 15) / 16;
