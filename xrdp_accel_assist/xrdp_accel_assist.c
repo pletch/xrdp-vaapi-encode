@@ -47,6 +47,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include "xrdp_accel_assist_vaapi.h"
+#include "xrdp_accel_assist_selftest.h"
 #endif
 
 #define ARRAYSIZE(x) (sizeof(x)/sizeof(*(x)))
@@ -1168,6 +1169,145 @@ vaapi_init_without_x(void)
     }
     return rv;
 }
+
+/*****************************************************************************/
+/* "WxH" into width and height. Returns 0 if it parsed. */
+static int
+parse_size(const char *text, int *width, int *height)
+{
+    int w;
+    int h;
+
+    if (text == NULL || sscanf(text, "%dx%d", &w, &h) != 2 ||
+            w < 64 || h < 64 || w > 8192 || h > 8192)
+    {
+        return 1;
+    }
+    *width = w;
+    *height = h;
+    return 0;
+}
+
+/*****************************************************************************/
+/* Run the encoder self-test before signal_ready(), see
+   xrdp_accel_assist_selftest.c: what it finds broken would otherwise show
+   as a frozen picture once the session is ours. Without the X server, like
+   the init above. AVC444 is tested too unless the session rules it out,
+   since the client's capabilities are not known yet.
+
+   XRDP_ACCEL_SELFTEST: "0" skips the test, "WxH" sets its picture size. */
+static int
+vaapi_selftest_without_x(void)
+{
+    const char *env = g_getenv("XRDP_ACCEL_SELFTEST");
+    const char *avc444 = g_getenv("XRDP_ACCEL_AVC444");
+    char *display;
+    int width = 1920;
+    int height = 1080;
+    int rv;
+
+    if (env != NULL && g_strcmp(env, "0") == 0)
+    {
+        LOG(LOG_LEVEL_INFO, "selftest: skipped (XRDP_ACCEL_SELFTEST=0)");
+        return 0;
+    }
+    if (env != NULL && parse_size(env, &width, &height) != 0)
+    {
+        LOG(LOG_LEVEL_WARNING, "selftest: XRDP_ACCEL_SELFTEST=%s is not "
+            "\"0\" or \"WxH\"; using %dx%d", env, width, height);
+    }
+    display = g_strdup(g_getenv("DISPLAY"));
+    unsetenv("DISPLAY");
+    rv = xrdp_accel_assist_selftest(width, height, 1, 3, 0, NULL);
+    if (rv == 0 && (avc444 == NULL || g_strcmp(avc444, "0") != 0))
+    {
+        rv = xrdp_accel_assist_selftest(width, height, 2, 6, 0, NULL);
+        if (rv != 0)
+        {
+            LOG(LOG_LEVEL_ERROR, "selftest: AVC420 encodes on this GPU but "
+                "AVC444 does not. XRDP_ACCEL_AVC444=0 in sesman.ini "
+                "[SessionVariables] keeps the session on hardware AVC420");
+        }
+    }
+    if (display != NULL)
+    {
+        g_setenv("DISPLAY", display, 1);
+        g_free(display);
+    }
+    return rv;
+}
+
+/*****************************************************************************/
+/* xrdp-accel-assist --selftest [WxH [views [frames [stress [dumpfile]]]]]
+   Run the self-test from a shell and report on the console, to try a GPU
+   before any session depends on it. views: 1 = AVC420, 2 = AVC444,
+   0 (default) = one after the other. A dumpfile needs views 1 or 2. */
+static int
+selftest_main(int argc, char **argv)
+{
+    struct log_config *logconfig;
+    int width = 1920;
+    int height = 1080;
+    int views = 0;
+    int frames = 12;
+    int stress = 0;
+    const char *dump = NULL;
+    int rv;
+
+    g_init("xrdp_accel_assist");
+    logconfig = log_config_init_for_console(LOG_LEVEL_INFO,
+                g_getenv("XRDP_ACCEL_ASSIST_LOG_LEVEL"));
+    if (logconfig != NULL)
+    {
+        log_start_from_param(logconfig);
+        log_config_free(logconfig);
+    }
+    if (argc > 2 && parse_size(argv[2], &width, &height) != 0)
+    {
+        g_writeln("usage: %s --selftest [WxH [views [frames [stress "
+                  "[dumpfile]]]]]", argv[0]);
+        return 2;
+    }
+    views = (argc > 3) ? g_atoi(argv[3]) : 0;
+    frames = (argc > 4) ? g_atoi(argv[4]) : frames;
+    stress = (argc > 5) ? g_atoi(argv[5]) : 0;
+    dump = (argc > 6) ? argv[6] : NULL;
+    if (frames < 1 || stress < 0 || views < 0 || views > 2 ||
+            (dump != NULL && views == 0))
+    {
+        g_writeln("usage: %s --selftest [WxH [views [frames [stress "
+                  "[dumpfile]]]]]", argv[0]);
+        return 2;
+    }
+    unsetenv("DISPLAY");
+    if (render_node_is_nvidia())
+    {
+        g_writeln("selftest: %s is an NVIDIA GPU (NVENC), which this test "
+                  "does not cover", xrdp_accel_assist_render_node());
+        return 2;
+    }
+    if (xrdp_accel_assist_vaapi_init() != 0)
+    {
+        g_writeln("selftest: FAIL (VA-API encoder init)");
+        return 1;
+    }
+    rv = 0;
+    if (views != 2)
+    {
+        rv = xrdp_accel_assist_selftest(width, height, 1, frames, stress,
+                                        dump);
+        g_writeln("selftest: AVC420 %s", rv == 0 ? "PASS" : "FAIL");
+    }
+    if (views != 1)
+    {
+        int rv2 = xrdp_accel_assist_selftest(width, height, 2, frames,
+                                             stress, dump);
+
+        g_writeln("selftest: AVC444 %s", rv2 == 0 ? "PASS" : "FAIL");
+        rv = rv || rv2;
+    }
+    return rv ? 1 : 0;
+}
 #endif
 
 /*****************************************************************************/
@@ -1213,6 +1353,12 @@ main(int argc, char **argv)
         g_writeln("need to pass -d");
         return 0;
     }
+#if defined(XRDP_VAAPI)
+    if (strcmp(argv[1], "--selftest") == 0)
+    {
+        return selftest_main(argc, argv);
+    }
+#endif
     if (strcmp(argv[1], "-d") != 0)
     {
         g_writeln("need to pass -d");
@@ -1234,6 +1380,13 @@ main(int argc, char **argv)
     if (!render_node_is_nvidia() && vaapi_init_without_x() != 0)
     {
         LOG(LOG_LEVEL_ERROR, "VA-API encoder init failed");
+        return 1;
+    }
+    /* And that it encodes, while failing still means software encoding. */
+    if (!render_node_is_nvidia() && vaapi_selftest_without_x() != 0)
+    {
+        LOG(LOG_LEVEL_ERROR, "VA-API encoder self-test failed; not "
+            "starting, the session uses software encoding");
         return 1;
     }
 #endif

@@ -1535,6 +1535,85 @@ xrdp_accel_assist_vaapi_delete_encoder(struct enc_info *ei)
 }
 
 /*****************************************************************************/
+/* For the self-test: samples of a view's input surface as libva sees them,
+   three values (Y, U, V) per point. The caller has finished its GL drawing.
+   Returns 0 if they could be read. */
+int
+xrdp_accel_assist_vaapi_read_input(struct enc_info *ei, int view, int npoints,
+                                   const int *xs, const int *ys, int *yuv)
+{
+    VAImage image;
+    VAImageFormat format;
+    VAStatus va_status;
+    unsigned char *data;
+    unsigned char *uv;
+    int buf_w = (ei->width + 15) & ~15;
+    int buf_h = (ei->height + 15) & ~15;
+    int index;
+    int rv;
+
+    if (view < 0 || view >= ei->nviews)
+    {
+        return 1;
+    }
+    /* A copy through the driver; a mapping of the surface itself if the
+       driver has no copy for it. */
+    g_memset(&image, 0, sizeof(image));
+    g_memset(&format, 0, sizeof(format));
+    format.fourcc = VA_FOURCC_NV12;
+    format.byte_order = VA_LSB_FIRST;
+    format.bits_per_pixel = 12;
+    va_status = vaCreateImage(g_va_dpy, &format, buf_w, buf_h, &image);
+    if (va_status == VA_STATUS_SUCCESS)
+    {
+        va_status = vaGetImage(g_va_dpy, ei->input_surface[view], 0, 0,
+                               buf_w, buf_h, image.image_id);
+        if (va_status != VA_STATUS_SUCCESS)
+        {
+            vaDestroyImage(g_va_dpy, image.image_id);
+        }
+    }
+    if (va_status != VA_STATUS_SUCCESS)
+    {
+        va_status = vaDeriveImage(g_va_dpy, ei->input_surface[view], &image);
+        if (va_status != VA_STATUS_SUCCESS)
+        {
+            return 1;
+        }
+    }
+    rv = 1;
+    data = NULL;
+    if (image.format.fourcc == VA_FOURCC_NV12 && image.num_planes >= 2 &&
+            vaMapBuffer(g_va_dpy, image.buf, (void **) &data)
+            == VA_STATUS_SUCCESS)
+    {
+        if (data != NULL)
+        {
+            for (index = 0; index < npoints; index++)
+            {
+                if (xs[index] < 0 || xs[index] >= (int) image.width ||
+                        ys[index] < 0 || ys[index] >= (int) image.height)
+                {
+                    break;
+                }
+                yuv[index * 3] = data[image.offsets[0] +
+                                      ys[index] * image.pitches[0] +
+                                      xs[index]];
+                uv = data + image.offsets[1] +
+                     (ys[index] / 2) * image.pitches[1] +
+                     (xs[index] / 2) * 2;
+                yuv[index * 3 + 1] = uv[0];
+                yuv[index * 3 + 2] = uv[1];
+            }
+            rv = (index == npoints) ? 0 : 1;
+        }
+        vaUnmapBuffer(g_va_dpy, image.buf);
+    }
+    vaDestroyImage(g_va_dpy, image.image_id);
+    return rv;
+}
+
+/*****************************************************************************/
 /* Create a buffer, queue it, and remember its id for cleanup. */
 static int
 render_buffer(VAContextID ctx, VABufferType type, unsigned int size,
