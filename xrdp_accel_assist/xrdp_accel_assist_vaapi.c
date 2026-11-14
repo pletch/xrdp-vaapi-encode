@@ -415,8 +415,9 @@ build_sps(unsigned char *out, struct enc_info *ei)
     bs_put(&b, 1, 1);              /* motion_vectors_over_pic_boundaries_flag */
     bs_ue(&b, 0);                  /* max_bytes_per_pic_denom */
     bs_ue(&b, 0);                  /* max_bits_per_mb_denom */
-    bs_ue(&b, 16);                 /* log2_max_mv_length_horizontal */
-    bs_ue(&b, 16);                 /* log2_max_mv_length_vertical */
+    /* 0..15 in the current standard; older editions allowed 16 */
+    bs_ue(&b, 15);                 /* log2_max_mv_length_horizontal */
+    bs_ue(&b, 15);                 /* log2_max_mv_length_vertical */
     bs_ue(&b, 0);                  /* max_num_reorder_frames = 0 */
     bs_ue(&b, num_ref);            /* max_dec_frame_buffering */
     bs_trailing(&b);
@@ -1778,6 +1779,13 @@ vaapi_finish(struct enc_info *ei, int flags, void *cdata, int *cdata_bytes)
     total = 0;
     while (seg != NULL)
     {
+        if (seg->status & VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK)
+        {
+            LOG(LOG_LEVEL_ERROR, "vaapi: the coded picture overflowed its "
+                "buffer (status 0x%x)", seg->status);
+            rv = ENCODER_ERROR;
+            break;
+        }
         if (total + (int) seg->size > *cdata_bytes)
         {
             LOG(LOG_LEVEL_ERROR, "vaapi: coded data too big %d > %d",

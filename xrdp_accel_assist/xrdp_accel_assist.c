@@ -35,10 +35,11 @@
 #include "xrdp_accel_assist.h"
 #include "xrdp_accel_assist_x11.h"
 
+#include <unistd.h>
+
 #if defined(HAVE_SYS_PRCTL_H)
 #include <sys/prctl.h>
 #include <signal.h>
-#include <unistd.h>
 #endif
 
 #if defined(XRDP_VAAPI)
@@ -216,7 +217,8 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
     cdata_bytes = (int) map_size;
     /* Keep xorgxrdp's flag bits rather than rebuilding the word, so a bit
        added later is not silently cleared. */
-    encoder_flags = flags & ~(unsigned int) XH_ENC_FLAGS_FORCEIDR;
+    encoder_flags = flags & ~(unsigned int) (XH_ENC_FLAGS_FORCEIDR |
+                    XH_ENC_FLAGS_AUXVIEW);
     if (xi->idr_count > 0)
     {
         encoder_flags |= XH_ENC_FLAGS_FORCEIDR;
@@ -1171,6 +1173,149 @@ vaapi_init_without_x(void)
 #endif
 
 /*****************************************************************************/
+/* The X server that started us, as "pid starttime". One X server is one
+   session, and a pid alone could be reused. */
+static int
+parent_id(char *text, int bytes)
+{
+    char path[64];
+    char stat_text[1024];
+    char *p;
+    int fd;
+    int len;
+    int field;
+    int ppid = (int) getppid();
+
+    g_snprintf(path, sizeof(path), "/proc/%d/stat", ppid);
+    fd = g_file_open_ro(path);
+    if (fd < 0)
+    {
+        return 1;
+    }
+    len = g_file_read(fd, stat_text, sizeof(stat_text) - 1);
+    g_file_close(fd);
+    if (len < 1)
+    {
+        return 1;
+    }
+    stat_text[len] = '\0';
+    /* comm, the second field, may hold spaces: count on from its ")".
+       starttime is field 22. */
+    p = strrchr(stat_text, ')');
+    for (field = 2; p != NULL && field < 22; field++)
+    {
+        p = strchr(p + 1, ' ');
+    }
+    if (p == NULL)
+    {
+        return 1;
+    }
+    g_snprintf(text, bytes, "%d %ld", ppid, atol(p + 1));
+    return 0;
+}
+
+/*****************************************************************************/
+static int
+failed_marker_path(char *path, int bytes)
+{
+    char dir[256];
+
+    if (get_log_path(dir, 255) != 0)
+    {
+        return 1;
+    }
+    g_snprintf(path, bytes, "%s/xrdp-accel-assist.%d.failed", dir,
+               g_display_num);
+    return 0;
+}
+
+/*****************************************************************************/
+/* Once ready has been signalled the helper cannot hand a session back to
+   software encoding: xorgxrdp gave it the client's connection. A helper
+   whose encoder stops working for good used to rebuild it on every frame
+   behind a frozen picture. Instead leave a marker for this X server and
+   exit: the client is disconnected once, and when it reconnects the helper
+   finds the marker and declines to start, so xorgxrdp encodes in software
+   for the rest of the session. A new session (a new X server) tries the
+   GPU again. */
+void
+xrdp_accel_assist_give_up(const char *reason)
+{
+    char path[512];
+    char id[64];
+    char text[512];
+    int fd;
+
+    LOG(LOG_LEVEL_ERROR, "giving up on hardware encoding for this session: "
+        "%s. The client is disconnected now; when it reconnects the session "
+        "uses software encoding. Log out and in to try the GPU again",
+        reason);
+    if (failed_marker_path(path, sizeof(path)) == 0 &&
+            parent_id(id, sizeof(id)) == 0)
+    {
+        fd = g_file_open_ex(path, 0, 1, 1, 1);
+        if (fd >= 0)
+        {
+            g_snprintf(text, sizeof(text), "%s\n%s\n", id, reason);
+            if (g_file_write(fd, text, g_strlen(text)) < 0)
+            {
+                LOG(LOG_LEVEL_WARNING, "could not write %s", path);
+            }
+            g_file_close(fd);
+        }
+    }
+    log_end();
+    _exit(1);
+}
+
+/*****************************************************************************/
+/* Did a helper give up on hardware encoding in this session (under this X
+   server)? A marker from an earlier session is removed. */
+static int
+gave_up_before(void)
+{
+    char path[512];
+    char id[64];
+    char text[512];
+    char *eol;
+    int fd;
+    int len;
+
+    if (failed_marker_path(path, sizeof(path)) != 0 || !g_file_exist(path))
+    {
+        return 0;
+    }
+    len = 0;
+    fd = g_file_open_ro(path);
+    if (fd >= 0)
+    {
+        len = g_file_read(fd, text, sizeof(text) - 1);
+        g_file_close(fd);
+    }
+    text[len > 0 ? len : 0] = '\0';
+    eol = strchr(text, '\n');
+    if (eol != NULL)
+    {
+        *eol = '\0';
+    }
+    if (parent_id(id, sizeof(id)) == 0 && g_strcmp(id, text) == 0)
+    {
+        char *reason = (eol != NULL) ? eol + 1 : text;
+
+        if (strchr(reason, '\n') != NULL)
+        {
+            *strchr(reason, '\n') = '\0';
+        }
+        LOG(LOG_LEVEL_WARNING, "hardware encoding failed earlier in this "
+            "session (%s); not starting, the session uses software "
+            "encoding. Log out and in to try the GPU again", reason);
+        return 1;
+    }
+    g_file_delete(path);
+    return 0;
+}
+
+/*****************************************************************************/
 /* Die with the process that started us (Xorg, or wlxrdp). The kernel
    delivers it, so it works where nothing in the helper could notice: a
    helper whose X server aborted mid-frame was left asleep on a lock in the
@@ -1227,6 +1372,10 @@ main(int argc, char **argv)
     LOG(LOG_LEVEL_INFO, "startup");
     g_memset(&xi, 0, sizeof(xi));
     g_signal_pipe(sigpipe_func);
+    if (gave_up_before())
+    {
+        return 1;
+    }
 #if defined(XRDP_VAAPI)
     /* The encoder before X: it needs only the render node, and X waits for
        signal_ready() before it answers us. NVIDIA (NVENC) is set up with X,
