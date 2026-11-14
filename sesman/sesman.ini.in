@@ -333,6 +333,14 @@ PULSE_SCRIPT=@sesmansysconfdir@/pulse/default.pa
 ;XRDP_VAAPI_BITRATE=5000
 ; Render node to encode on, when the default pick is wrong.
 ;XRDP_VAAPI_DEVICE=/dev/dri/renderD128
+; Before it takes a session, the VA-API helper encodes a few test pictures
+; (AVC420, then AVC444 unless XRDP_ACCEL_AVC444=0) and checks that its GL
+; drawing reached the encoder and that every picture came out. If not, it
+; does not start and the session encodes in software. It runs each time a
+; client connects and took about half a second at 1920x1080 on an Intel UHD
+; 600. "WxH" tests at that size (default 1920x1080), 0 skips the test.
+; From a shell: xrdp-accel-assist --selftest [WxH [views [frames]]].
+;XRDP_ACCEL_SELFTEST=1920x1080
 ; NVENC (--enable-nvenc). Constant QP by default, 28 for the main view and
 ; 18 for the AVC444 auxiliary view; XRDP_NVENC_QP takes effect with the
 ; CONSTQP mode set. NV_ENC_PARAMS_RC_VBR with XRDP_NVENC_AVERAGE_BITRATE
@@ -407,6 +415,10 @@ PULSE_SCRIPT=@sesmansysconfdir@/pulse/default.pa
 ; each AVC444 frame and the audio round trip are logged at debug level
 ; (XRDP_ACCEL_ASSIST_LOG_LEVEL, chansrv's log level).
 ;XRDP_VAAPI_TIMING=1
+; The GL conversion is handed to the encoder after glFlush, ordered by the
+; dma-buf's implicit sync. 1 waits for GL with glFinish instead, for a
+; driver stack where encoded pictures show stale or partly drawn content.
+;XRDP_VAAPI_GLFINISH=1
 ; AVC444 damage detection is always on: what xorgxrdp or the compositor
 ; reports as damaged is compared with the frame last encoded, and only what
 ; changed is sent (repainted but unchanged areas otherwise flickered between

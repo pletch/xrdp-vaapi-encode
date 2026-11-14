@@ -29,6 +29,8 @@ SPS/PPS/slice headers are generated directly - no ffmpeg, no libx264.
 
 ### What changed
 * `xrdp_accel_assist/xrdp_accel_assist_vaapi.{c,h}`: the VA-API encoder (new)
+* `xrdp_accel_assist/xrdp_accel_assist_selftest.{c,h}`: encoder self-test, run before
+  the helper takes a session and from a shell with `--selftest` (new)
 * `xrdp_accel_assist/xrdp_accel_assist_x11.c`: wire the `ENC_VA` vtable + NV12 layout
 * `configure.ac`, `xrdp_accel_assist/Makefile.am`: `--enable-vaapi` build option
 
@@ -256,6 +258,13 @@ For NVIDIA:
 * `sudo grep "hardware encoding active" /var/log/xrdp.log` (the log needs
   root). The line appears on the first GPU-encoded frame.
 * The helper's own log: `~/.local/share/xrdp/xrdp-accel-assist.<display>.log`.
+  Each connection starts with a *selftest: passed* line per codec.
+* Before any session depends on a GPU, try it from a shell as a user in the
+  `render` group: `/usr/local/libexec/xrdp/xrdp-accel-assist --selftest 1920x1080`
+  prints *selftest: AVC420 PASS* and *AVC444 PASS*. Further arguments: views
+  (1 AVC420, 2 AVC444, 0 both), frames, a stress level that adds GL work before
+  each picture, and a file to write the stream to, with the expected samples per
+  picture in `<file>.expect`, for checking it with a software decoder.
 * `intel_gpu_top` (the Video engine) or `nvidia-smi dmon -s u` (the `enc`
   column) while something on screen is moving.
 
@@ -276,6 +285,8 @@ For NVIDIA:
 | the same fringes on FreeRDP 3.18+ | `XRDP_AVC444_LEGACY_FREERDP=1` is on; it suits only FreeRDP before 3.18 |
 | `XRDP_AVC444_LEGACY_FREERDP=1` changes nothing | on Xorg, an xorgxrdp without the client-type bit: `~/.xorgxrdp.*.log` shows *capabilities 0x00000003* for a FreeRDP client instead of *0x00000007*; or the session started before the setting (a reconnect keeps the old environment) |
 | AVC444v1 on FreeRDP looks dithered, no better than AVC420 | FreeRDP's SSE4.1 v1 combine on x86 (FreeRDP#13669); v2 is unaffected |
+| *VA-API encoder self-test failed* in the helper log | the GPU or driver cannot run this encoder path; the session encodes in software. The lines before it name the step; `--selftest` from a shell reproduces it |
+| *AVC420 encodes on this GPU but AVC444 does not* | set `XRDP_ACCEL_AVC444=0` to stay on hardware AVC420 |
 | no *hardware encoding active* line | `XRDP_USE_ACCEL_ASSIST` unset, no x264/OpenH264 in the build, or (NVIDIA) the xrdpdev `xorg.conf` |
 | bash: *!dev: event not found* when pasting a command | history expansion on `!` inside double quotes; use single quotes |
 
@@ -537,6 +548,7 @@ All of these are `[SessionVariables]` in `sesman.ini`, documented there as well:
 | `XRDP_AVC444_IDR_PERIOD` | unset | overrides the two above with an IDR every Nth frame, ungated (A/B testing) |
 | `XRDP_VAAPI_QP` / `_AUX_QP` | 28 / 18 | constant quantiser, 1-51; 26 is a reasonable desktop value for main |
 | `XRDP_VAAPI_BITRATE` | 0 (CQP) | kbit/s; switches to VBR |
+| `XRDP_ACCEL_SELFTEST` | 1920x1080 | size of the encoder self-test run before the helper takes a session; `0` skips it |
 | `XRDP_NVENC_QP` / `XRDP_NVENC_AUX_QP` | 28 / 18 | NVENC constant quantiser (with `XRDP_NVENC_RATE_CONTROL_MODE=NV_ENC_PARAMS_RC_CONSTQP`); the aux QP applies to AVC444's chroma view |
 | `XRDP_NVENC_DUMP_STREAM` | unset | `<prefix>`: write the NVENC stream to `<prefix>.h264` and a per-picture index, for offline checks |
 | `XRDP_SOUND_MAX_LATENCY_MS` | 0 | drop audio above this measured latency |
