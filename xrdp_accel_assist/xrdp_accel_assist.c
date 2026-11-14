@@ -216,7 +216,8 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
     cdata_bytes = (int) map_size;
     /* Keep xorgxrdp's flag bits rather than rebuilding the word, so a bit
        added later is not silently cleared. */
-    encoder_flags = flags & ~(unsigned int) XH_ENC_FLAGS_FORCEIDR;
+    encoder_flags = flags & ~(unsigned int) (XH_ENC_FLAGS_FORCEIDR |
+                    XH_ENC_FLAGS_AUXVIEW);
     if (xi->idr_count > 0)
     {
         encoder_flags |= XH_ENC_FLAGS_FORCEIDR;
