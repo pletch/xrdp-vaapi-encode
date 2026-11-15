@@ -37,4 +37,9 @@ int
 xrdp_accel_assist_selftest(int width, int height, int nviews, int frames,
                            int stress, const char *dump_path);
 
+/* Does the helper run the test before it takes a session? Yes unless
+   XRDP_ACCEL_SELFTEST=0. */
+int
+xrdp_accel_assist_selftest_enabled(void);
+
 #endif

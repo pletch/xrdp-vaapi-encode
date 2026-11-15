@@ -1192,36 +1192,27 @@ parse_size(const char *text, int *width, int *height)
 /* Run the encoder self-test before signal_ready(), see
    xrdp_accel_assist_selftest.c: what it finds broken would otherwise show
    as a frozen picture once the session is ours. Without the X server, like
-   the init above. AVC444 is tested too unless the session rules it out,
-   since the client's capabilities are not known yet.
-
-   XRDP_ACCEL_SELFTEST: "0" skips the test, "WxH" sets its picture size. */
+   the init above, so at a fixed size; --selftest tries others. AVC444 is
+   tested too unless the session rules it out, since the client's
+   capabilities are not known yet. XRDP_ACCEL_SELFTEST=0 skips the test. */
 static int
 vaapi_selftest_without_x(void)
 {
-    const char *env = g_getenv("XRDP_ACCEL_SELFTEST");
     const char *avc444 = g_getenv("XRDP_ACCEL_AVC444");
     char *display;
-    int width = 1920;
-    int height = 1080;
     int rv;
 
-    if (env != NULL && g_strcmp(env, "0") == 0)
+    if (!xrdp_accel_assist_selftest_enabled())
     {
         LOG(LOG_LEVEL_INFO, "selftest: skipped (XRDP_ACCEL_SELFTEST=0)");
         return 0;
     }
-    if (env != NULL && parse_size(env, &width, &height) != 0)
-    {
-        LOG(LOG_LEVEL_WARNING, "selftest: XRDP_ACCEL_SELFTEST=%s is not "
-            "\"0\" or \"WxH\"; using %dx%d", env, width, height);
-    }
     display = g_strdup(g_getenv("DISPLAY"));
     unsetenv("DISPLAY");
-    rv = xrdp_accel_assist_selftest(width, height, 1, 3, 0, NULL);
+    rv = xrdp_accel_assist_selftest(1920, 1080, 1, 3, 0, NULL);
     if (rv == 0 && (avc444 == NULL || g_strcmp(avc444, "0") != 0))
     {
-        rv = xrdp_accel_assist_selftest(width, height, 2, 6, 0, NULL);
+        rv = xrdp_accel_assist_selftest(1920, 1080, 2, 6, 0, NULL);
         if (rv != 0)
         {
             LOG(LOG_LEVEL_ERROR, "selftest: AVC420 encodes on this GPU but "

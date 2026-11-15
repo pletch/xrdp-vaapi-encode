@@ -384,6 +384,15 @@ st_views_of(int nviews, int frame)
 
 /*****************************************************************************/
 int
+xrdp_accel_assist_selftest_enabled(void)
+{
+    const char *env = g_getenv("XRDP_ACCEL_SELFTEST");
+
+    return env == NULL || g_strcmp(env, "0") != 0;
+}
+
+/*****************************************************************************/
+int
 xrdp_accel_assist_selftest(int width, int height, int nviews, int frames,
                            int stress, const char *dump_path)
 {

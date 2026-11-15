@@ -548,7 +548,7 @@ All of these are `[SessionVariables]` in `sesman.ini`, documented there as well:
 | `XRDP_AVC444_IDR_PERIOD` | unset | overrides the two above with an IDR every Nth frame, ungated (A/B testing) |
 | `XRDP_VAAPI_QP` / `_AUX_QP` | 28 / 18 | constant quantiser, 1-51; 26 is a reasonable desktop value for main |
 | `XRDP_VAAPI_BITRATE` | 0 (CQP) | kbit/s; switches to VBR |
-| `XRDP_ACCEL_SELFTEST` | 1920x1080 | size of the encoder self-test run before the helper takes a session; `0` skips it |
+| `XRDP_ACCEL_SELFTEST` | on | `0` skips the encoder self-test the helper runs before it takes a session |
 | `XRDP_NVENC_QP` / `XRDP_NVENC_AUX_QP` | 28 / 18 | NVENC constant quantiser (with `XRDP_NVENC_RATE_CONTROL_MODE=NV_ENC_PARAMS_RC_CONSTQP`); the aux QP applies to AVC444's chroma view |
 | `XRDP_NVENC_DUMP_STREAM` | unset | `<prefix>`: write the NVENC stream to `<prefix>.h264` and a per-picture index, for offline checks |
 | `XRDP_SOUND_MAX_LATENCY_MS` | 0 | drop audio above this measured latency |
