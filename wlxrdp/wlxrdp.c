@@ -186,6 +186,9 @@ struct be
     struct xkb_keymap *keymap;
     struct xkb_state *xkb_state;
     char *keymap_text;          /* the client layout's keymap, as uploaded */
+    /* keys the client holds down (X11 keycodes): its auto-repeat resends
+       key-down, which xkbcommon would count as further presses */
+    uint8_t keys_down[32];
     /* characters with no key on the layout (xrdp's WM_KEYBRD_UNICODE):
        each gets a spare keycode in a copy of the keymap */
     struct
@@ -1351,14 +1354,43 @@ kbd_send_modifiers(struct be *b)
 static void
 kbd_key(struct be *b, int x11_keycode, int down)
 {
-    if (b->xkb_state == NULL || x11_keycode < 8)
+    uint8_t bit;
+    uint8_t *byte;
+
+    if (b->xkb_state == NULL || x11_keycode < 8 || x11_keycode > 255)
     {
         return;
     }
+    /* Drop the client's auto-repeat (the compositor repeats keys itself)
+       and releases of keys not held: xkbcommon counts every key-down, so a
+       repeated modifier would stay down after its release */
+    bit = 1 << (x11_keycode & 7);
+    byte = b->keys_down + x11_keycode / 8;
+    if (down == ((*byte & bit) != 0))
+    {
+        return;
+    }
+    *byte = down ? *byte | bit : *byte & ~bit;
     b->ops->key(b->ad, x11_keycode - 8, down);
     xkb_state_update_key(b->xkb_state, x11_keycode,
                          down ? XKB_KEY_DOWN : XKB_KEY_UP);
     kbd_send_modifiers(b);
+}
+
+/*****************************************************************************/
+/* release every key the client holds, for key-ups it may never send */
+static void
+kbd_release_all(struct be *b)
+{
+    int kc;
+
+    for (kc = 8; kc < 256; kc++)
+    {
+        if (b->keys_down[kc / 8] & (1 << (kc & 7)))
+        {
+            kbd_key(b, kc, 0);
+        }
+    }
 }
 
 /*****************************************************************************/
@@ -1439,6 +1471,9 @@ kbd_load_keymap(struct be *b)
     }
     if (b->keymap != NULL)
     {
+        /* a reconnect: the old client's held keys go up under the old
+           keymap, so the compositor and the new state agree */
+        kbd_release_all(b);
         xkb_state_unref(b->xkb_state);
         xkb_keymap_unref(b->keymap);
     }
@@ -1577,7 +1612,10 @@ kbd_unicode(struct be *b, uint32_t cp)
 }
 
 /*****************************************************************************/
-/* RDP synchronize: bring the lock keys to the client's state */
+/* RDP synchronize, which clients send on regaining focus: release the keys
+   held (key-ups sent while the client lacked focus never arrive; the client
+   presses again any key still held), and bring the lock keys to the
+   client's state */
 static void
 kbd_sync(struct be *b, int flags)
 {
@@ -1601,6 +1639,7 @@ kbd_sync(struct be *b, int flags)
     {
         return;
     }
+    kbd_release_all(b);
     for (i = 0; i < 3; i++)
     {
         int on = xkb_state_led_name_is_active(b->xkb_state, locks[i].led) > 0;
