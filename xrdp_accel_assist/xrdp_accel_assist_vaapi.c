@@ -60,6 +60,7 @@
 #include "xrdp_accel_assist.h"
 #include "xrdp_accel_assist_x11.h"
 #include "xrdp_accel_assist_vaapi.h"
+#include "xrdp_accel_assist_selftest.h"
 #include "log.h"
 
 /* EGL display/context from the EGL interface backend; dma-buf export
@@ -844,6 +845,12 @@ xrdp_accel_assist_vaapi_check_gl_device(void)
     }
     if (g_strcmp(gl_gpu, va_gpu) != 0)
     {
+        if (xrdp_accel_assist_selftest_enabled())
+        {
+            LOG(LOG_LEVEL_WARNING, "vaapi: the encoder self-test ran on %s, "
+                "before X; it did not cover %s, where GL renders",
+                xrdp_accel_assist_render_node(), gl_node);
+        }
         xrdp_accel_assist_vaapi_switch_to(gl_node);
         return;
     }
