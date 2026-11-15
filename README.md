@@ -258,7 +258,8 @@ For NVIDIA:
 * `sudo grep "hardware encoding active" /var/log/xrdp.log` (the log needs
   root). The line appears on the first GPU-encoded frame.
 * The helper's own log: `~/.local/share/xrdp/xrdp-accel-assist.<display>.log`.
-  Each connection starts with a *selftest: passed* line per codec.
+  A session's first connection logs a *selftest: passed* line per codec,
+  a reconnect *selftest: passed earlier under this X server*.
 * Before any session depends on a GPU, try it from a shell as a user in the
   `render` group: `/usr/local/libexec/xrdp/xrdp-accel-assist --selftest 1920x1080`
   prints *selftest: AVC420 PASS* and *AVC444 PASS*. Further arguments: views

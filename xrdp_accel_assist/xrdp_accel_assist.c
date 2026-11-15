@@ -1189,16 +1189,123 @@ parse_size(const char *text, int *width, int *height)
 }
 
 /*****************************************************************************/
+/* The X server that started us, as "pid starttime". One X server is one
+   session, and a pid alone could be reused. */
+static int
+parent_id(char *text, int bytes)
+{
+    char path[64];
+    char stat_text[1024];
+    char *p;
+    int fd;
+    int len;
+    int field;
+    int ppid = (int) getppid();
+
+    g_snprintf(path, sizeof(path), "/proc/%d/stat", ppid);
+    fd = g_file_open_ro(path);
+    if (fd < 0)
+    {
+        return 1;
+    }
+    len = g_file_read(fd, stat_text, sizeof(stat_text) - 1);
+    g_file_close(fd);
+    if (len < 1)
+    {
+        return 1;
+    }
+    stat_text[len] = '\0';
+    /* comm, the second field, may hold spaces: count on from its ")".
+       starttime is field 22. */
+    p = strrchr(stat_text, ')');
+    for (field = 2; p != NULL && field < 22; field++)
+    {
+        p = strchr(p + 1, ' ');
+    }
+    if (p == NULL)
+    {
+        return 1;
+    }
+    g_snprintf(text, bytes, "%d %ld", ppid, atol(p + 1));
+    return 0;
+}
+
+/*****************************************************************************/
+/* The marker a passed self-test leaves in the log directory, and what it
+   holds: the X server the test ran under, the render node and the codecs
+   tested. */
+static int
+selftest_marker(char *path, int path_bytes, char *key, int key_bytes,
+                int avc444)
+{
+    char dir[256];
+    char id[64];
+
+    if (get_log_path(dir, 255) != 0 || parent_id(id, sizeof(id)) != 0)
+    {
+        return 1;
+    }
+    g_snprintf(path, path_bytes, "%s/xrdp-accel-assist.%d.selftest-passed",
+               dir, g_display_num);
+    g_snprintf(key, key_bytes, "%s %s %s", id,
+               xrdp_accel_assist_render_node(),
+               avc444 ? "AVC420+AVC444" : "AVC420");
+    return 0;
+}
+
+/*****************************************************************************/
+/* Does the marker hold this key? */
+static int
+selftest_marker_matches(const char *path, const char *key)
+{
+    char text[256];
+    int fd;
+    int len;
+
+    if (!g_file_exist(path))
+    {
+        return 0;
+    }
+    fd = g_file_open_ro(path);
+    if (fd < 0)
+    {
+        return 0;
+    }
+    len = g_file_read(fd, text, sizeof(text) - 1);
+    g_file_close(fd);
+    if (len < 1)
+    {
+        return 0;
+    }
+    text[len] = '\0';
+    if (text[len - 1] == '\n')
+    {
+        text[len - 1] = '\0';
+    }
+    return g_strcmp(text, key) == 0;
+}
+
+/*****************************************************************************/
 /* Run the encoder self-test before signal_ready(), see
    xrdp_accel_assist_selftest.c: what it finds broken would otherwise show
    as a frozen picture once the session is ours. Without the X server, like
    the init above, so at a fixed size; --selftest tries others. AVC444 is
    tested too unless the session rules it out, since the client's
-   capabilities are not known yet. XRDP_ACCEL_SELFTEST=0 skips the test. */
+   capabilities are not known yet. XRDP_ACCEL_SELFTEST=0 skips the test.
+
+   Once per X server: the X server waits for us while the test runs, on
+   every reconnect, and within one X server the GPU, the driver and the
+   session's settings stay the same. So a passed test leaves a marker, and
+   a helper the same X server starts again finds it and skips the test. A
+   marker from an earlier X server does not match and is replaced. */
 static int
 vaapi_selftest_without_x(void)
 {
-    const char *avc444 = g_getenv("XRDP_ACCEL_AVC444");
+    const char *env = g_getenv("XRDP_ACCEL_AVC444");
+    int avc444 = (env == NULL || g_strcmp(env, "0") != 0);
+    char path[512];
+    char key[256];
+    int have_marker;
     char *display;
     int rv;
 
@@ -1207,10 +1314,18 @@ vaapi_selftest_without_x(void)
         LOG(LOG_LEVEL_INFO, "selftest: skipped (XRDP_ACCEL_SELFTEST=0)");
         return 0;
     }
+    have_marker = (selftest_marker(path, sizeof(path), key, sizeof(key),
+                                   avc444) == 0);
+    if (have_marker && selftest_marker_matches(path, key))
+    {
+        LOG(LOG_LEVEL_INFO, "selftest: passed earlier under this X server "
+            "(%s), not run again", key);
+        return 0;
+    }
     display = g_strdup(g_getenv("DISPLAY"));
     unsetenv("DISPLAY");
     rv = xrdp_accel_assist_selftest(1920, 1080, 1, 3, 0, NULL);
-    if (rv == 0 && (avc444 == NULL || g_strcmp(avc444, "0") != 0))
+    if (rv == 0 && avc444)
     {
         rv = xrdp_accel_assist_selftest(1920, 1080, 2, 6, 0, NULL);
         if (rv != 0)
@@ -1224,6 +1339,26 @@ vaapi_selftest_without_x(void)
     {
         g_setenv("DISPLAY", display, 1);
         g_free(display);
+    }
+    if (have_marker && rv == 0)
+    {
+        char text[300];
+        int fd = g_file_open_ex(path, 0, 1, 1, 1);
+
+        g_snprintf(text, sizeof(text), "%s\n", key);
+        if (fd < 0 || g_file_write(fd, text, g_strlen(text)) < 0)
+        {
+            LOG(LOG_LEVEL_WARNING, "selftest: cannot write %s, the test "
+                "runs again on the next connect", path);
+        }
+        if (fd >= 0)
+        {
+            g_file_close(fd);
+        }
+    }
+    else if (have_marker && g_file_exist(path))
+    {
+        g_file_delete(path);
     }
     return rv;
 }
