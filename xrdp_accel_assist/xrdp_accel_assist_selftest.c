@@ -452,6 +452,7 @@ xrdp_accel_assist_selftest(int width, int height, int nviews, int frames,
             width, height, nviews);
         goto done;
     }
+    xrdp_accel_assist_vaapi_set_selftest(ei);
     glGenFramebuffers(1, &fb);
     for (frame = 0; frame < frames; frame++)
     {

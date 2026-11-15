@@ -35,6 +35,9 @@ xrdp_accel_assist_vaapi_create_encoder(int width, int height, int nviews,
                                        struct xh_enc_target *targets);
 int
 xrdp_accel_assist_vaapi_delete_encoder(struct enc_info *ei);
+/* The self-test's encoder: kept out of the stream dump and SPS log. */
+void
+xrdp_accel_assist_vaapi_set_selftest(struct enc_info *ei);
 /* For the self-test: npoints samples (Y, U, V each) of a view's input
    surface, read back through libva. */
 int

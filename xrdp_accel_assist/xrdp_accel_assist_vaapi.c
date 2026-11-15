@@ -176,6 +176,8 @@ struct enc_info
     VAPictureH264 ltrv[2];
     /* Dual-LTR: MMCO 4 already sent this sequence. */
     int lt_max_sent;
+    /* The self-test's encoder: kept out of the session's diagnostics. */
+    int selftest;
 };
 
 /* Minimal H.264 RBSP bit writer (MSB first) */
@@ -1535,6 +1537,16 @@ xrdp_accel_assist_vaapi_delete_encoder(struct enc_info *ei)
 }
 
 /*****************************************************************************/
+/* Mark an encoder as the self-test's: its pictures stay out of
+   XRDP_VAAPI_DUMP_STREAM, whose files and sequence numbers belong to the
+   session, and it does not use up the session's one SPS log line. */
+void
+xrdp_accel_assist_vaapi_set_selftest(struct enc_info *ei)
+{
+    ei->selftest = 1;
+}
+
+/*****************************************************************************/
 /* For the self-test: samples of a view's input surface as libva sees them,
    three values (Y, U, V) per point. The caller has finished its GL drawing.
    Returns 0 if they could be read. */
@@ -1874,7 +1886,10 @@ vaapi_finish(struct enc_info *ei, int flags, void *cdata, int *cdata_bytes)
         return rv;
     }
     *cdata_bytes = total;
-    xrdp_accel_assist_vaapi_dump(view, cdata, total);
+    if (!ei->selftest)
+    {
+        xrdp_accel_assist_vaapi_dump(view, cdata, total);
+    }
     return rv;
 }
 
@@ -2087,6 +2102,7 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
         }
         sps_len = build_sps(sps, ei);
         /* The SPS as sent, once per session, at debug level. */
+        if (!ei->selftest)
         {
             static int logged = 0;
 
