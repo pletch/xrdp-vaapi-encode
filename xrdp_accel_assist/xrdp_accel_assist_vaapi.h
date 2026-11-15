@@ -39,7 +39,7 @@ xrdp_accel_assist_vaapi_delete_encoder(struct enc_info *ei);
 void
 xrdp_accel_assist_vaapi_set_selftest(struct enc_info *ei);
 /* For the self-test: npoints samples (Y, U, V each) of a view's input
-   surface, read back through libva. */
+   surface, read back through vaGetImage. */
 int
 xrdp_accel_assist_vaapi_read_input(struct enc_info *ei, int view, int npoints,
                                    const int *xs, const int *ys, int *yuv);

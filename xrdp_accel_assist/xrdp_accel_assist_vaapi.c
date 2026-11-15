@@ -1549,7 +1549,10 @@ xrdp_accel_assist_vaapi_set_selftest(struct enc_info *ei)
 /*****************************************************************************/
 /* For the self-test: samples of a view's input surface as libva sees them,
    three values (Y, U, V) per point. The caller has finished its GL drawing.
-   Returns 0 if they could be read. */
+   Only through vaGetImage, a copy the driver detiles: vaDeriveImage maps
+   the tiled surface itself, and not every driver detiles that mapping, so
+   a mismatch read there could reject a GPU that encodes fine. Returns 0
+   if they could be read. */
 int
 xrdp_accel_assist_vaapi_read_input(struct enc_info *ei, int view, int npoints,
                                    const int *xs, const int *ys, int *yuv)
@@ -1568,30 +1571,22 @@ xrdp_accel_assist_vaapi_read_input(struct enc_info *ei, int view, int npoints,
     {
         return 1;
     }
-    /* A copy through the driver; a mapping of the surface itself if the
-       driver has no copy for it. */
     g_memset(&image, 0, sizeof(image));
     g_memset(&format, 0, sizeof(format));
     format.fourcc = VA_FOURCC_NV12;
     format.byte_order = VA_LSB_FIRST;
     format.bits_per_pixel = 12;
     va_status = vaCreateImage(g_va_dpy, &format, buf_w, buf_h, &image);
-    if (va_status == VA_STATUS_SUCCESS)
-    {
-        va_status = vaGetImage(g_va_dpy, ei->input_surface[view], 0, 0,
-                               buf_w, buf_h, image.image_id);
-        if (va_status != VA_STATUS_SUCCESS)
-        {
-            vaDestroyImage(g_va_dpy, image.image_id);
-        }
-    }
     if (va_status != VA_STATUS_SUCCESS)
     {
-        va_status = vaDeriveImage(g_va_dpy, ei->input_surface[view], &image);
-        if (va_status != VA_STATUS_SUCCESS)
-        {
-            return 1;
-        }
+        return 1;
+    }
+    va_status = vaGetImage(g_va_dpy, ei->input_surface[view], 0, 0,
+                           buf_w, buf_h, image.image_id);
+    if (va_status != VA_STATUS_SUCCESS)
+    {
+        vaDestroyImage(g_va_dpy, image.image_id);
+        return 1;
     }
     rv = 1;
     data = NULL;

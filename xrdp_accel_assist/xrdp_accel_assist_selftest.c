@@ -332,8 +332,8 @@ st_check_input(struct enc_info *ei, int view, int buf_w, int buf_h, int frame)
     glFinish();
     if (xrdp_accel_assist_vaapi_read_input(ei, view, 4, xs, ys, yuv) != 0)
     {
-        LOG(LOG_LEVEL_WARNING, "selftest: view %d: the input surface cannot "
-            "be read back, its contents are not checked", view);
+        LOG(LOG_LEVEL_WARNING, "selftest: view %d: vaGetImage cannot read "
+            "the input surface back, its contents are not checked", view);
         return -1;
     }
     bad = 0;
