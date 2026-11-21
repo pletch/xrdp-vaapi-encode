@@ -1231,17 +1231,28 @@ parent_id(char *text, int bytes)
 }
 
 /*****************************************************************************/
-/* The marker a passed self-test leaves in the log directory, and what it
-   holds: the X server the test ran under, the render node and the codecs
-   tested. */
+/* The marker a passed self-test leaves, and what it holds: the X server
+   the test ran under, the render node and the codecs tested. It goes to
+   the session's socket directory, $XRDP_SOCKET_PATH, which sesexec sets
+   for every session and which xorgxrdp and chansrv use too: per user under
+   /run, so it is gone after a reboot. Without it, to the log directory. */
 static int
 selftest_marker(char *path, int path_bytes, char *key, int key_bytes,
                 int avc444)
 {
+    const char *sockdir = g_getenv("XRDP_SOCKET_PATH");
     char dir[256];
     char id[64];
 
-    if (get_log_path(dir, 255) != 0 || parent_id(id, sizeof(id)) != 0)
+    if (parent_id(id, sizeof(id)) != 0)
+    {
+        return 1;
+    }
+    if (sockdir != NULL && g_directory_exist(sockdir))
+    {
+        g_snprintf(dir, sizeof(dir), "%s", sockdir);
+    }
+    else if (get_log_path(dir, 255) != 0)
     {
         return 1;
     }
@@ -1297,7 +1308,9 @@ selftest_marker_matches(const char *path, const char *key)
    every reconnect, and within one X server the GPU, the driver and the
    session's settings stay the same. So a passed test leaves a marker, and
    a helper the same X server starts again finds it and skips the test. A
-   marker from an earlier X server does not match and is replaced. */
+   marker from an earlier X server does not match and is replaced. The
+   price: a stack that breaks later in the session, after a driver update
+   or a GPU hang, is not caught on a reconnect. */
 static int
 vaapi_selftest_without_x(void)
 {
