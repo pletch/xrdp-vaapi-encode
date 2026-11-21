@@ -369,6 +369,30 @@ static int
 xrdp_accel_assist_gl_init(void);
 
 /*****************************************************************************/
+/* Xlib's default handler exits on any X error, and the helper holds the
+   client's connection: an error on a pixmap that went away in a resize
+   ended the client's session. Log it and carry on; the calls that needed
+   the resource fail on their own and are handled where they are made. */
+static int
+xrdp_accel_assist_x11_error(Display *display, XErrorEvent *event)
+{
+    static int logged = 0;
+    char text[128];
+
+    if (logged < 20)
+    {
+        logged++;
+        text[0] = '\0';
+        XGetErrorText(display, event->error_code, text, sizeof(text));
+        LOG(LOG_LEVEL_WARNING, "X error %d (%s), request %d.%d, resource "
+            "0x%lx%s", event->error_code, text, event->request_code,
+            event->minor_code, (unsigned long) event->resourceid,
+            logged == 20 ? "; further X errors are not logged" : "");
+    }
+    return 0;
+}
+
+/*****************************************************************************/
 int
 xrdp_accel_assist_x11_init(void)
 {
@@ -380,6 +404,7 @@ xrdp_accel_assist_x11_init(void)
     {
         return 1;
     }
+    XSetErrorHandler(xrdp_accel_assist_x11_error);
     g_x_socket = XConnectionNumber(g_display);
     g_screen_num = DefaultScreen(g_display);
     g_screen = ScreenOfDisplay(g_display, g_screen_num);
@@ -1037,7 +1062,7 @@ xrdp_accel_assist_x11_legacy_freerdp_split(void)
 int
 xrdp_accel_assist_x11_mon_avc444_v2(int mon_id)
 {
-    return g_mons[mon_id % MAX_MON].avc444_v2;
+    return g_mons[(unsigned int) mon_id % MAX_MON].avc444_v2;
 }
 
 /*****************************************************************************/
@@ -1128,7 +1153,7 @@ xrdp_accel_assist_x11_create_pixmap(int width, int height, int magic,
     int img[64];
     int buf;
 
-    mi = g_mons + mon_id % MAX_MON;
+    mi = g_mons + (unsigned int) mon_id % MAX_MON;
     if (mi->pixmap[0] != 0)
     {
         LOG(LOG_LEVEL_ERROR, "xrdp_accel_assist_x11_create_pixmap: "
@@ -1889,7 +1914,7 @@ encode_pixmap(int left, int top, int width, int height,
     enum encoder_result rv;
     struct xh_rect whole;
 
-    mi = g_mons + mon_id % MAX_MON;
+    mi = g_mons + (unsigned int) mon_id % MAX_MON;
     /* Which capture buffer xorgxrdp used for this frame. */
     mi->cur_buf = flags & ACCEL_ASSIST_BUFFER_MASK;
     mi->cur_buf >>= ACCEL_ASSIST_BUFFER_SHIFT;
@@ -3080,7 +3105,7 @@ xrdp_accel_assist_x11_encode_pixmap(int left, int top, int width, int height,
                                     void *cdata, int *cdata_bytes,
                                     int codec_id, int flags)
 {
-    struct mon_info *mi = g_mons + mon_id % MAX_MON;
+    struct mon_info *mi = g_mons + (unsigned int) mon_id % MAX_MON;
     enum encoder_result rv;
     struct xh_rect *dd_rects = NULL;
     int dd_n = -1;

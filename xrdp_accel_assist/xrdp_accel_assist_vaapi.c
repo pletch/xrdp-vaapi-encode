@@ -60,6 +60,7 @@
 #include "xrdp_accel_assist.h"
 #include "xrdp_accel_assist_x11.h"
 #include "xrdp_accel_assist_vaapi.h"
+#include "xrdp_accel_assist_selftest.h"
 #include "log.h"
 
 /* EGL display/context from the EGL interface backend; dma-buf export
@@ -176,6 +177,8 @@ struct enc_info
     VAPictureH264 ltrv[2];
     /* Dual-LTR: MMCO 4 already sent this sequence. */
     int lt_max_sent;
+    /* The self-test's encoder: kept out of the session's diagnostics. */
+    int selftest;
 };
 
 /* Minimal H.264 RBSP bit writer (MSB first) */
@@ -415,8 +418,9 @@ build_sps(unsigned char *out, struct enc_info *ei)
     bs_put(&b, 1, 1);              /* motion_vectors_over_pic_boundaries_flag */
     bs_ue(&b, 0);                  /* max_bytes_per_pic_denom */
     bs_ue(&b, 0);                  /* max_bits_per_mb_denom */
-    bs_ue(&b, 16);                 /* log2_max_mv_length_horizontal */
-    bs_ue(&b, 16);                 /* log2_max_mv_length_vertical */
+    /* 0..15 in the current standard; older editions allowed 16 */
+    bs_ue(&b, 15);                 /* log2_max_mv_length_horizontal */
+    bs_ue(&b, 15);                 /* log2_max_mv_length_vertical */
     bs_ue(&b, 0);                  /* max_num_reorder_frames = 0 */
     bs_ue(&b, num_ref);            /* max_dec_frame_buffering */
     bs_trailing(&b);
@@ -842,6 +846,12 @@ xrdp_accel_assist_vaapi_check_gl_device(void)
     }
     if (g_strcmp(gl_gpu, va_gpu) != 0)
     {
+        if (xrdp_accel_assist_selftest_enabled())
+        {
+            LOG(LOG_LEVEL_WARNING, "vaapi: the encoder self-test ran on %s, "
+                "before X; it did not cover %s, where GL renders",
+                xrdp_accel_assist_render_node(), gl_node);
+        }
         xrdp_accel_assist_vaapi_switch_to(gl_node);
         return;
     }
@@ -1535,6 +1545,90 @@ xrdp_accel_assist_vaapi_delete_encoder(struct enc_info *ei)
 }
 
 /*****************************************************************************/
+/* Mark an encoder as the self-test's: its pictures stay out of
+   XRDP_VAAPI_DUMP_STREAM, whose files and sequence numbers belong to the
+   session, and it does not use up the session's one SPS log line. */
+void
+xrdp_accel_assist_vaapi_set_selftest(struct enc_info *ei)
+{
+    ei->selftest = 1;
+}
+
+/*****************************************************************************/
+/* For the self-test: samples of a view's input surface as libva sees them,
+   three values (Y, U, V) per point. The caller has finished its GL drawing.
+   Only through vaGetImage, a copy the driver detiles: vaDeriveImage maps
+   the tiled surface itself, and not every driver detiles that mapping, so
+   a mismatch read there could reject a GPU that encodes fine. Returns 0
+   if they could be read. */
+int
+xrdp_accel_assist_vaapi_read_input(struct enc_info *ei, int view, int npoints,
+                                   const int *xs, const int *ys, int *yuv)
+{
+    VAImage image;
+    VAImageFormat format;
+    VAStatus va_status;
+    unsigned char *data;
+    unsigned char *uv;
+    int buf_w = (ei->width + 15) & ~15;
+    int buf_h = (ei->height + 15) & ~15;
+    int index;
+    int rv;
+
+    if (view < 0 || view >= ei->nviews)
+    {
+        return 1;
+    }
+    g_memset(&image, 0, sizeof(image));
+    g_memset(&format, 0, sizeof(format));
+    format.fourcc = VA_FOURCC_NV12;
+    format.byte_order = VA_LSB_FIRST;
+    format.bits_per_pixel = 12;
+    va_status = vaCreateImage(g_va_dpy, &format, buf_w, buf_h, &image);
+    if (va_status != VA_STATUS_SUCCESS)
+    {
+        return 1;
+    }
+    va_status = vaGetImage(g_va_dpy, ei->input_surface[view], 0, 0,
+                           buf_w, buf_h, image.image_id);
+    if (va_status != VA_STATUS_SUCCESS)
+    {
+        vaDestroyImage(g_va_dpy, image.image_id);
+        return 1;
+    }
+    rv = 1;
+    data = NULL;
+    if (image.format.fourcc == VA_FOURCC_NV12 && image.num_planes >= 2 &&
+            vaMapBuffer(g_va_dpy, image.buf, (void **) &data)
+            == VA_STATUS_SUCCESS)
+    {
+        if (data != NULL)
+        {
+            for (index = 0; index < npoints; index++)
+            {
+                if (xs[index] < 0 || xs[index] >= (int) image.width ||
+                        ys[index] < 0 || ys[index] >= (int) image.height)
+                {
+                    break;
+                }
+                yuv[index * 3] = data[image.offsets[0] +
+                                      ys[index] * image.pitches[0] +
+                                      xs[index]];
+                uv = data + image.offsets[1] +
+                     (ys[index] / 2) * image.pitches[1] +
+                     (xs[index] / 2) * 2;
+                yuv[index * 3 + 1] = uv[0];
+                yuv[index * 3 + 2] = uv[1];
+            }
+            rv = (index == npoints) ? 0 : 1;
+        }
+        vaUnmapBuffer(g_va_dpy, image.buf);
+    }
+    vaDestroyImage(g_va_dpy, image.image_id);
+    return rv;
+}
+
+/*****************************************************************************/
 /* Create a buffer, queue it, and remember its id for cleanup. */
 static int
 render_buffer(VAContextID ctx, VABufferType type, unsigned int size,
@@ -1778,6 +1872,13 @@ vaapi_finish(struct enc_info *ei, int flags, void *cdata, int *cdata_bytes)
     total = 0;
     while (seg != NULL)
     {
+        if (seg->status & VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK)
+        {
+            LOG(LOG_LEVEL_ERROR, "vaapi: the coded picture overflowed its "
+                "buffer (status 0x%x)", seg->status);
+            rv = ENCODER_ERROR;
+            break;
+        }
         if (total + (int) seg->size > *cdata_bytes)
         {
             LOG(LOG_LEVEL_ERROR, "vaapi: coded data too big %d > %d",
@@ -1795,7 +1896,10 @@ vaapi_finish(struct enc_info *ei, int flags, void *cdata, int *cdata_bytes)
         return rv;
     }
     *cdata_bytes = total;
-    xrdp_accel_assist_vaapi_dump(view, cdata, total);
+    if (!ei->selftest)
+    {
+        xrdp_accel_assist_vaapi_dump(view, cdata, total);
+    }
     return rv;
 }
 
@@ -1841,8 +1945,32 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
     /* glFlush, not glFinish: the dma-buf's implicit sync orders the GL
        writes before the encode, on a surface libva allocated too. Checked
        on iHD 26.1.2 (xe) with a slow render each frame and every encoded
-       frame decoded and compared: no stale frames. */
-    glFlush();
+       frame decoded and compared: no stale frames. XRDP_VAAPI_GLFINISH=1
+       waits for GL instead, for a driver stack where the encoder turns
+       out not to. */
+    {
+        static int finish = -1;
+
+        if (finish < 0)
+        {
+            const char *env = g_getenv("XRDP_VAAPI_GLFINISH");
+
+            finish = (env != NULL) && (g_atoi(env) != 0);
+            if (finish)
+            {
+                LOG(LOG_LEVEL_INFO, "vaapi: XRDP_VAAPI_GLFINISH is set, "
+                    "waiting for GL before each encode");
+            }
+        }
+        if (finish)
+        {
+            glFinish();
+        }
+        else
+        {
+            glFlush();
+        }
+    }
 
     w_mbs = (ei->width + 15) / 16;
     h_mbs = (ei->height + 15) / 16;
@@ -1984,6 +2112,7 @@ vaapi_submit(struct enc_info *ei, void *cdata, int *cdata_bytes,
         }
         sps_len = build_sps(sps, ei);
         /* The SPS as sent, once per session, at debug level. */
+        if (!ei->selftest)
         {
             static int logged = 0;
 

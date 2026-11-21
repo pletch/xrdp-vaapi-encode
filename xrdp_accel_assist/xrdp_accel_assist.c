@@ -54,6 +54,7 @@
 #endif
 #if defined(XRDP_VAAPI)
 #include "xrdp_accel_assist_vaapi.h"
+#include "xrdp_accel_assist_selftest.h"
 #endif
 
 #define ARRAYSIZE(x) (sizeof(x)/sizeof(*(x)))
@@ -224,7 +225,8 @@ gfx_wiretosurface1(struct xorgxrdp_info *xi, struct stream *s)
     cdata_bytes = (int) map_size;
     /* Keep xorgxrdp's flag bits rather than rebuilding the word, so a bit
        added later is not silently cleared. */
-    encoder_flags = flags & ~(unsigned int) XH_ENC_FLAGS_FORCEIDR;
+    encoder_flags = flags & ~(unsigned int) (XH_ENC_FLAGS_FORCEIDR |
+                    XH_ENC_FLAGS_AUXVIEW);
     if (xi->idr_count > 0)
     {
         encoder_flags |= XH_ENC_FLAGS_FORCEIDR;
@@ -1255,6 +1257,284 @@ vaapi_init_without_x(void)
     }
     return rv;
 }
+
+/*****************************************************************************/
+/* "WxH" into width and height. Returns 0 if it parsed. */
+static int
+parse_size(const char *text, int *width, int *height)
+{
+    int w;
+    int h;
+
+    if (text == NULL || sscanf(text, "%dx%d", &w, &h) != 2 ||
+            w < 64 || h < 64 || w > 8192 || h > 8192)
+    {
+        return 1;
+    }
+    *width = w;
+    *height = h;
+    return 0;
+}
+
+/*****************************************************************************/
+/* The X server that started us, as "pid starttime". One X server is one
+   session, and a pid alone could be reused. */
+static int
+parent_id(char *text, int bytes)
+{
+    char path[64];
+    char stat_text[1024];
+    char *p;
+    int fd;
+    int len;
+    int field;
+    int ppid = (int) getppid();
+
+    g_snprintf(path, sizeof(path), "/proc/%d/stat", ppid);
+    fd = g_file_open_ro(path);
+    if (fd < 0)
+    {
+        return 1;
+    }
+    len = g_file_read(fd, stat_text, sizeof(stat_text) - 1);
+    g_file_close(fd);
+    if (len < 1)
+    {
+        return 1;
+    }
+    stat_text[len] = '\0';
+    /* comm, the second field, may hold spaces: count on from its ")".
+       starttime is field 22. */
+    p = strrchr(stat_text, ')');
+    for (field = 2; p != NULL && field < 22; field++)
+    {
+        p = strchr(p + 1, ' ');
+    }
+    if (p == NULL)
+    {
+        return 1;
+    }
+    g_snprintf(text, bytes, "%d %ld", ppid, atol(p + 1));
+    return 0;
+}
+
+/*****************************************************************************/
+/* The marker a passed self-test leaves, and what it holds: the X server
+   the test ran under, the render node and the codecs tested. It goes to
+   the session's socket directory, $XRDP_SOCKET_PATH, which sesexec sets
+   for every session and which xorgxrdp and chansrv use too: per user under
+   /run, so it is gone after a reboot. Without it, to the log directory. */
+static int
+selftest_marker(char *path, int path_bytes, char *key, int key_bytes,
+                int avc444)
+{
+    const char *sockdir = g_getenv("XRDP_SOCKET_PATH");
+    char dir[256];
+    char id[64];
+
+    if (parent_id(id, sizeof(id)) != 0)
+    {
+        return 1;
+    }
+    if (sockdir != NULL && g_directory_exist(sockdir))
+    {
+        g_snprintf(dir, sizeof(dir), "%s", sockdir);
+    }
+    else if (get_log_path(dir, 255) != 0)
+    {
+        return 1;
+    }
+    g_snprintf(path, path_bytes, "%s/xrdp-accel-assist.%d.selftest-passed",
+               dir, g_display_num);
+    g_snprintf(key, key_bytes, "%s %s %s", id,
+               xrdp_accel_assist_render_node(),
+               avc444 ? "AVC420+AVC444" : "AVC420");
+    return 0;
+}
+
+/*****************************************************************************/
+/* Does the marker hold this key? */
+static int
+selftest_marker_matches(const char *path, const char *key)
+{
+    char text[256];
+    int fd;
+    int len;
+
+    if (!g_file_exist(path))
+    {
+        return 0;
+    }
+    fd = g_file_open_ro(path);
+    if (fd < 0)
+    {
+        return 0;
+    }
+    len = g_file_read(fd, text, sizeof(text) - 1);
+    g_file_close(fd);
+    if (len < 1)
+    {
+        return 0;
+    }
+    text[len] = '\0';
+    if (text[len - 1] == '\n')
+    {
+        text[len - 1] = '\0';
+    }
+    return g_strcmp(text, key) == 0;
+}
+
+/*****************************************************************************/
+/* Run the encoder self-test before signal_ready(), see
+   xrdp_accel_assist_selftest.c: what it finds broken would otherwise show
+   as a frozen picture once the session is ours. Without the X server, like
+   the init above, so at a fixed size; --selftest tries others. AVC444 is
+   tested too unless the session rules it out, since the client's
+   capabilities are not known yet. XRDP_ACCEL_SELFTEST=0 skips the test.
+
+   Once per X server: the X server waits for us while the test runs, on
+   every reconnect, and within one X server the GPU, the driver and the
+   session's settings stay the same. So a passed test leaves a marker, and
+   a helper the same X server starts again finds it and skips the test. A
+   marker from an earlier X server does not match and is replaced. The
+   price: a stack that breaks later in the session, after a driver update
+   or a GPU hang, is not caught on a reconnect. */
+static int
+vaapi_selftest_without_x(void)
+{
+    const char *env = g_getenv("XRDP_ACCEL_AVC444");
+    int avc444 = (env == NULL || g_strcmp(env, "0") != 0);
+    char path[512];
+    char key[256];
+    int have_marker;
+    char *display;
+    int rv;
+
+    if (!xrdp_accel_assist_selftest_enabled())
+    {
+        LOG(LOG_LEVEL_INFO, "selftest: skipped (XRDP_ACCEL_SELFTEST=0)");
+        return 0;
+    }
+    have_marker = (selftest_marker(path, sizeof(path), key, sizeof(key),
+                                   avc444) == 0);
+    if (have_marker && selftest_marker_matches(path, key))
+    {
+        LOG(LOG_LEVEL_INFO, "selftest: passed earlier under this X server "
+            "(%s), not run again", key);
+        return 0;
+    }
+    display = g_strdup(g_getenv("DISPLAY"));
+    unsetenv("DISPLAY");
+    rv = xrdp_accel_assist_selftest(1920, 1080, 1, 3, 0, NULL);
+    if (rv == 0 && avc444)
+    {
+        rv = xrdp_accel_assist_selftest(1920, 1080, 2, 6, 0, NULL);
+        if (rv != 0)
+        {
+            LOG(LOG_LEVEL_ERROR, "selftest: AVC420 encodes on this GPU but "
+                "AVC444 does not. XRDP_ACCEL_AVC444=0 in sesman.ini "
+                "[SessionVariables] keeps the session on hardware AVC420");
+        }
+    }
+    if (display != NULL)
+    {
+        g_setenv("DISPLAY", display, 1);
+        g_free(display);
+    }
+    if (have_marker && rv == 0)
+    {
+        char text[300];
+        int fd = g_file_open_ex(path, 0, 1, 1, 1);
+
+        g_snprintf(text, sizeof(text), "%s\n", key);
+        if (fd < 0 || g_file_write(fd, text, g_strlen(text)) < 0)
+        {
+            LOG(LOG_LEVEL_WARNING, "selftest: cannot write %s, the test "
+                "runs again on the next connect", path);
+        }
+        if (fd >= 0)
+        {
+            g_file_close(fd);
+        }
+    }
+    else if (have_marker && g_file_exist(path))
+    {
+        g_file_delete(path);
+    }
+    return rv;
+}
+
+/*****************************************************************************/
+/* xrdp-accel-assist --selftest [WxH [views [frames [stress [dumpfile]]]]]
+   Run the self-test from a shell and report on the console, to try a GPU
+   before any session depends on it. views: 1 = AVC420, 2 = AVC444,
+   0 (default) = one after the other. A dumpfile needs views 1 or 2. */
+static int
+selftest_main(int argc, char **argv)
+{
+    struct log_config *logconfig;
+    int width = 1920;
+    int height = 1080;
+    int views = 0;
+    int frames = 12;
+    int stress = 0;
+    const char *dump = NULL;
+    int rv;
+
+    g_init("xrdp_accel_assist");
+    logconfig = log_config_init_for_console(LOG_LEVEL_INFO,
+                g_getenv("XRDP_ACCEL_ASSIST_LOG_LEVEL"));
+    if (logconfig != NULL)
+    {
+        log_start_from_param(logconfig);
+        log_config_free(logconfig);
+    }
+    if (argc > 2 && parse_size(argv[2], &width, &height) != 0)
+    {
+        g_writeln("usage: %s --selftest [WxH [views [frames [stress "
+                  "[dumpfile]]]]]", argv[0]);
+        return 2;
+    }
+    views = (argc > 3) ? g_atoi(argv[3]) : 0;
+    frames = (argc > 4) ? g_atoi(argv[4]) : frames;
+    stress = (argc > 5) ? g_atoi(argv[5]) : 0;
+    dump = (argc > 6) ? argv[6] : NULL;
+    if (frames < 1 || stress < 0 || views < 0 || views > 2 ||
+            (dump != NULL && views == 0))
+    {
+        g_writeln("usage: %s --selftest [WxH [views [frames [stress "
+                  "[dumpfile]]]]]", argv[0]);
+        return 2;
+    }
+    unsetenv("DISPLAY");
+    if (render_node_is_nvidia())
+    {
+        g_writeln("selftest: %s is an NVIDIA GPU (NVENC), which this test "
+                  "does not cover", xrdp_accel_assist_render_node());
+        return 2;
+    }
+    if (xrdp_accel_assist_vaapi_init() != 0)
+    {
+        g_writeln("selftest: FAIL (VA-API encoder init)");
+        return 1;
+    }
+    rv = 0;
+    if (views != 2)
+    {
+        rv = xrdp_accel_assist_selftest(width, height, 1, frames, stress,
+                                        dump);
+        g_writeln("selftest: AVC420 %s", rv == 0 ? "PASS" : "FAIL");
+    }
+    if (views != 1)
+    {
+        int rv2 = xrdp_accel_assist_selftest(width, height, 2, frames,
+                                             stress, dump);
+
+        g_writeln("selftest: AVC444 %s", rv2 == 0 ? "PASS" : "FAIL");
+        rv = rv || rv2;
+    }
+    return rv ? 1 : 0;
+}
 #endif
 
 /*****************************************************************************/
@@ -1295,6 +1575,12 @@ main(int argc, char **argv)
     struct xorgxrdp_info xi;
 
     die_with_parent();
+#if defined(XRDP_VAAPI)
+    if (argc >= 2 && strcmp(argv[1], "--selftest") == 0)
+    {
+        return selftest_main(argc, argv);
+    }
+#endif
     /* -d: frames from xorgxrdp (X pixmaps); -w: from a non-X frame source
        (the Wayland backend), as dma-bufs, with no X display */
     if (argc < 2 || (strcmp(argv[1], "-d") != 0 &&
@@ -1350,6 +1636,14 @@ main(int argc, char **argv)
         if (!render_node_is_nvidia() && vaapi_init_without_x() != 0)
         {
             LOG(LOG_LEVEL_ERROR, "VA-API encoder init failed");
+            return 1;
+        }
+        /* And that it encodes, while failing still means software
+           encoding. */
+        if (!render_node_is_nvidia() && vaapi_selftest_without_x() != 0)
+        {
+            LOG(LOG_LEVEL_ERROR, "VA-API encoder self-test failed; not "
+                "starting, the session uses software encoding");
             return 1;
         }
 #endif
