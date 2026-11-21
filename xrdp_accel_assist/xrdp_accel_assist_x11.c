@@ -370,9 +370,10 @@ xrdp_accel_assist_gl_init(void);
 
 /*****************************************************************************/
 /* Xlib's default handler exits on any X error, and the helper holds the
-   client's connection: an error on a pixmap that went away in a resize
-   ended the client's session. Log it and carry on; the calls that needed
-   the resource fail on their own and are handled where they are made. */
+   client's connection: an X error, for example on a pixmap that no longer
+   exists, would end the client's session. Log it and carry on; the calls
+   that needed the resource fail on their own and are handled where they
+   are made. */
 static int
 xrdp_accel_assist_x11_error(Display *display, XErrorEvent *event)
 {
