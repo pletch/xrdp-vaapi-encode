@@ -1386,6 +1386,7 @@ static int
 selftest_main(int argc, char **argv)
 {
     struct log_config *logconfig;
+    const char *log_level;
     int width = 1920;
     int height = 1080;
     int views = 0;
@@ -1395,8 +1396,8 @@ selftest_main(int argc, char **argv)
     int rv;
 
     g_init("xrdp_accel_assist");
-    logconfig = log_config_init_for_console(LOG_LEVEL_INFO,
-                g_getenv("XRDP_ACCEL_ASSIST_LOG_LEVEL"));
+    log_level = g_getenv("XRDP_ACCEL_ASSIST_LOG_LEVEL");
+    logconfig = log_config_init_for_console(LOG_LEVEL_INFO, log_level);
     if (logconfig != NULL)
     {
         log_start_from_param(logconfig);
