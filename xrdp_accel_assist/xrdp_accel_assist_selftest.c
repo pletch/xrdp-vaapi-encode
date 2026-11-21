@@ -493,7 +493,7 @@ xrdp_accel_assist_selftest(int width, int height, int nviews, int frames,
         if (which == 3)
         {
             er = xrdp_accel_assist_vaapi_encode_dual(ei, cdata[0], &cbytes[0],
-                    cdata[1], &cbytes[1], flags, (frame == 0) ? 0 : -1);
+                 cdata[1], &cbytes[1], flags, (frame == 0) ? 0 : -1);
         }
         else if (which == 2)
         {
