@@ -1277,8 +1277,9 @@ parse_size(const char *text, int *width, int *height)
 }
 
 /*****************************************************************************/
-/* The X server that started us, as "pid starttime". One X server is one
-   session, and a pid alone could be reused. */
+/* The process that started us, as "pid starttime": the X server, or with
+   -w the Wayland backend. Either is one session, and a pid alone could be
+   reused. */
 static int
 parent_id(char *text, int bytes)
 {
@@ -1344,8 +1345,24 @@ selftest_marker(char *path, int path_bytes, char *key, int key_bytes,
     {
         return 1;
     }
-    g_snprintf(path, path_bytes, "%s/xrdp-accel-assist.%d.selftest-passed",
-               dir, g_display_num);
+    if (g_headless)
+    {
+        /* No X display in a Wayland session: name the marker after the
+           compositor's socket, unique per session of a user */
+        const char *wl = g_getenv("WAYLAND_DISPLAY");
+        const char *base = (wl != NULL) ? strrchr(wl, '/') : NULL;
+
+        base = (base != NULL) ? base + 1 : wl;
+        g_snprintf(path, path_bytes,
+                   "%s/xrdp-accel-assist.%s.selftest-passed", dir,
+                   (base != NULL && base[0] != '\0') ? base : "wayland");
+    }
+    else
+    {
+        g_snprintf(path, path_bytes,
+                   "%s/xrdp-accel-assist.%d.selftest-passed", dir,
+                   g_display_num);
+    }
     g_snprintf(key, key_bytes, "%s %s %s", id,
                xrdp_accel_assist_render_node(),
                avc444 ? "AVC420+AVC444" : "AVC420");
@@ -1398,7 +1415,8 @@ selftest_marker_matches(const char *path, const char *key)
    a helper the same X server starts again finds it and skips the test. A
    marker from an earlier X server does not match and is replaced. The
    price: a stack that breaks later in the session, after a driver update
-   or a GPU hang, is not caught on a reconnect. */
+   or a GPU hang, is not caught on a reconnect. With -w, the Wayland
+   backend (wlxrdp) takes the X server's place in all of this. */
 static int
 vaapi_selftest_without_x(void)
 {
@@ -1419,8 +1437,8 @@ vaapi_selftest_without_x(void)
                                    avc444) == 0);
     if (have_marker && selftest_marker_matches(path, key))
     {
-        LOG(LOG_LEVEL_INFO, "selftest: passed earlier under this X server "
-            "(%s), not run again", key);
+        LOG(LOG_LEVEL_INFO, "selftest: passed earlier in this session (%s), "
+            "not run again", key);
         return 0;
     }
     display = g_strdup(g_getenv("DISPLAY"));
@@ -1611,6 +1629,21 @@ main(int argc, char **argv)
         nvidia = render_node_is_nvidia();
         LOG(LOG_LEVEL_INFO, "headless: render node %s, encoder %s",
             xrdp_accel_assist_render_node(), nvidia ? "NVENC" : "VA-API");
+#if defined(XRDP_VAAPI)
+        /* As with X: the encoder, and that it encodes, before EGL is up.
+           Failing here leaves the Wayland backend on its CPU path. */
+        if (!nvidia && vaapi_init_without_x() != 0)
+        {
+            LOG(LOG_LEVEL_ERROR, "VA-API encoder init failed");
+            return 1;
+        }
+        if (!nvidia && vaapi_selftest_without_x() != 0)
+        {
+            LOG(LOG_LEVEL_ERROR, "VA-API encoder self-test failed; not "
+                "starting, the session uses software encoding");
+            return 1;
+        }
+#endif
         drm_fd = g_file_open_ex(xrdp_accel_assist_render_node(), 1, 1, 0, 0);
         gbm = (drm_fd >= 0) ? gbm_create_device(drm_fd) : NULL;
         if (gbm == NULL ||
