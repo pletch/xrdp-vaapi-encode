@@ -35,6 +35,14 @@ xrdp_accel_assist_vaapi_create_encoder(int width, int height, int nviews,
                                        struct xh_enc_target *targets);
 int
 xrdp_accel_assist_vaapi_delete_encoder(struct enc_info *ei);
+/* The self-test's encoder: kept out of the stream dump and SPS log. */
+void
+xrdp_accel_assist_vaapi_set_selftest(struct enc_info *ei);
+/* For the self-test: npoints samples (Y, U, V each) of a view's input
+   surface, read back through vaGetImage. */
+int
+xrdp_accel_assist_vaapi_read_input(struct enc_info *ei, int view, int npoints,
+                                   const int *xs, const int *ys, int *yuv);
 /* Encode both AVC444 views, submitting each before waiting on either. */
 enum encoder_result
 xrdp_accel_assist_vaapi_encode_dual(struct enc_info *ei,
